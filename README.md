@@ -46,4 +46,4 @@ docker compose ps
 
 Docker Desktop 中通过 `host.docker.internal` 访问宿主机的私有服务。部署到不同服务器时，修改 `.env.docker` 中的 `MINIMAX_UPSTREAM_URL` 和 `MINIMAX_PUBLIC_UPSTREAM_URL`。SQLite 数据保存在宿主机 `data/` 目录。
 
-容器使用 TCP 健康检查，不提供额外 HTTP 健康接口。队首保护区内的任务虽然查询状态为 `queued`，但不可取消。回调、水印、`mm_file://` 和 Data URI 首版不支持。
+容器使用 TCP 健康检查。队首保护区内的任务虽然查询状态为 `queued`，但不可取消。回调、水印、`mm_file://` 和 Data URI 首版不支持。
