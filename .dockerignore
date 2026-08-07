@@ -1,0 +1,10 @@
+.git
+.gitignore
+docs
+specs
+data
+.env.docker
+*.db
+*.db-shm
+*.db-wal
+bin

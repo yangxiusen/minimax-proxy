@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MiniMax H3 运行监控</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f3f5f8;color:#172033;font:14px system-ui,"Microsoft YaHei",sans-serif;letter-spacing:0}header{height:52px;padding:0 24px;background:#fff;border-bottom:1px solid #d8e0e9;display:flex;align-items:center;justify-content:space-between}main{max-width:1440px;margin:auto;padding:20px}.label{font-size:12px;font-weight:700;color:#556176;margin:0 0 7px}.panel{background:#fff;border:1px solid #d8e0e9;padding:14px;margin-bottom:20px}.bar,.title{display:flex;justify-content:space-between;align-items:center;gap:12px}.filters{display:flex;gap:8px;flex-wrap:wrap}.control{border:1px solid #cbd5df;background:#fff;padding:7px 10px;color:#364258}.table{margin-top:13px;min-width:760px}.scroll{overflow:auto}.row{display:grid;grid-template-columns:1.5fr .8fr .8fr .8fr .8fr .8fr 1fr;gap:8px;padding:9px 2px;border-top:1px solid #e8edf3}.head{color:#68758a;font-size:12px;border:0}.pager{display:flex;justify-content:space-between;margin-top:12px;color:#68758a}.private{border:2px solid #aebbc9;background:#e9edf2;padding:14px}.private-grid{display:grid;grid-template-columns:230px 1fr;gap:10px;margin-top:12px}.nodes,.detail{background:#fff;border:1px solid #cbd5df;padding:12px}.node{padding:10px;border-left:3px solid #29865b;margin-top:8px}.node.active{background:#edf4ff;border-color:#2d6bc4}.node.bad{border-color:#c94848}.muted{color:#68758a}.ok{color:#237349}.run{color:#2d6bc4}.bad-text{color:#c94848}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0}.metric,.taskbox{border:1px solid #dce3ec;padding:11px}.metric b{display:block;font-size:20px;margin-top:4px}.tasks{display:grid;grid-template-columns:1.5fr 1fr;gap:8px}.recent{margin-top:12px;padding-top:11px;border-top:1px solid #dce3ec}.recent .row{grid-template-columns:1.5fr .8fr .8fr .8fr 1fr}.status{padding:5px 9px;background:#e6f5ec;color:#237349}@media(max-width:800px){header{padding:0 12px}main{padding:12px}.private-grid{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}.tasks{grid-template-columns:1fr}.bar{align-items:flex-start;flex-direction:column}}
+</style>
+</head>
+<body>
+<header><b>MiniMax H3 运行监控</b><span class="muted">最后更新 11:36:10　admin　退出</span></header>
+<main>
+<div class="label">全部任务</div>
+<section class="panel">
+  <div class="bar"><div><b>任务列表</b> <span class="muted">共 128 条</span></div><div class="filters"><button class="control">状态：全部</button><button class="control">实例：全部</button><button class="control">搜索任务 ID / 客户</button></div></div>
+  <div class="scroll"><div class="table"><div class="row head"><span>任务 ID</span><span>客户</span><span>状态</span><span>实例</span><span>方式</span><span>规格</span><span>创建时间</span></div><div class="row"><span>073478442647032693</span><span>customer-1</span><span class="run">运行中</span><span>gpu-1</span><span>t2va</span><span>768P</span><span>11:21:17</span></div><div class="row"><span>889164568012345678</span><span>customer-2</span><span>排队</span><span>--</span><span>i2va</span><span>2K</span><span>11:20:46</span></div></div></div>
+  <div class="pager"><span>每页 <button class="control">10</button>　10 / 20</span><span>上一页　<b>1</b> / 13　下一页</span></div>
+</section>
+<section class="private">
+  <div class="title"><div><b style="font-size:17px">私有服务监控</b> <span class="muted">独立节点运行状态与任务</span></div><div><span class="ok">● 2 个健康</span>　<span class="bad-text">● 1 个异常</span></div></div>
+  <div class="private-grid"><aside class="nodes"><span class="muted">选择私有实例</span><div class="node active"><b>gpu-1</b><br><span class="ok">● 健康 · 运行中</span><br><small>私有队列 0</small></div><div class="node"><b>gpu-2</b><br><span class="ok">● 健康 · 空闲</span><br><small>私有队列 0</small></div><div class="node bad"><b>gpu-3</b><br><span class="bad-text">● 连接失败</span><br><small>队列未知</small></div></aside>
+  <article class="detail"><div class="title"><div><b style="font-size:19px">gpu-1</b><br><span class="muted">127.0.0.1:7860 · 最后检查 11:36:10</span></div><span class="status">健康</span></div><div class="metrics"><div class="metric">CPU<b>8%</b></div><div class="metric">内存<b>89%</b></div><div class="metric">显存<b>64%</b></div><div class="metric">GPU<b>42%</b></div></div><div class="tasks"><div class="taskbox"><span class="muted">当前任务</span><br><b>073478442647032693</b> <span class="run">运行中 · 02:14</span></div><div class="taskbox"><span class="muted">私有服务队列</span><br><b>0 个任务</b> <span class="muted">最近错误：无</span></div></div><div class="recent"><div class="title"><b>gpu-1 最近一条任务</b><span class="muted">完整记录请在上方按实例筛选</span></div><div class="scroll"><div class="row head"><span>任务 ID</span><span>客户</span><span>状态</span><span>耗时</span><span>完成时间</span></div><div class="row"><span>073478441812345678</span><span>customer-1</span><span class="ok">成功</span><span>04:51</span><span>10:38:21</span></div></div></div></article></div>
+</section>
+</main>
+</body></html>

@@ -1,0 +1,7 @@
+config.yaml
+data/
+*.db
+*.db-shm
+*.db-wal
+.superpowers/
+.env.docker

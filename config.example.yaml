@@ -1,0 +1,69 @@
+server:
+  address: ":8080"
+  read_timeout: 15s
+  write_timeout: 15s
+
+admin:
+  username: admin
+  password: "123"
+  session_ttl: 12h
+  monitor_interval: 5s
+  secure_cookie: false
+
+database:
+  path: /data/minimax.db
+
+queue:
+  protected_slots: 3
+  per_key_unfinished_limit: 10
+  global_unfinished_limit: 100
+
+task:
+  retention: 168h
+  idempotency_ttl: 24h
+
+api_keys:
+  - id: customer-a
+    key: "${MINIMAX_API_KEY_CUSTOMER_A}"
+    enabled: true
+
+upstreams:
+  - id: gpu-1
+    base_url: "${MINIMAX_UPSTREAM_GPU_1_URL}"
+    public_base_url: https://video.example.com
+    health_path: /
+    submit_api_name: submit_minimax_from_slots
+    check_api_name: check_and_get_video
+    poll_interval: 3s
+    request_timeout: 30s
+
+# 尺寸和模型值必须按真实私有服务验证后调整，服务不会猜测缺失组合。
+generation_profiles:
+  768P:
+    model_mode: high_quality
+    custom_model: __follow_model_mode__
+    custom_model_high: __follow_model_mode__
+    easy_cache: true
+    steps: 20
+    dimensions:
+      adaptive: {width: 832, height: 480}
+      "21:9": {width: 1104, height: 480}
+      "16:9": {width: 832, height: 480}
+      "4:3": {width: 640, height: 480}
+      "1:1": {width: 480, height: 480}
+      "3:4": {width: 480, height: 640}
+      "9:16": {width: 480, height: 832}
+  2K:
+    model_mode: custom
+    custom_model: __follow_model_mode__
+    custom_model_high: __follow_model_mode__
+    easy_cache: true
+    steps: 20
+    dimensions:
+      adaptive: {width: 1920, height: 1080}
+      "21:9": {width: 2560, height: 1080}
+      "16:9": {width: 1920, height: 1080}
+      "4:3": {width: 1440, height: 1080}
+      "1:1": {width: 1080, height: 1080}
+      "3:4": {width: 1080, height: 1440}
+      "9:16": {width: 1080, height: 1920}

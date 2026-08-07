@@ -1,0 +1,19 @@
+services:
+  frontend:
+    image: minimax-h3-tc:v0.0.1
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: minimax-h3-tc
+    restart: unless-stopped
+    ports:
+      - "18080:18080"
+    env_file:
+      - .env.docker
+    environment:
+      TZ: Asia/Shanghai
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./config.docker.yaml:/app/config.yaml:ro
+      - ./data:/data
