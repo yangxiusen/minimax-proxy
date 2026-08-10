@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 
@@ -84,6 +85,64 @@ func TestValidateCreateAcceptsBase64Image(t *testing.T) {
 	if _, err := ValidateCreate(request, profiles()); err != nil {
 		t.Fatalf("ValidateCreate() error = %v", err)
 	}
+}
+
+func TestValidateCreateAcceptsBase64Audio(t *testing.T) {
+	for _, mediaType := range []string{"audio/wav", "audio/mpeg", "audio/mp3"} {
+		t.Run(mediaType, func(t *testing.T) {
+			request := CreateRequest{
+				Model: "MiniMax-H3",
+				Content: []ContentItem{
+					{Type: "text", Text: "跟随音频节奏"},
+					audio("data:"+mediaType+";base64,UklGRg==", "reference_audio"),
+				},
+				Resolution: "768P",
+				Duration:   4,
+				Ratio:      "adaptive",
+			}
+			if _, err := ValidateCreate(request, profiles()); err != nil {
+				t.Fatalf("ValidateCreate() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateCreateRejectsInvalidBase64Audio(t *testing.T) {
+	tests := []struct {
+		name, source, want string
+	}{
+		{name: "missing payload", source: "data:audio/wav;base64", want: "音频 Base64 格式无效"},
+		{name: "empty payload", source: "data:audio/wav;base64,", want: "音频 Base64 格式无效"},
+		{name: "invalid encoding", source: "data:audio/wav;base64,%%%", want: "音频 Base64 格式无效"},
+		{name: "unsupported mime", source: "data:audio/ogg;base64,T2dnUw==", want: "音频 Base64 类型仅支持 WAV 或 MP3"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := CreateRequest{Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: "保持一致"}, audio(tt.source, "reference_audio")}, Resolution: "768P", Duration: 4, Ratio: "adaptive"}
+			_, err := ValidateCreate(request, profiles())
+			if err == nil || err.Error() != tt.want {
+				t.Fatalf("error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateCreateLimitsDecodedBase64AudioTo15MiB(t *testing.T) {
+	t.Run("exact limit", func(t *testing.T) {
+		source := "data:audio/wav;base64," + base64.StdEncoding.EncodeToString(make([]byte, MaxDecodedAudioBytes))
+		request := CreateRequest{Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: "保持一致"}, audio(source, "reference_audio")}, Resolution: "768P", Duration: 4, Ratio: "adaptive"}
+		if _, err := ValidateCreate(request, profiles()); err != nil {
+			t.Fatalf("ValidateCreate() error = %v", err)
+		}
+	})
+	t.Run("over limit", func(t *testing.T) {
+		source := "data:audio/wav;base64," + base64.StdEncoding.EncodeToString(make([]byte, MaxDecodedAudioBytes+1))
+		request := CreateRequest{Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: "保持一致"}, audio(source, "reference_audio")}, Resolution: "768P", Duration: 4, Ratio: "adaptive"}
+		_, err := ValidateCreate(request, profiles())
+		if err == nil || err.Error() != "音频 Base64 单段不能超过 15 MiB" {
+			t.Fatalf("error = %v", err)
+		}
+	})
 }
 
 func TestValidateCreateRejectsNonURLAudioAndVideo(t *testing.T) {

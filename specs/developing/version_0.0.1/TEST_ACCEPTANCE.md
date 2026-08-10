@@ -34,7 +34,7 @@ docker build -t minimax-h3-tc:v0.0.1 .
 | API-07 | DELETE running/cancelled | 返回不可操作错误，状态不变 |
 | API-08 | 无效 Bearer Key 或跨 Key 查询 | 返回鉴权/无效任务错误，不泄露归属 |
 
-兼容性差异必须有固定回归用例：队首保护区内的 `queued` 不可取消；`callback_url`、`aigc_watermark=true`、`mm_file://` 和 Data URI 被明确拒绝。
+兼容性差异必须有固定回归用例：队首保护区内的 `queued` 不可取消；图片与 WAV/MP3 音频 Data URI 被接受，视频 Data URI、裸 Base64、`callback_url`、`aigc_watermark=true` 和 `mm_file://` 被明确拒绝。
 
 ## 3. 队列与并发验收
 

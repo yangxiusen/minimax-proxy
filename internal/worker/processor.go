@@ -35,6 +35,10 @@ type GradioClient interface {
 	Call(context.Context, string, []any) ([]any, error)
 }
 
+type ArgumentPreparer interface {
+	PrepareArguments(context.Context, v2.ValidatedRequest, config.GenerationProfile) ([]any, error)
+}
+
 type JobsClient interface {
 	ListJobs(context.Context) ([]gradio.Job, error)
 	GetJob(context.Context, string) (gradio.Job, error)
@@ -83,11 +87,6 @@ func (p *Processor) ProcessOne(ctx context.Context) error {
 	if err != nil {
 		return p.fail(ctx, task, "invalid_persisted_request", "持久化请求不再符合配置")
 	}
-	arguments, err := gradio.BuildArguments(validated, p.Profiles[validated.Resolution])
-	if err != nil {
-		return p.fail(ctx, task, "upstream_mapping_error", "无法映射上游参数")
-	}
-
 	if jobs, ok := p.Client.(JobsClient); ok {
 		before, listErr := jobs.ListJobs(ctx)
 		if listErr != nil {
@@ -121,6 +120,10 @@ func (p *Processor) ProcessOne(ctx context.Context) error {
 	baseline := gradio.GalleryURLs(baselineResult[0])
 	if err := p.Store.SaveBaseline(ctx, task.TaskID, p.Upstream.ID, baseline); err != nil {
 		return err
+	}
+	arguments, err := p.prepareArguments(ctx, validated)
+	if err != nil {
+		return p.fail(ctx, task, "upstream_media_upload_failed", "参考音频上传私有服务失败")
 	}
 
 	p.Logger.InfoContext(ctx, "开始向私有服务提交任务", "task_id", task.TaskID, "upstream_id", p.Upstream.ID, "stage", "submit")
@@ -377,9 +380,9 @@ func (p *Processor) retryOrFail(ctx context.Context, task domain.Task, validated
 	if err := p.Store.BeginRetry(ctx, task.TaskID, p.Upstream.ID, jobIDs(currentJobs), galleryBefore); err != nil {
 		return err
 	}
-	arguments, err := gradio.BuildArguments(validated, p.Profiles[validated.Resolution])
+	arguments, err := p.prepareArguments(ctx, validated)
 	if err != nil {
-		return p.fail(ctx, task, "upstream_mapping_error", "无法映射上游参数")
+		return p.fail(ctx, task, "upstream_media_upload_failed", "参考音频上传私有服务失败")
 	}
 	p.Logger.WarnContext(ctx, "私有任务丢失，自动重试一次", "task_id", task.TaskID, "api_key_id", task.APIKeyID, "upstream_id", p.Upstream.ID, "stage", "retry", "error_code", code, "retry_count", 1)
 	if _, err := p.Client.Call(ctx, p.Upstream.SubmitAPIName, arguments); err != nil {
@@ -514,6 +517,14 @@ func (p *Processor) pollInterval() time.Duration {
 		return p.Upstream.PollInterval
 	}
 	return 3 * time.Second
+}
+
+func (p *Processor) prepareArguments(ctx context.Context, request v2.ValidatedRequest) ([]any, error) {
+	profile := p.Profiles[request.Resolution]
+	if preparer, ok := p.Client.(ArgumentPreparer); ok {
+		return preparer.PrepareArguments(ctx, request, profile)
+	}
+	return gradio.BuildArguments(request, profile)
 }
 
 func jobIDs(jobs []gradio.Job) []string {

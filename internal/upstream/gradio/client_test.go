@@ -238,6 +238,98 @@ func TestBuildArgumentsUsesURLFieldForBase64Image(t *testing.T) {
 	}
 }
 
+func TestClientPrepareArgumentsUploadsBase64Audio(t *testing.T) {
+	var uploadCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/gradio_api/upload" {
+			http.NotFound(w, r)
+			return
+		}
+		uploadCalls++
+		if err := r.ParseMultipartForm(16 << 20); err != nil {
+			t.Fatal(err)
+		}
+		file, header, err := r.FormFile("files")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		content, err := io.ReadAll(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if header.Filename != "reference-audio-1.wav" || string(content) != "RIFF" {
+			t.Fatalf("filename=%q content=%q", header.Filename, content)
+		}
+		_ = json.NewEncoder(w).Encode([]string{`C:\gradio-cache\reference-audio-1.wav`})
+	}))
+	defer server.Close()
+	base, _ := url.Parse(server.URL)
+	client := NewClient(base, server.Client(), 1<<20)
+	request := v2.ValidatedRequest{
+		CreateRequest: v2.CreateRequest{Model: "MiniMax-H3", Content: []v2.ContentItem{
+			{Type: "text", Text: "跟随音频"},
+			{Type: "audio_url", AudioURL: &v2.URLValue{URL: "data:audio/wav;base64,UklGRg=="}, Role: "reference_audio"},
+		}, Resolution: "768P", Duration: 4, Ratio: "adaptive"},
+		Scenario: "r2va", Prompt: "跟随音频", Width: 768, Height: 768,
+	}
+
+	args, err := client.PrepareArguments(context.Background(), request, config.GenerationProfile{ModelMode: "high_quality", Steps: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileData, ok := args[29].(FileData)
+	if !ok || fileData.Path != `C:\gradio-cache\reference-audio-1.wav` || fileData.URL != "" || uploadCalls != 1 {
+		t.Fatalf("audio=%#v upload calls=%d", args[29], uploadCalls)
+	}
+}
+
+func TestClientPrepareArgumentsKeepsHTTPAudioWithoutUpload(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer server.Close()
+	base, _ := url.Parse(server.URL)
+	client := NewClient(base, server.Client(), 1<<20)
+	request := v2.ValidatedRequest{
+		CreateRequest: v2.CreateRequest{Model: "MiniMax-H3", Content: []v2.ContentItem{
+			{Type: "text", Text: "跟随音频"},
+			{Type: "audio_url", AudioURL: &v2.URLValue{URL: "https://media.example/reference.mp3"}, Role: "reference_audio"},
+		}, Resolution: "768P", Duration: 4, Ratio: "adaptive"},
+		Scenario: "r2va", Prompt: "跟随音频", Width: 768, Height: 768,
+	}
+
+	args, err := client.PrepareArguments(context.Background(), request, config.GenerationProfile{ModelMode: "high_quality", Steps: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileData, ok := args[29].(FileData)
+	if !ok || fileData.Path != "https://media.example/reference.mp3" {
+		t.Fatalf("audio = %#v", args[29])
+	}
+}
+
+func TestClientPrepareArgumentsRejectsInvalidUploadResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]string{})
+	}))
+	defer server.Close()
+	base, _ := url.Parse(server.URL)
+	client := NewClient(base, server.Client(), 1<<20)
+	request := v2.ValidatedRequest{
+		CreateRequest: v2.CreateRequest{Content: []v2.ContentItem{
+			{Type: "text", Text: "跟随音频"},
+			{Type: "audio_url", AudioURL: &v2.URLValue{URL: "data:audio/mpeg;base64,SUQz"}, Role: "reference_audio"},
+		}, Resolution: "768P", Duration: 4, Ratio: "adaptive"},
+		Scenario: "r2va", Prompt: "跟随音频", Width: 768, Height: 768,
+	}
+
+	_, err := client.PrepareArguments(context.Background(), request, config.GenerationProfile{ModelMode: "high_quality", Steps: 20})
+	if err == nil || !strings.Contains(err.Error(), "未返回唯一文件路径") {
+		t.Fatalf("PrepareArguments() error = %v", err)
+	}
+}
+
 func TestGalleryDeltaAndPublicURLMapping(t *testing.T) {
 	before := []string{"http://private.local/gradio_api/file=/old.mp4"}
 	gallery := []any{map[string]any{"video": map[string]any{"url": "http://private.local/gradio_api/file=/old.mp4"}}, map[string]any{"path": "http://private.local/gradio_api/file=/new.mp4?token=x"}}

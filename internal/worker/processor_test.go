@@ -14,6 +14,7 @@ import (
 
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/httpapi/v2"
 	"minimax-h3-tc/internal/monitor"
 	"minimax-h3-tc/internal/store/sqlite"
 	"minimax-h3-tc/internal/upstream/gradio"
@@ -251,12 +252,31 @@ func TestProcessOneFailsTaskWhenUpstreamExplicitlyRejectsSubmit(t *testing.T) {
 	}
 }
 
+func TestProcessOneFailsTaskWhenAudioUploadPreparationFails(t *testing.T) {
+	store := workerStore(t)
+	createWorkerTask(t, store, "upload-failed-1")
+	client := &prepareErrorClient{}
+	processor := workerProcessor(store, client, monitor.NewCache([]monitor.NodeSnapshot{{ID: "gpu-1"}}))
+
+	if err := processor.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.Get(context.Background(), "owner", "upload-failed-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != domain.StatusFailed || task.ErrorCode != "upstream_media_upload_failed" || client.calls != 1 {
+		t.Fatalf("task=%+v calls=%d", task, client.calls)
+	}
+}
+
 func TestProcessOneRetriesLostPrivateJobOnce(t *testing.T) {
 	store := workerStore(t)
 	createWorkerTask(t, store, "lost-retry-1")
 	firstJob := "11111111-1111-1111-1111-111111111111"
 	secondJob := "22222222-2222-2222-2222-222222222222"
 	client := &lifecycleClient{
+		preparePaths: []string{`C:\gradio-cache\first.wav`, `C:\gradio-cache\retry.wav`},
 		callResults: [][]any{
 			{[]any{}, "idle", 0, ""},
 			{"submitted"},
@@ -285,8 +305,11 @@ func TestProcessOneRetriesLostPrivateJobOnce(t *testing.T) {
 	if task.Status != domain.StatusSucceeded || task.RetryCount != 1 || task.ResultPublicURL != "https://video.example.com/retried.mp4" {
 		t.Fatalf("task = %+v", task)
 	}
-	if client.submitCalls != 2 || client.cancelCalls != 1 {
-		t.Fatalf("submit calls = %d, cancel calls = %d", client.submitCalls, client.cancelCalls)
+	if client.submitCalls != 2 || client.cancelCalls != 1 || client.prepareCalls != 2 {
+		t.Fatalf("submit calls = %d, cancel calls = %d, prepare calls = %d", client.submitCalls, client.cancelCalls, client.prepareCalls)
+	}
+	if len(client.submittedAudioPaths) != 2 || client.submittedAudioPaths[0] != `C:\gradio-cache\first.wav` || client.submittedAudioPaths[1] != `C:\gradio-cache\retry.wav` {
+		t.Fatalf("submitted audio paths = %#v", client.submittedAudioPaths)
 	}
 }
 
@@ -593,23 +616,52 @@ type scriptedClient struct {
 }
 
 type lifecycleClient struct {
-	callResults  [][]any
-	callErrors   []error
-	jobLists     [][]gradio.Job
-	listErrors   []error
-	getJobs      []gradio.Job
-	getErrors    []error
-	cancelErrors []error
-	callIndex    int
-	listIndex    int
-	getIndex     int
-	cancelCalls  int
-	submitCalls  int
+	callResults         [][]any
+	callErrors          []error
+	jobLists            [][]gradio.Job
+	listErrors          []error
+	getJobs             []gradio.Job
+	getErrors           []error
+	cancelErrors        []error
+	callIndex           int
+	listIndex           int
+	getIndex            int
+	cancelCalls         int
+	submitCalls         int
+	prepareCalls        int
+	preparePaths        []string
+	submittedAudioPaths []string
 }
 
-func (c *lifecycleClient) Call(_ context.Context, apiName string, _ []any) ([]any, error) {
+type prepareErrorClient struct {
+	calls int
+}
+
+func (c *prepareErrorClient) Call(context.Context, string, []any) ([]any, error) {
+	c.calls++
+	return []any{[]any{}, "idle", 0, ""}, nil
+}
+
+func (c *prepareErrorClient) PrepareArguments(context.Context, v2.ValidatedRequest, config.GenerationProfile) ([]any, error) {
+	return nil, errors.New("upload failed")
+}
+
+func (c *lifecycleClient) PrepareArguments(_ context.Context, request v2.ValidatedRequest, profile config.GenerationProfile) ([]any, error) {
+	index := c.prepareCalls
+	c.prepareCalls++
+	arguments, err := gradio.BuildArguments(request, profile)
+	if err == nil && index < len(c.preparePaths) {
+		arguments[29] = gradio.FileData{Path: c.preparePaths[index], Meta: gradio.FileMeta{Type: "gradio.FileData"}}
+	}
+	return arguments, err
+}
+
+func (c *lifecycleClient) Call(_ context.Context, apiName string, arguments []any) ([]any, error) {
 	if apiName == "submit" || apiName == "submit_minimax_from_slots" {
 		c.submitCalls++
+		if file, ok := arguments[29].(gradio.FileData); ok {
+			c.submittedAudioPaths = append(c.submittedAudioPaths, file.Path)
+		}
 	}
 	index := c.callIndex
 	c.callIndex++

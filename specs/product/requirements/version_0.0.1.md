@@ -61,7 +61,7 @@
 - 首尾帧场景与任一 `reference_*` 场景互斥。
 - `callback_url` 不在首版范围；请求携带时返回参数不支持错误，不静默忽略。
 - 中转层必须完成校验和场景识别，再映射为固定 32 位 Gradio `data` 数组。
-- 首版只承诺私有服务可直接访问的 HTTP/HTTPS 媒体 URL；`mm_file://` 和 Data URI 的落地能力在技术方案中列为兼容差异。
+- 图片支持 HTTP/HTTPS URL 和图片 Base64 Data URI；音频支持 HTTP/HTTPS URL 和 WAV/MP3 Base64 Data URI；视频只支持私有服务可访问的 HTTP/HTTPS URL。`mm_file://` 和视频 Data URI 不支持。
 
 ### 4.2 支持场景
 

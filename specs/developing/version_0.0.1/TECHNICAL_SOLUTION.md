@@ -203,7 +203,7 @@ generation_profiles:
 | 26-28 | 参考视频 | `reference_video` 按 content 顺序 |
 | 29-31 | 参考音频 | `reference_audio` 按 content 顺序 |
 
-首版只接受 HTTP/HTTPS 媒体 URL，并生成 `{path:url,meta:{_type:"gradio.FileData"}}`。`mm_file://` 和 Data URI 返回 400 `unsupported_media_source`；`callback_url` 和 `aigc_watermark=true` 返回 400 `unsupported_feature`。这些限制必须写入兼容性说明，不得静默忽略。
+HTTP/HTTPS 媒体 URL 生成 `{path:url,meta:{_type:"gradio.FileData"}}`。图片 Base64 Data URI 生成图片 `FileData.url`；WAV/MP3 音频 Base64 Data URI 在提交前通过 `/gradio_api/upload` 换取私有缓存路径，再写入音频 `FileData.path`。视频 Data URI、裸 Base64 和 `mm_file://` 返回 400；`callback_url` 和 `aigc_watermark=true` 继续返回不支持错误，不得静默忽略。
 
 ## 8. 创建、领取与取消事务
 

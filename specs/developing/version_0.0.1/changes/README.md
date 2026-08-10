@@ -20,6 +20,7 @@
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 001-monitor-console | 只读监控控制台与节点状态缓存 | 迭代 | In Progress | 待人工填写 | CHANGE_SPEC.md、PRD_DELTA.md、PROTOTYPE_DELTA.md、TECH_SOLUTION.md、API_DELTA.md、task.md、TEST_ACCEPTANCE.md | `specs/developing/version_0.0.1/changes/001-monitor-console/` | 实现与本地验收完成，待 Docker 和真实环境人工联调 |
 | 002-task-lifecycle-closure | 任务恢复、中止、删除与视频访问闭环 | 缺陷修复/迭代 | In Progress | 待人工填写 | CHANGE_SPEC.md、PRD_DELTA.md、TECH_SOLUTION.md、DATABASE_DELTA.md、API_DELTA.md、PROTOTYPE_DELTA.md、task.md、TEST_ACCEPTANCE.md | `specs/developing/version_0.0.1/changes/002-task-lifecycle-closure/` | 设计完成，待开发与真实模型故障演练 |
+| 003-audio-base64-input | 音频 Data URI 输入与私有上传适配 | 兼容修复 | In Progress | 待人工填写 | CHANGE_SPEC.md、API_DELTA.md、TECH_SOLUTION.md、task.md、TEST_ACCEPTANCE.md | `specs/developing/version_0.0.1/changes/003-audio-base64-input/` | 实现与本地验证完成，真实私有服务联调待人工确认 |
 
 ## 维护规则
 

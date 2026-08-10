@@ -33,6 +33,8 @@ type URLValue struct {
 	URL string `json:"url"`
 }
 
+const MaxDecodedAudioBytes = 15 << 20
+
 type ValidatedRequest struct {
 	CreateRequest
 	Scenario, Prompt string
@@ -110,7 +112,7 @@ func ValidateCreate(request CreateRequest, profiles map[string]config.Generation
 			if item.AudioURL == nil || item.ImageURL != nil || item.VideoURL != nil || item.Text != "" || item.Role != "reference_audio" {
 				return ValidatedRequest{}, fmt.Errorf("audio_url 必须使用 reference_audio role")
 			}
-			if err := validateAccessibleMediaURL(item.AudioURL.URL); err != nil {
+			if err := validateAudioSource(item.AudioURL.URL); err != nil {
 				return ValidatedRequest{}, err
 			}
 			referenceAudios++
@@ -190,6 +192,45 @@ func validateAccessibleMediaURL(value string) error {
 		return fmt.Errorf("音频视频必须要上传可以访问的url。")
 	}
 	return nil
+}
+
+func validateAudioSource(value string) error {
+	_, _, isDataURI, err := ParseAudioDataURI(value)
+	if isDataURI {
+		return err
+	}
+	return validateAccessibleMediaURL(value)
+}
+
+func ParseAudioDataURI(value string) (string, []byte, bool, error) {
+	if !strings.HasPrefix(value, "data:") {
+		return "", nil, false, nil
+	}
+	header, encoded, ok := strings.Cut(value, ",")
+	if !ok || encoded == "" {
+		return "", nil, true, fmt.Errorf("音频 Base64 格式无效")
+	}
+	mediaType, encoding, ok := strings.Cut(strings.TrimPrefix(header, "data:"), ";")
+	if !ok || !strings.EqualFold(encoding, "base64") {
+		return "", nil, true, fmt.Errorf("音频 Base64 格式无效")
+	}
+	switch strings.ToLower(mediaType) {
+	case "audio/wav", "audio/mpeg", "audio/mp3":
+		mediaType = strings.ToLower(mediaType)
+	default:
+		return "", nil, true, fmt.Errorf("音频 Base64 类型仅支持 WAV 或 MP3")
+	}
+	if len(encoded) > base64.StdEncoding.EncodedLen(MaxDecodedAudioBytes) {
+		return "", nil, true, fmt.Errorf("音频 Base64 单段不能超过 15 MiB")
+	}
+	decoded, err := base64.StdEncoding.Strict().DecodeString(encoded)
+	if err != nil {
+		return "", nil, true, fmt.Errorf("音频 Base64 格式无效")
+	}
+	if len(decoded) > MaxDecodedAudioBytes {
+		return "", nil, true, fmt.Errorf("音频 Base64 单段不能超过 15 MiB")
+	}
+	return mediaType, decoded, true, nil
 }
 
 func validRatio(value string) bool {

@@ -51,7 +51,7 @@ Body 参数：
 | `text` | string | type=text | 1-7000 字符 |
 | `image_url.url` | string | type=image_url | HTTP/HTTPS；其他官方来源首版拒绝 |
 | `video_url.url` | string | type=video_url | HTTP/HTTPS |
-| `audio_url.url` | string | type=audio_url | HTTP/HTTPS |
+| `audio_url.url` | string | type=audio_url | HTTP/HTTPS，或 `audio/wav`、`audio/mpeg`、`audio/mp3` Base64 Data URI（单段解码后不超过 15 MiB） |
 | `role` | string | 媒体条件必填 | `first_frame/last_frame/reference_image/reference_video/reference_audio` |
 
 场景校验：
@@ -66,7 +66,7 @@ Body 参数：
 - 单张无 role 图片按 first_frame 处理；其他媒体缺 role 返回 400。
 - 类型与 role 必须匹配：video 只能 reference_video，audio 只能 reference_audio。
 - 首版结构校验文件扩展名和 URL，不主动下载探测大小、编码、分辨率或时长；真实限制由上游联调验证。
-- `mm_file://`、Data URI 返回 `unsupported_media_source`，不尝试隐式转换。
+- `mm_file://`、裸 Base64 和视频 Data URI 不支持；图片及指定 WAV/MP3 音频 Data URI 按上表规则处理。
 
 成功响应：
 
