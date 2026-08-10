@@ -13,7 +13,8 @@ import (
 )
 
 type FileData struct {
-	Path string   `json:"path"`
+	Path string   `json:"path,omitempty"`
+	URL  string   `json:"url,omitempty"`
 	Meta FileMeta `json:"meta"`
 }
 type FileMeta struct {
@@ -46,9 +47,9 @@ func BuildArguments(request v2.ValidatedRequest, profile config.GenerationProfil
 		var rawURL string
 		switch item.Role {
 		case "first_frame":
-			args[5], rawURL = fileData(item.ImageURL.URL), item.ImageURL.URL
+			args[5], rawURL = imageData(item.ImageURL.URL), item.ImageURL.URL
 		case "last_frame":
-			args[6], rawURL = fileData(item.ImageURL.URL), item.ImageURL.URL
+			args[6], rawURL = imageData(item.ImageURL.URL), item.ImageURL.URL
 		case "reference_image":
 			target, rawURL = &imageIndex, item.ImageURL.URL
 		case "reference_video":
@@ -57,7 +58,11 @@ func BuildArguments(request v2.ValidatedRequest, profile config.GenerationProfil
 			target, rawURL = &audioIndex, item.AudioURL.URL
 		}
 		if target != nil {
-			args[*target] = fileData(rawURL)
+			if item.Role == "reference_image" {
+				args[*target] = imageData(rawURL)
+			} else {
+				args[*target] = fileData(rawURL)
+			}
 			*target++
 		}
 	}
@@ -66,6 +71,13 @@ func BuildArguments(request v2.ValidatedRequest, profile config.GenerationProfil
 
 func fileData(value string) FileData {
 	return FileData{Path: value, Meta: FileMeta{Type: "gradio.FileData"}}
+}
+
+func imageData(value string) FileData {
+	if strings.HasPrefix(value, "data:image/") {
+		return FileData{URL: value, Meta: FileMeta{Type: "gradio.FileData"}}
+	}
+	return fileData(value)
 }
 
 func GalleryURLs(gallery any) []string {

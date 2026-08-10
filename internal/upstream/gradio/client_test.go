@@ -151,6 +151,22 @@ func TestBuildArgumentsUsesOfficialImageToVideoModeForFirstAndLastFrames(t *test
 	}
 }
 
+func TestBuildArgumentsUsesURLFieldForBase64Image(t *testing.T) {
+	const imageData = "data:image/png;base64,iVBORw0KGgo="
+	request := v2.ValidatedRequest{CreateRequest: v2.CreateRequest{Model: "MiniMax-H3", Content: []v2.ContentItem{{Type: "text", Text: "首帧"}, {Type: "image_url", ImageURL: &v2.URLValue{URL: imageData}, Role: "first_frame"}}, Resolution: "768P", Duration: 4, Ratio: "adaptive"}, Scenario: "i2va", Prompt: "首帧", Width: 768, Height: 768, InputImageCount: 1}
+	args, err := BuildArguments(request, config.GenerationProfile{ModelMode: "high_quality", Steps: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(args[5])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != `{"url":"data:image/png;base64,iVBORw0KGgo=","meta":{"_type":"gradio.FileData"}}` {
+		t.Fatalf("base64 image = %s, want Gradio ImageData url", encoded)
+	}
+}
+
 func TestGalleryDeltaAndPublicURLMapping(t *testing.T) {
 	before := []string{"http://private.local/gradio_api/file=/old.mp4"}
 	gallery := []any{map[string]any{"video": map[string]any{"url": "http://private.local/gradio_api/file=/old.mp4"}}, map[string]any{"path": "http://private.local/gradio_api/file=/new.mp4?token=x"}}

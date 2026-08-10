@@ -41,6 +41,41 @@ func TestValidateCreateNormalizesI2VARatio(t *testing.T) {
 	}
 }
 
+func TestValidateCreateAcceptsBase64Image(t *testing.T) {
+	request := CreateRequest{
+		Model: "MiniMax-H3",
+		Content: []ContentItem{
+			{Type: "text", Text: "动起来"},
+			image("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "first_frame"),
+		},
+		Resolution: "768P",
+		Duration:   4,
+		Ratio:      "adaptive",
+	}
+	if _, err := ValidateCreate(request, profiles()); err != nil {
+		t.Fatalf("ValidateCreate() error = %v", err)
+	}
+}
+
+func TestValidateCreateRejectsNonURLAudioAndVideo(t *testing.T) {
+	tests := []struct {
+		name string
+		item ContentItem
+	}{
+		{name: "video", item: video("data:video/mp4;base64,AAAA", "reference_video")},
+		{name: "audio", item: audio("C:/media/reference.wav", "reference_audio")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := CreateRequest{Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: "保持一致"}, tt.item}, Resolution: "768P", Duration: 4, Ratio: "adaptive"}
+			_, err := ValidateCreate(request, profiles())
+			if err == nil || err.Error() != "音频视频必须要上传可以访问的url。" {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateCreateRejectsUnsupportedAndInvalidInputs(t *testing.T) {
 	callback := "https://callback.example.com"
 	watermark := true

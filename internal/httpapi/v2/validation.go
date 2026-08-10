@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"strings"
@@ -79,7 +80,7 @@ func ValidateCreate(request CreateRequest, profiles map[string]config.Generation
 			if item.ImageURL == nil || item.VideoURL != nil || item.AudioURL != nil || item.Text != "" {
 				return ValidatedRequest{}, fmt.Errorf("image_url 元素结构无效")
 			}
-			if err := validateMediaURL(item.ImageURL.URL); err != nil {
+			if err := validateImageSource(item.ImageURL.URL); err != nil {
 				return ValidatedRequest{}, err
 			}
 			if item.Role == "" {
@@ -99,7 +100,7 @@ func ValidateCreate(request CreateRequest, profiles map[string]config.Generation
 			if item.VideoURL == nil || item.ImageURL != nil || item.AudioURL != nil || item.Text != "" || item.Role != "reference_video" {
 				return ValidatedRequest{}, fmt.Errorf("video_url 必须使用 reference_video role")
 			}
-			if err := validateMediaURL(item.VideoURL.URL); err != nil {
+			if err := validateAccessibleMediaURL(item.VideoURL.URL); err != nil {
 				return ValidatedRequest{}, err
 			}
 			referenceVideos++
@@ -107,7 +108,7 @@ func ValidateCreate(request CreateRequest, profiles map[string]config.Generation
 			if item.AudioURL == nil || item.ImageURL != nil || item.VideoURL != nil || item.Text != "" || item.Role != "reference_audio" {
 				return ValidatedRequest{}, fmt.Errorf("audio_url 必须使用 reference_audio role")
 			}
-			if err := validateMediaURL(item.AudioURL.URL); err != nil {
+			if err := validateAccessibleMediaURL(item.AudioURL.URL); err != nil {
 				return ValidatedRequest{}, err
 			}
 			referenceAudios++
@@ -160,13 +161,31 @@ func ValidateCreate(request CreateRequest, profiles map[string]config.Generation
 	return validated, nil
 }
 
-func validateMediaURL(value string) error {
-	if strings.HasPrefix(value, "mm_file://") || strings.HasPrefix(strings.ToLower(value), "data:") {
+func validateImageSource(value string) error {
+	if strings.HasPrefix(value, "data:") {
+		header, encoded, ok := strings.Cut(value, ",")
+		if !ok || !strings.HasPrefix(header, "data:image/") || !strings.HasSuffix(strings.ToLower(header), ";base64") || encoded == "" {
+			return fmt.Errorf("图片 Base64 格式无效")
+		}
+		if _, err := base64.StdEncoding.Strict().DecodeString(encoded); err != nil {
+			return fmt.Errorf("图片 Base64 格式无效")
+		}
+		return nil
+	}
+	if strings.HasPrefix(value, "mm_file://") {
 		return fmt.Errorf("该媒体来源暂不支持")
 	}
 	parsed, err := url.Parse(value)
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil {
 		return fmt.Errorf("媒体 URL 必须是无凭据的 HTTP/HTTPS 地址")
+	}
+	return nil
+}
+
+func validateAccessibleMediaURL(value string) error {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil {
+		return fmt.Errorf("音频视频必须要上传可以访问的url。")
 	}
 	return nil
 }
