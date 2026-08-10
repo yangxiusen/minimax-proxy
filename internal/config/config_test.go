@@ -130,6 +130,16 @@ func TestLoadRejectsIncompleteGenerationProfile(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsGenerationDimensionNotMultipleOf32(t *testing.T) {
+	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
+	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
+	yaml := strings.Replace(validYAML(t), "adaptive: {width: 832, height: 480}", "adaptive: {width: 830, height: 480}", 1)
+	_, err := Load(writeConfig(t, yaml))
+	if err == nil || !strings.Contains(err.Error(), "32 的倍数") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
 func TestLoadRejectsConfigWithoutEnabledAPIKey(t *testing.T) {
 	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
 	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
@@ -202,7 +212,7 @@ generation_profiles:
     steps: 20
     dimensions:
       adaptive: {width: 832, height: 480}
-      "21:9": {width: 1104, height: 480}
+      "21:9": {width: 1120, height: 480}
       "16:9": {width: 832, height: 480}
       "4:3": {width: 640, height: 480}
       "1:1": {width: 480, height: 480}
@@ -212,12 +222,12 @@ generation_profiles:
     model_mode: custom
     steps: 20
     dimensions:
-      adaptive: {width: 1920, height: 1080}
-      "21:9": {width: 2560, height: 1080}
-      "16:9": {width: 1920, height: 1080}
-      "4:3": {width: 1440, height: 1080}
-      "1:1": {width: 1080, height: 1080}
-      "3:4": {width: 1080, height: 1440}
-      "9:16": {width: 1080, height: 1920}
+      adaptive: {width: 1920, height: 1088}
+      "21:9": {width: 2560, height: 1088}
+      "16:9": {width: 1920, height: 1088}
+      "4:3": {width: 1440, height: 1088}
+      "1:1": {width: 1088, height: 1088}
+      "3:4": {width: 1088, height: 1440}
+      "9:16": {width: 1088, height: 1920}
 `
 }

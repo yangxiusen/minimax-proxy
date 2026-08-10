@@ -47,7 +47,7 @@ generation_profiles:
     steps: 20
     dimensions:
       adaptive: {width: 832, height: 480}
-      "21:9": {width: 1104, height: 480}
+      "21:9": {width: 1120, height: 480}
       "16:9": {width: 832, height: 480}
       "4:3": {width: 640, height: 480}
       "1:1": {width: 480, height: 480}
@@ -60,10 +60,10 @@ generation_profiles:
     easy_cache: true
     steps: 20
     dimensions:
-      adaptive: {width: 1920, height: 1080}
-      "21:9": {width: 2560, height: 1080}
-      "16:9": {width: 1920, height: 1080}
-      "4:3": {width: 1440, height: 1080}
-      "1:1": {width: 1080, height: 1080}
-      "3:4": {width: 1080, height: 1440}
-      "9:16": {width: 1080, height: 1920}
+      adaptive: {width: 1920, height: 1088}
+      "21:9": {width: 2560, height: 1088}
+      "16:9": {width: 1920, height: 1088}
+      "4:3": {width: 1440, height: 1088}
+      "1:1": {width: 1088, height: 1088}
+      "3:4": {width: 1088, height: 1440}
+      "9:16": {width: 1088, height: 1920}

@@ -368,6 +368,9 @@ func validate(cfg Config) error {
 			if dimension.Width <= 0 || dimension.Height <= 0 {
 				return fmt.Errorf("generation_profiles.%s.%s 尺寸无效", resolution, ratio)
 			}
+			if dimension.Width%32 != 0 || dimension.Height%32 != 0 {
+				return fmt.Errorf("generation_profiles.%s.%s 的宽高必须是 32 的倍数", resolution, ratio)
+			}
 		}
 	}
 	return nil
