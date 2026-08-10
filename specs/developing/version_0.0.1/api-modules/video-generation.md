@@ -37,7 +37,7 @@ Body 参数：
 | --- | --- | --- | --- |
 | `model` | string | 是 | 固定 `MiniMax-H3` |
 | `content` | array | 是 | 1-16 项，恰好一个非空 text |
-| `resolution` | string | 是 | `768P`、`2K` |
+| `resolution` | string | 是 | `480P`、`768P`、`2K` |
 | `duration` | integer | 是 | 4-15 |
 | `ratio` | string | 场景相关 | `adaptive/21:9/16:9/4:3/1:1/3:4/9:16` |
 | `callback_url` | string | 否 | 首版不支持；出现即 400 |
@@ -166,4 +166,3 @@ HTTP/1.1 409 Conflict
 - [ ] 使用官方 V2 三类示例验证 JSON 兼容。
 - [ ] 使用真实 profile 验证 32 位参数顺序。
 - [ ] 验证私有实例能访问媒体 HTTP/HTTPS URL。
-

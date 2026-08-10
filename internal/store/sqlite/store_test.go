@@ -2,14 +2,68 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/migrations"
 )
+
+func TestOpenMigratesLegacyResolutionTier(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacySchema := strings.Replace(migrations.Initial, "('480P','768P','2K')", "('768P','2K')", 1)
+	if _, err := db.ExecContext(ctx, legacySchema); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO schema_migrations(version,applied_at) VALUES(1,1)"); err != nil {
+		t.Fatal(err)
+	}
+	requestJSON := `{"model":"MiniMax-H3","content":[{"type":"text","text":"legacy"}],"resolution":"768P","duration":5,"ratio":"16:9"}`
+	if _, err := db.ExecContext(ctx, `INSERT INTO video_tasks(task_id,api_key_id,scenario,request_json,request_hash,resolution,duration,ratio_requested,created_at,updated_at,expires_at) VALUES('legacy','owner','t2va',?,'hash','768P',5,'16:9',1,1,100)`, requestJSON); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(ctx, path, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 100, Retention: time.Hour, IdempotencyTTL: time.Hour})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer store.Close()
+
+	var versionCount int
+	if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations WHERE version=2").Scan(&versionCount); err != nil {
+		t.Fatal(err)
+	}
+	if versionCount != 1 {
+		t.Fatalf("migration version 2 count = %d", versionCount)
+	}
+	var resolution, migratedJSON string
+	if err := store.db.QueryRowContext(ctx, "SELECT resolution,request_json FROM video_tasks WHERE task_id='legacy'").Scan(&resolution, &migratedJSON); err != nil {
+		t.Fatal(err)
+	}
+	if resolution != "480P" || !strings.Contains(migratedJSON, `"resolution":"480P"`) {
+		t.Fatalf("resolution = %q, request_json = %s", resolution, migratedJSON)
+	}
+
+	input := task("new-480", "owner")
+	input.Resolution = "480P"
+	input.RequestJSON = strings.Replace(input.RequestJSON, `"resolution":"2K"`, `"resolution":"480P"`, 1)
+	if _, err := store.Create(ctx, input, "", nil); err != nil {
+		t.Fatalf("Create(480P) error = %v", err)
+	}
+}
 
 func TestCreateProtectsQueueAndClaimsFIFO(t *testing.T) {
 	store := newStore(t, Options{ProtectedSlots: 3, PerKeyLimit: 10, GlobalLimit: 100})

@@ -151,11 +151,16 @@ upstreams:
     request_timeout: 30s
 
 generation_profiles:
-  768P:
+  480P:
     model_mode: high_quality
     steps: 20
     dimensions:
       "16:9": {width: 832, height: 480}
+  768P:
+    model_mode: high_quality
+    steps: 20
+    dimensions:
+      "16:9": {width: 1344, height: 768}
   2K:
     model_mode: custom
     steps: 20

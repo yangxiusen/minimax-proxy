@@ -80,6 +80,18 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, ?)", s.nowUnix()); err != nil {
 		return err
 	}
+	var version2Applied int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations WHERE version=2").Scan(&version2Applied); err != nil {
+		return fmt.Errorf("查询数据库迁移版本: %w", err)
+	}
+	if version2Applied == 0 {
+		if _, err := tx.ExecContext(ctx, migrations.ResolutionTiers); err != nil {
+			return fmt.Errorf("执行分辨率档位迁移: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES(2, ?)", s.nowUnix()); err != nil {
+			return fmt.Errorf("记录数据库迁移版本: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交数据库迁移: %w", err)
 	}

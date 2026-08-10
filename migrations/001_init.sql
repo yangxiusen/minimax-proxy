@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS video_tasks (
     gallery_before_json TEXT,
     result_internal_url TEXT,
     result_public_url TEXT,
-    resolution TEXT NOT NULL CHECK (resolution IN ('768P','2K')),
+    resolution TEXT NOT NULL CHECK (resolution IN ('480P','768P','2K')),
     duration INTEGER NOT NULL CHECK (duration BETWEEN 4 AND 15),
     ratio_requested TEXT NOT NULL DEFAULT 'adaptive',
     ratio_actual TEXT,

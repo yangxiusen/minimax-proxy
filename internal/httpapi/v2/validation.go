@@ -47,8 +47,10 @@ func ValidateCreate(request CreateRequest, profiles map[string]config.Generation
 	if len(request.Content) < 1 || len(request.Content) > 16 {
 		return ValidatedRequest{}, fmt.Errorf("content 数量必须为 1-16")
 	}
-	if request.Resolution != "768P" && request.Resolution != "2K" {
-		return ValidatedRequest{}, fmt.Errorf("resolution 仅支持 768P 或 2K")
+	switch request.Resolution {
+	case "480P", "768P", "2K":
+	default:
+		return ValidatedRequest{}, fmt.Errorf("resolution 仅支持 480P、768P 或 2K")
 	}
 	if request.Duration < 4 || request.Duration > 15 {
 		return ValidatedRequest{}, fmt.Errorf("duration 必须为 4-15 的整数")

@@ -64,7 +64,7 @@ erDiagram
 | `gallery_before_json` | TEXT | 否 | NULL | - | 归一化基线 JSON |
 | `result_internal_url` | TEXT | 否 | NULL | - | 上游原始结果，响应禁止返回 |
 | `result_public_url` | TEXT | 否 | NULL | - | V2 `task.content.url` |
-| `resolution` | TEXT | 是 | - | - | `768P/2K` |
+| `resolution` | TEXT | 是 | - | - | `480P/768P/2K` |
 | `duration` | INTEGER | 是 | - | - | 4-15 秒 |
 | `ratio_requested` | TEXT | 是 | `adaptive` | - | 原请求比例 |
 | `ratio_actual` | TEXT | 否 | NULL | - | 可确认时记录，否则返回请求值 |
@@ -87,7 +87,7 @@ erDiagram
 ```sql
 CHECK (status IN ('queued_open','queued_locked','dispatching','running','reconciling','succeeded','failed','cancelled'))
 CHECK (scenario IN ('t2va','i2va','r2va'))
-CHECK (resolution IN ('768P','2K'))
+CHECK (resolution IN ('480P','768P','2K'))
 CHECK (duration BETWEEN 4 AND 15)
 CHECK (cancel_locked IN (0,1))
 ```
@@ -205,7 +205,8 @@ WHERE queue_seq IN (SELECT queue_seq FROM ranked);
 
 - `migrations/*.sql` 使用 `//go:embed` 打包到二进制。
 - 启动时获取进程内迁移锁，按版本在事务内执行；失败则拒绝启动。
-- 首版创建 `schema_migrations`、`video_tasks`、`idempotency_keys` 与索引，无历史数据回填。
+- 版本 1 创建 `schema_migrations`、`video_tasks`、`idempotency_keys` 与索引。
+- 版本 2 扩展分辨率约束，并将升级前实际属于 480 档的历史 `768P` 字段及 `request_json.resolution` 修正为 `480P`。
 - 回滚采用部署前备份 SQLite 文件并回退二进制；不提供自动 down migration，避免破坏数据。
 - Docker 启动前/升级前的备份流程需在部署文档中说明并人工执行。
 

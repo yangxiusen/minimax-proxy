@@ -11,7 +11,7 @@ $env:MINIMAX_API_KEY_CUSTOMER_A='replace-me'
 $env:MINIMAX_UPSTREAM_GPU_1_URL='http://192.168.1.200:7861'
 ```
 
-`public_base_url` 必须是用户可直接访问的 HTTP/HTTPS 下载基址；跨公网部署建议使用 HTTPS。`generation_profiles` 中的模型、尺寸和步数必须在真实私有服务验证。所有文件使用 UTF-8；运行时代码不得读取 `docs/`。
+`public_base_url` 必须是用户可直接访问的 HTTP/HTTPS 下载基址；跨公网部署建议使用 HTTPS。`resolution` 支持 `480P`、`768P`、`2K`，其中 `768P` 使用 `1344x768` 横屏基准。`generation_profiles` 中的模型、尺寸和步数必须在真实私有服务验证。所有文件使用 UTF-8；运行时代码不得读取 `docs/`。
 
 只读监控控制台位于 `http://服务地址/monitor`。`admin.username` 和 `admin.password` 配置登录凭据，`admin.session_ttl` 配置会话有效期，`admin.monitor_interval` 配置节点采集周期。HTTPS 在反向代理终止时必须设置 `admin.secure_cookie: true`；直接 HTTP 本地测试保持 `false`。示例中的 `admin`/`123` 仅供本地测试，服务会在使用该默认组合时输出安全警告；部署前必须替换，日志不会记录管理密码。
 
@@ -46,4 +46,4 @@ docker compose ps
 
 Docker Desktop 中通过 `host.docker.internal` 访问宿主机的私有服务。部署到不同服务器时，修改 `.env.docker` 中的 `MINIMAX_UPSTREAM_URL` 和 `MINIMAX_PUBLIC_UPSTREAM_URL`。SQLite 数据保存在宿主机 `data/` 目录。
 
-容器使用 TCP 健康检查。队首保护区内的任务虽然查询状态为 `queued`，但不可取消。回调、水印、`mm_file://` 和 Data URI 首版不支持。
+容器使用 TCP 健康检查。队首保护区内的任务虽然查询状态为 `queued`，但不可取消。图片支持 HTTP/HTTPS URL 和 Base64 Data URI；音频、视频必须使用可访问的 HTTP/HTTPS URL。回调、水印和 `mm_file://` 暂不支持。

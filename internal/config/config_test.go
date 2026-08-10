@@ -143,7 +143,8 @@ func TestLoadRejectsGenerationDimensionNotMultipleOf32(t *testing.T) {
 func TestLoadMigratesLegacyGenerationDimensions(t *testing.T) {
 	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
 	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
-	yaml := strings.Replace(validYAML(t), `"21:9": {width: 1120, height: 480}`, `"21:9": {width: 1104, height: 480}`, 1)
+	yaml := legacyGenerationYAML(t)
+	yaml = strings.Replace(yaml, `"21:9": {width: 1120, height: 480}`, `"21:9": {width: 1104, height: 480}`, 1)
 	yaml = strings.ReplaceAll(yaml, "height: 1088", "height: 1080")
 	yaml = strings.ReplaceAll(yaml, "width: 1088", "width: 1080")
 
@@ -151,11 +152,24 @@ func TestLoadMigratesLegacyGenerationDimensions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if got := cfg.GenerationProfiles["768P"].Dimensions["21:9"]; got != (Dimension{Width: 1120, Height: 480}) {
-		t.Fatalf("768P 21:9 dimension = %+v", got)
+	if got := cfg.GenerationProfiles["480P"].Dimensions["21:9"]; got != (Dimension{Width: 1120, Height: 480}) {
+		t.Fatalf("480P 21:9 dimension = %+v", got)
+	}
+	if got := cfg.GenerationProfiles["768P"].Dimensions["adaptive"]; got != (Dimension{Width: 1344, Height: 768}) {
+		t.Fatalf("768P adaptive dimension = %+v", got)
 	}
 	if got := cfg.GenerationProfiles["2K"].Dimensions["adaptive"]; got != (Dimension{Width: 1920, Height: 1088}) {
 		t.Fatalf("2K adaptive dimension = %+v", got)
+	}
+}
+
+func TestLoadRejectsGenerationProfilesWithout480P(t *testing.T) {
+	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
+	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
+	yaml := strings.Replace(validYAML(t), generationProfile480PYAML, "", 1)
+	_, err := Load(writeConfig(t, yaml))
+	if err == nil || !strings.Contains(err.Error(), "generation_profiles 缺少 480P") {
+		t.Fatalf("Load() error = %v", err)
 	}
 }
 
@@ -226,17 +240,17 @@ upstreams:
     base_url: ${TEST_UPSTREAM_URL}
     public_base_url: https://video.example.com
 generation_profiles:
-  768P:
+` + generationProfile480PYAML + `  768P:
     model_mode: high_quality
     steps: 20
     dimensions:
-      adaptive: {width: 832, height: 480}
-      "21:9": {width: 1120, height: 480}
-      "16:9": {width: 832, height: 480}
-      "4:3": {width: 640, height: 480}
-      "1:1": {width: 480, height: 480}
-      "3:4": {width: 480, height: 640}
-      "9:16": {width: 480, height: 832}
+      adaptive: {width: 1344, height: 768}
+      "21:9": {width: 1792, height: 768}
+      "16:9": {width: 1344, height: 768}
+      "4:3": {width: 1024, height: 768}
+      "1:1": {width: 768, height: 768}
+      "3:4": {width: 768, height: 1024}
+      "9:16": {width: 768, height: 1344}
   2K:
     model_mode: custom
     steps: 20
@@ -249,4 +263,26 @@ generation_profiles:
       "3:4": {width: 1088, height: 1440}
       "9:16": {width: 1088, height: 1920}
 `
+}
+
+const generationProfile480PYAML = `  480P:
+    model_mode: high_quality
+    steps: 20
+    dimensions:
+      adaptive: {width: 832, height: 480}
+      "21:9": {width: 1120, height: 480}
+      "16:9": {width: 832, height: 480}
+      "4:3": {width: 640, height: 480}
+      "1:1": {width: 480, height: 480}
+      "3:4": {width: 480, height: 640}
+      "9:16": {width: 480, height: 832}
+`
+
+func legacyGenerationYAML(t *testing.T) string {
+	t.Helper()
+	yaml := strings.Replace(validYAML(t), generationProfile480PYAML, "", 1)
+	start := strings.Index(yaml, "  768P:")
+	end := strings.Index(yaml[start:], "  2K:")
+	yaml = yaml[:start] + yaml[start+end:]
+	return strings.Replace(yaml, "generation_profiles:\n", "generation_profiles:\n"+strings.Replace(generationProfile480PYAML, "  480P:", "  768P:", 1), 1)
 }

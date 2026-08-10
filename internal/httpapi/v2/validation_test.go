@@ -41,6 +41,35 @@ func TestValidateCreateNormalizesI2VARatio(t *testing.T) {
 	}
 }
 
+func TestValidateCreateSupportsResolutionTiers(t *testing.T) {
+	tests := []struct {
+		resolution string
+		width      int
+	}{
+		{resolution: "480P", width: 832},
+		{resolution: "768P", width: 1344},
+		{resolution: "2K", width: 1920},
+	}
+	for _, tt := range tests {
+		t.Run(tt.resolution, func(t *testing.T) {
+			request := CreateRequest{Model: "MiniMax-H3", Content: text(), Resolution: tt.resolution, Duration: 5, Ratio: "16:9"}
+			got, err := ValidateCreate(request, profiles())
+			if err != nil {
+				t.Fatalf("ValidateCreate() error = %v", err)
+			}
+			if got.Width != tt.width {
+				t.Fatalf("Width = %d, want %d", got.Width, tt.width)
+			}
+		})
+	}
+
+	request := CreateRequest{Model: "MiniMax-H3", Content: text(), Resolution: "1K", Duration: 5, Ratio: "16:9"}
+	_, err := ValidateCreate(request, profiles())
+	if err == nil || !strings.Contains(err.Error(), "480P、768P 或 2K") {
+		t.Fatalf("ValidateCreate() error = %v", err)
+	}
+}
+
 func TestValidateCreateAcceptsBase64Image(t *testing.T) {
 	request := CreateRequest{
 		Model: "MiniMax-H3",
@@ -112,9 +141,13 @@ func audio(url, role string) ContentItem {
 }
 
 func profiles() map[string]config.GenerationProfile {
-	dimensions := map[string]config.Dimension{}
-	for _, ratio := range []string{"adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"} {
-		dimensions[ratio] = config.Dimension{Width: 1920, Height: 1080}
+	profiles := map[string]config.GenerationProfile{}
+	for resolution, width := range map[string]int{"480P": 832, "768P": 1344, "2K": 1920} {
+		dimensions := map[string]config.Dimension{}
+		for _, ratio := range []string{"adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"} {
+			dimensions[ratio] = config.Dimension{Width: width, Height: 768}
+		}
+		profiles[resolution] = config.GenerationProfile{ModelMode: "high_quality", Steps: 20, Dimensions: dimensions}
 	}
-	return map[string]config.GenerationProfile{"768P": {ModelMode: "high_quality", Steps: 20, Dimensions: dimensions}, "2K": {ModelMode: "custom", Steps: 20, Dimensions: dimensions}}
+	return profiles
 }

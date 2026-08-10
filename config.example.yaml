@@ -39,7 +39,7 @@ upstreams:
 
 # 尺寸和模型值必须按真实私有服务验证后调整，服务不会猜测缺失组合。
 generation_profiles:
-  768P:
+  480P:
     model_mode: high_quality
     custom_model: __follow_model_mode__
     custom_model_high: __follow_model_mode__
@@ -53,6 +53,20 @@ generation_profiles:
       "1:1": {width: 480, height: 480}
       "3:4": {width: 480, height: 640}
       "9:16": {width: 480, height: 832}
+  768P:
+    model_mode: high_quality
+    custom_model: __follow_model_mode__
+    custom_model_high: __follow_model_mode__
+    easy_cache: true
+    steps: 20
+    dimensions:
+      adaptive: {width: 1344, height: 768}
+      "21:9": {width: 1792, height: 768}
+      "16:9": {width: 1344, height: 768}
+      "4:3": {width: 1024, height: 768}
+      "1:1": {width: 768, height: 768}
+      "3:4": {width: 768, height: 1024}
+      "9:16": {width: 768, height: 1344}
   2K:
     model_mode: custom
     custom_model: __follow_model_mode__
