@@ -227,6 +227,7 @@ func normalize(raw rawConfig) (Config, error) {
 	if cfg.Task.IdempotencyTTL, err = parseDuration(raw.Task.IdempotencyTTL, cfg.Task.IdempotencyTTL, "task.idempotency_ttl"); err != nil {
 		return Config{}, err
 	}
+	migrateLegacyGenerationDimensions(cfg.GenerationProfiles)
 	for _, item := range raw.Upstreams {
 		baseURL, err := parseURL(item.BaseURL)
 		if err != nil {
@@ -259,6 +260,26 @@ func normalize(raw rawConfig) (Config, error) {
 		cfg.Upstreams = append(cfg.Upstreams, u)
 	}
 	return cfg, nil
+}
+
+func migrateLegacyGenerationDimensions(profiles map[string]GenerationProfile) {
+	// 兼容升级前示例配置中的旧尺寸，其他非 32 倍数仍由校验拒绝。
+	if profile, ok := profiles["768P"]; ok {
+		if dimension, exists := profile.Dimensions["21:9"]; exists && dimension == (Dimension{Width: 1104, Height: 480}) {
+			profile.Dimensions["21:9"] = Dimension{Width: 1120, Height: 480}
+		}
+	}
+	if profile, ok := profiles["2K"]; ok {
+		for ratio, dimension := range profile.Dimensions {
+			if dimension.Width == 1080 {
+				dimension.Width = 1088
+			}
+			if dimension.Height == 1080 {
+				dimension.Height = 1088
+			}
+			profile.Dimensions[ratio] = dimension
+		}
+	}
 }
 
 func parseDuration(value string, fallback time.Duration, field string) (time.Duration, error) {

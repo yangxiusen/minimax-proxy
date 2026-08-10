@@ -140,6 +140,25 @@ func TestLoadRejectsGenerationDimensionNotMultipleOf32(t *testing.T) {
 	}
 }
 
+func TestLoadMigratesLegacyGenerationDimensions(t *testing.T) {
+	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
+	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
+	yaml := strings.Replace(validYAML(t), `"21:9": {width: 1120, height: 480}`, `"21:9": {width: 1104, height: 480}`, 1)
+	yaml = strings.ReplaceAll(yaml, "height: 1088", "height: 1080")
+	yaml = strings.ReplaceAll(yaml, "width: 1088", "width: 1080")
+
+	cfg, err := Load(writeConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.GenerationProfiles["768P"].Dimensions["21:9"]; got != (Dimension{Width: 1120, Height: 480}) {
+		t.Fatalf("768P 21:9 dimension = %+v", got)
+	}
+	if got := cfg.GenerationProfiles["2K"].Dimensions["adaptive"]; got != (Dimension{Width: 1920, Height: 1088}) {
+		t.Fatalf("2K adaptive dimension = %+v", got)
+	}
+}
+
 func TestLoadRejectsConfigWithoutEnabledAPIKey(t *testing.T) {
 	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
 	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
