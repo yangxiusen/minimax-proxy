@@ -17,6 +17,7 @@
 - [接口设计](developing/version_0.0.1/API_INTERFACE.md)：4 个官方 V2 接口及模块文档。
 - [测试与验收](developing/version_0.0.1/TEST_ACCEPTANCE.md)：自动化范围与真实上游联调清单。
 - [开发任务](developing/version_0.0.1/task.md)：按依赖排序的实施步骤和验证命令。
+- [任务生命周期闭环变更](developing/version_0.0.1/changes/002-task-lifecycle-closure/CHANGE_SPEC.md)：模型任务对账、一次重试、管理中止/删除和视频访问。
 - [归档](archive/)：已完成版本与历史资料。
 
 `docs/` 是外部参考资料，只用于分析，不得被运行时代码直接引用或依赖。
