@@ -20,20 +20,26 @@ var (
 )
 
 type Client struct {
-	baseURL *url.URL
-	http    *http.Client
-	maxBody int64
+	baseURL     *url.URL
+	jobsBaseURL *url.URL
+	http        *http.Client
+	maxBody     int64
 }
 
 func NewClient(baseURL *url.URL, client *http.Client, maxBody int64) *Client {
+	return NewClientWithJobs(baseURL, baseURL, client, maxBody)
+}
+
+func NewClientWithJobs(baseURL, jobsBaseURL *url.URL, client *http.Client, maxBody int64) *Client {
 	copyURL := *baseURL
+	jobsCopy := *jobsBaseURL
 	if client == nil {
 		client = http.DefaultClient
 	}
 	if maxBody <= 0 {
 		maxBody = 8 << 20
 	}
-	return &Client{baseURL: &copyURL, http: client, maxBody: maxBody}
+	return &Client{baseURL: &copyURL, jobsBaseURL: &jobsCopy, http: client, maxBody: maxBody}
 }
 
 func (c *Client) Call(ctx context.Context, apiName string, data []any) ([]any, error) {
@@ -101,7 +107,15 @@ func (c *Client) Healthy(ctx context.Context, healthPath string) error {
 }
 
 func (c *Client) endpoint(parts ...string) *url.URL {
-	result := *c.baseURL
+	return endpoint(c.baseURL, parts...)
+}
+
+func (c *Client) jobsEndpoint(parts ...string) *url.URL {
+	return endpoint(c.jobsBaseURL, parts...)
+}
+
+func endpoint(baseURL *url.URL, parts ...string) *url.URL {
+	result := *baseURL
 	segments := append([]string{result.Path}, parts...)
 	result.Path = path.Join(segments...)
 	result.RawPath, result.RawQuery, result.Fragment = "", "", ""

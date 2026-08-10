@@ -16,6 +16,7 @@ type Slot struct {
 	ID        string
 	Processor Processor
 	Health    func(context.Context) error
+	Active    func(context.Context) (bool, error)
 }
 
 type Scheduler struct {
@@ -60,7 +61,19 @@ func (s *Scheduler) runSlot(ctx context.Context, slot Slot) {
 		if ctx.Err() != nil {
 			return
 		}
-		if slot.Health != nil {
+		hasActive := false
+		if slot.Active != nil {
+			active, err := slot.Active(ctx)
+			if err != nil {
+				s.logger.ErrorContext(ctx, "读取实例活动任务失败", "upstream_id", slot.ID, "stage", "active_check", "error_code", "active_check_failed")
+				if !s.wait(ctx) {
+					return
+				}
+				continue
+			}
+			hasActive = active
+		}
+		if !hasActive && slot.Health != nil {
 			healthCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			err := slot.Health(healthCtx)
 			cancel()

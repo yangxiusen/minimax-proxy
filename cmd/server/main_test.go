@@ -79,6 +79,32 @@ func TestNodeCacheAvailabilityAndCachedHealthUseFreshSnapshots(t *testing.T) {
 	}
 }
 
+func TestCachedNodeSchedulableRejectsPrivateWorkWithoutLocalTask(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0).UTC()
+	queue := 1
+	cache := monitorcache.NewCache([]monitorcache.NodeSnapshot{{ID: "gpu-1", Health: monitorcache.HealthHealthy, Runtime: monitorcache.RuntimeRunning, PrivateQueue: &queue, CheckedAt: now}})
+	if err := cachedNodeSchedulable(cache, "gpu-1", now, 10*time.Second); err == nil {
+		t.Fatal("running private instance was considered schedulable")
+	}
+	cache.Update("gpu-1", func(node *monitorcache.NodeSnapshot) {
+		node.Runtime = monitorcache.RuntimeIdle
+		zero := 0
+		node.PrivateQueue = &zero
+	})
+	if err := cachedNodeSchedulable(cache, "gpu-1", now, 10*time.Second); err != nil {
+		t.Fatalf("idle private instance was not schedulable: %v", err)
+	}
+}
+
+func TestCachedNodeSchedulableRejectsExplicitSchedulingBlock(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0).UTC()
+	zero := 0
+	cache := monitorcache.NewCache([]monitorcache.NodeSnapshot{{ID: "gpu-1", Health: monitorcache.HealthHealthy, Runtime: monitorcache.RuntimeIdle, PrivateQueue: &zero, CheckedAt: now, SchedulingBlocked: true}})
+	if err := cachedNodeSchedulable(cache, "gpu-1", now, 10*time.Second); err == nil {
+		t.Fatal("explicitly blocked node was considered schedulable")
+	}
+}
+
 func TestMaxHealthAgeCoversSlowestProbe(t *testing.T) {
 	upstreams := []config.UpstreamConfig{
 		{ID: "gpu-1", RequestTimeout: 30 * time.Second},
@@ -208,3 +234,5 @@ func (*appStore) CancelOrDelete(context.Context, string, string) (domain.Action,
 func (*appStore) ListAdminTasks(context.Context, domain.AdminTaskFilter) ([]domain.AdminTaskSummary, int, error) {
 	return nil, 0, nil
 }
+func (*appStore) RequestAdminCancel(context.Context, string) error { return domain.ErrTaskNotFound }
+func (*appStore) AdminDelete(context.Context, string) error        { return domain.ErrTaskNotFound }

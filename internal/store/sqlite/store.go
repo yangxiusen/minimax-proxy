@@ -92,6 +92,18 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("记录数据库迁移版本: %w", err)
 		}
 	}
+	var version3Applied int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations WHERE version=3").Scan(&version3Applied); err != nil {
+		return fmt.Errorf("查询数据库迁移版本: %w", err)
+	}
+	if version3Applied == 0 {
+		if _, err := tx.ExecContext(ctx, migrations.TaskLifecycleClosure); err != nil {
+			return fmt.Errorf("执行任务生命周期迁移: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES(3, ?)", s.nowUnix()); err != nil {
+			return fmt.Errorf("记录数据库迁移版本: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交数据库迁移: %w", err)
 	}
@@ -169,7 +181,7 @@ func (s *Store) Get(ctx context.Context, owner, taskID string) (domain.Task, err
 }
 
 func (s *Store) ActiveForUpstream(ctx context.Context, upstreamID string) (domain.Task, error) {
-	task, err := scanTask(s.db.QueryRowContext(ctx, taskSelect+` WHERE upstream_id=? AND status IN ('dispatching','running','reconciling') AND deleted_at IS NULL LIMIT 1`, upstreamID))
+	task, err := scanTask(s.db.QueryRowContext(ctx, taskSelect+` WHERE upstream_id=? AND status IN ('dispatching','running','reconciling','cancelling') AND deleted_at IS NULL LIMIT 1`, upstreamID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Task{}, domain.ErrTaskNotFound
 	}
@@ -295,7 +307,7 @@ func (s *Store) ClaimNext(ctx context.Context, upstreamID string) (taskResult do
 	}
 	defer completeTransaction(finish, &err)
 	var active int
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM video_tasks WHERE upstream_id=? AND status IN ('dispatching','running','reconciling')`, upstreamID).Scan(&active); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM video_tasks WHERE upstream_id=? AND status IN ('dispatching','running','reconciling','cancelling')`, upstreamID).Scan(&active); err != nil {
 		return domain.Task{}, err
 	}
 	if active > 0 {
@@ -399,6 +411,97 @@ func (s *Store) SaveBaseline(ctx context.Context, taskID, upstreamID string, url
 	return oneRow(result, err)
 }
 
+func (s *Store) SaveSubmissionContext(ctx context.Context, taskID, upstreamID string, jobIDs []string) error {
+	data, err := json.Marshal(jobIDs)
+	if err != nil {
+		return err
+	}
+	now := s.nowUnix()
+	result, err := s.db.ExecContext(ctx, `UPDATE video_tasks SET upstream_jobs_before_json=?,attempt_started_at=?,updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND status='dispatching'`, string(data), now, now, taskID, upstreamID)
+	return oneRow(result, err)
+}
+
+func (s *Store) BindUpstreamJob(ctx context.Context, taskID, upstreamID, jobID string) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE video_tasks SET upstream_job_id=?,status='running',updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND status IN ('dispatching','reconciling')`, jobID, s.nowUnix(), taskID, upstreamID)
+	return oneRow(result, err)
+}
+
+func (s *Store) BeginRetry(ctx context.Context, taskID, upstreamID string, jobIDsBefore, galleryBefore []string) error {
+	jobsData, err := json.Marshal(jobIDsBefore)
+	if err != nil {
+		return err
+	}
+	galleryData, err := json.Marshal(galleryBefore)
+	if err != nil {
+		return err
+	}
+	now := s.nowUnix()
+	result, err := s.db.ExecContext(ctx, `UPDATE video_tasks SET status='dispatching',retry_count=1,upstream_job_id=NULL,upstream_jobs_before_json=?,gallery_before_json=?,attempt_started_at=?,error_code=NULL,error_message=NULL,updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND retry_count=0 AND status IN ('running','reconciling')`, string(jobsData), string(galleryData), now, now, taskID, upstreamID)
+	return oneRow(result, err)
+}
+
+func (s *Store) RequestAdminCancel(ctx context.Context, taskID string) (err error) {
+	conn, finish, err := s.immediate(ctx)
+	if err != nil {
+		return err
+	}
+	defer completeTransaction(finish, &err)
+	now := s.nowUnix()
+	var status domain.InternalStatus
+	err = conn.QueryRowContext(ctx, `SELECT status FROM video_tasks WHERE task_id=? AND deleted_at IS NULL AND expires_at>?`, taskID, now).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.ErrTaskNotFound
+	}
+	if err != nil {
+		return err
+	}
+	switch status {
+	case domain.StatusQueuedOpen, domain.StatusQueuedLocked:
+		result, execErr := conn.ExecContext(ctx, `UPDATE video_tasks SET status='cancelled',cancel_locked=0,cancel_requested_at=?,finished_at=?,updated_at=?,version=version+1 WHERE task_id=? AND status=?`, now, now, now, taskID, status)
+		if err := oneRow(result, execErr); err != nil {
+			return err
+		}
+		return s.rebalance(ctx, conn, now)
+	case domain.StatusDispatching, domain.StatusRunning, domain.StatusReconciling:
+		result, execErr := conn.ExecContext(ctx, `UPDATE video_tasks SET status='cancelling',cancel_requested_at=?,updated_at=?,version=version+1 WHERE task_id=? AND status=?`, now, now, taskID, status)
+		return oneRow(result, execErr)
+	default:
+		return domain.ErrTaskNotOperable
+	}
+}
+
+func (s *Store) FinishCancelled(ctx context.Context, taskID, upstreamID string) error {
+	now := s.nowUnix()
+	result, err := s.db.ExecContext(ctx, `UPDATE video_tasks SET status='cancelled',cancel_locked=0,finished_at=?,updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND status='cancelling'`, now, now, taskID, upstreamID)
+	return oneRow(result, err)
+}
+
+func (s *Store) AdminDelete(ctx context.Context, taskID string) (err error) {
+	conn, finish, err := s.immediate(ctx)
+	if err != nil {
+		return err
+	}
+	defer completeTransaction(finish, &err)
+	now := s.nowUnix()
+	var status domain.InternalStatus
+	err = conn.QueryRowContext(ctx, `SELECT status FROM video_tasks WHERE task_id=? AND deleted_at IS NULL AND expires_at>?`, taskID, now).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.ErrTaskNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if !status.AdminCanDelete() {
+		return domain.ErrTaskNotOperable
+	}
+	result, err := conn.ExecContext(ctx, `UPDATE video_tasks SET deleted_at=?,updated_at=?,version=version+1 WHERE task_id=? AND status=? AND deleted_at IS NULL`, now, now, taskID, status)
+	if err := oneRow(result, err); err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, `DELETE FROM idempotency_keys WHERE task_id=?`, taskID)
+	return err
+}
+
 func (s *Store) MarkRunning(ctx context.Context, taskID, upstreamID string) error {
 	result, err := s.db.ExecContext(ctx, `UPDATE video_tasks SET status='running',updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND status='dispatching'`, s.nowUnix(), taskID, upstreamID)
 	return oneRow(result, err)
@@ -421,7 +524,7 @@ func (s *Store) Requeue(ctx context.Context, taskID, upstreamID string) (err err
 		return err
 	}
 	defer completeTransaction(finish, &err)
-	result, err := conn.ExecContext(ctx, `UPDATE video_tasks SET status='queued_open',cancel_locked=0,upstream_id=NULL,gradio_event_id=NULL,gallery_before_json=NULL,started_at=NULL,updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND status='dispatching'`, s.nowUnix(), taskID, upstreamID)
+	result, err := conn.ExecContext(ctx, `UPDATE video_tasks SET status='queued_open',cancel_locked=0,upstream_id=NULL,gradio_event_id=NULL,upstream_job_id=NULL,upstream_jobs_before_json='[]',retry_count=0,attempt_started_at=NULL,cancel_requested_at=NULL,gallery_before_json=NULL,started_at=NULL,updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND status='dispatching'`, s.nowUnix(), taskID, upstreamID)
 	if err := oneRow(result, err); err != nil {
 		return err
 	}
@@ -514,9 +617,9 @@ type rowQuerier interface {
 
 type rowScanner interface{ Scan(...any) error }
 
-const taskSelect = `SELECT queue_seq,task_id,api_key_id,model,scenario,request_json,request_hash,status,cancel_locked,COALESCE(upstream_id,''),COALESCE(gradio_event_id,''),COALESCE(gallery_before_json,''),COALESCE(result_internal_url,''),COALESCE(result_public_url,''),resolution,duration,ratio_requested,COALESCE(ratio_actual,''),usage_total_seconds,usage_input_seconds,usage_output_seconds,usage_input_image_count,COALESCE(error_code,''),COALESCE(error_message,''),created_at,updated_at,COALESCE(started_at,0),COALESCE(finished_at,0),expires_at,version FROM video_tasks`
+const taskSelect = `SELECT queue_seq,task_id,api_key_id,model,scenario,request_json,request_hash,status,cancel_locked,COALESCE(upstream_id,''),COALESCE(gradio_event_id,''),COALESCE(upstream_job_id,''),upstream_jobs_before_json,retry_count,COALESCE(attempt_started_at,0),COALESCE(cancel_requested_at,0),COALESCE(gallery_before_json,''),COALESCE(result_internal_url,''),COALESCE(result_public_url,''),resolution,duration,ratio_requested,COALESCE(ratio_actual,''),usage_total_seconds,usage_input_seconds,usage_output_seconds,usage_input_image_count,COALESCE(error_code,''),COALESCE(error_message,''),created_at,updated_at,COALESCE(started_at,0),COALESCE(finished_at,0),expires_at,version FROM video_tasks`
 
-const adminTaskSelect = `SELECT task_id,api_key_id,COALESCE(upstream_id,''),scenario,resolution,status,duration,created_at,COALESCE(started_at,0),COALESCE(finished_at,0) FROM video_tasks`
+const adminTaskSelect = `SELECT task_id,api_key_id,COALESCE(upstream_id,''),scenario,resolution,status,retry_count,COALESCE(result_public_url,''),duration,created_at,COALESCE(started_at,0),COALESCE(finished_at,0) FROM video_tasks`
 
 func getWith(ctx context.Context, query rowQuerier, owner, taskID string, now int64) (domain.Task, error) {
 	statement := taskSelect + ` WHERE task_id=? AND api_key_id=? AND deleted_at IS NULL AND expires_at>?`
@@ -530,8 +633,8 @@ func getWith(ctx context.Context, query rowQuerier, owner, taskID string, now in
 func scanTask(scanner rowScanner) (domain.Task, error) {
 	var task domain.Task
 	var locked int
-	var created, updated, started, finished, expires int64
-	err := scanner.Scan(&task.QueueSeq, &task.TaskID, &task.APIKeyID, &task.Model, &task.Scenario, &task.RequestJSON, &task.RequestHash, &task.Status, &locked, &task.UpstreamID, &task.GradioEventID, &task.GalleryBeforeJSON, &task.ResultInternalURL, &task.ResultPublicURL, &task.Resolution, &task.Duration, &task.RatioRequested, &task.RatioActual, &task.UsageTotalSeconds, &task.UsageInputSeconds, &task.UsageOutputSeconds, &task.UsageInputImageCount, &task.ErrorCode, &task.ErrorMessage, &created, &updated, &started, &finished, &expires, &task.Version)
+	var created, updated, started, finished, expires, attemptStarted, cancelRequested int64
+	err := scanner.Scan(&task.QueueSeq, &task.TaskID, &task.APIKeyID, &task.Model, &task.Scenario, &task.RequestJSON, &task.RequestHash, &task.Status, &locked, &task.UpstreamID, &task.GradioEventID, &task.UpstreamJobID, &task.UpstreamJobsBeforeJSON, &task.RetryCount, &attemptStarted, &cancelRequested, &task.GalleryBeforeJSON, &task.ResultInternalURL, &task.ResultPublicURL, &task.Resolution, &task.Duration, &task.RatioRequested, &task.RatioActual, &task.UsageTotalSeconds, &task.UsageInputSeconds, &task.UsageOutputSeconds, &task.UsageInputImageCount, &task.ErrorCode, &task.ErrorMessage, &created, &updated, &started, &finished, &expires, &task.Version)
 	if err != nil {
 		return domain.Task{}, err
 	}
@@ -543,6 +646,12 @@ func scanTask(scanner rowScanner) (domain.Task, error) {
 	if finished > 0 {
 		task.FinishedAt = unix(finished)
 	}
+	if attemptStarted > 0 {
+		task.AttemptStartedAt = unix(attemptStarted)
+	}
+	if cancelRequested > 0 {
+		task.CancelRequestedAt = unix(cancelRequested)
+	}
 	return task, nil
 }
 
@@ -550,10 +659,10 @@ func scanAdminTaskSummary(scanner rowScanner) (domain.AdminTaskSummary, error) {
 	var item domain.AdminTaskSummary
 	var status domain.InternalStatus
 	var created, started, finished int64
-	if err := scanner.Scan(&item.TaskID, &item.APIKeyID, &item.UpstreamID, &item.Scenario, &item.Resolution, &status, &item.Duration, &created, &started, &finished); err != nil {
+	if err := scanner.Scan(&item.TaskID, &item.APIKeyID, &item.UpstreamID, &item.Scenario, &item.Resolution, &status, &item.RetryCount, &item.ResultPublicURL, &item.Duration, &created, &started, &finished); err != nil {
 		return domain.AdminTaskSummary{}, err
 	}
-	item.Status = status.V2()
+	item.InternalStatus, item.Status = status, status.V2()
 	item.CreatedAt = unix(created)
 	if started > 0 {
 		item.StartedAt = unix(started)
@@ -569,7 +678,7 @@ func internalStatuses(status domain.V2Status) []domain.InternalStatus {
 	case domain.V2Queued:
 		return []domain.InternalStatus{domain.StatusQueuedOpen, domain.StatusQueuedLocked}
 	case domain.V2Running:
-		return []domain.InternalStatus{domain.StatusDispatching, domain.StatusRunning, domain.StatusReconciling}
+		return []domain.InternalStatus{domain.StatusDispatching, domain.StatusRunning, domain.StatusReconciling, domain.StatusCancelling}
 	case domain.V2Succeeded:
 		return []domain.InternalStatus{domain.StatusSucceeded}
 	case domain.V2Failed:

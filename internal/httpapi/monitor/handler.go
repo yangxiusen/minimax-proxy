@@ -35,6 +35,8 @@ const (
 
 type TaskStore interface {
 	ListAdminTasks(context.Context, domain.AdminTaskFilter) ([]domain.AdminTaskSummary, int, error)
+	RequestAdminCancel(context.Context, string) error
+	AdminDelete(context.Context, string) error
 }
 
 type Dependencies struct {
@@ -44,6 +46,7 @@ type Dependencies struct {
 	Logger *slog.Logger
 	Now    func() time.Time
 	Rand   io.Reader
+	Wake   func()
 }
 
 type handler struct {
@@ -58,6 +61,7 @@ type handler struct {
 	sessionTTL      time.Duration
 	secureCookie    bool
 	monitorInterval time.Duration
+	wake            func()
 
 	sessionMu          sync.Mutex
 	sessions           map[[sha256.Size]byte]time.Time
@@ -105,6 +109,7 @@ func NewHandler(dependencies Dependencies) http.Handler {
 		sessionTTL:      dependencies.Admin.SessionTTL,
 		secureCookie:    dependencies.Admin.SecureCookie,
 		monitorInterval: monitorInterval,
+		wake:            dependencies.Wake,
 		sessions:        make(map[[sha256.Size]byte]time.Time),
 		failures:        make(map[string]loginFailure),
 	}
@@ -114,6 +119,8 @@ func NewHandler(dependencies Dependencies) http.Handler {
 	mux.Handle("DELETE /monitor/api/session", h.authenticate(http.HandlerFunc(h.deleteSession)))
 	mux.Handle("GET /monitor/api/snapshot", h.authenticate(http.HandlerFunc(h.snapshot)))
 	mux.Handle("GET /monitor/api/tasks", h.authenticate(http.HandlerFunc(h.tasks)))
+	mux.Handle("POST /monitor/api/tasks/{task_id}/cancel", h.authenticate(http.HandlerFunc(h.cancelTask)))
+	mux.Handle("DELETE /monitor/api/tasks/{task_id}", h.authenticate(http.HandlerFunc(h.deleteTask)))
 	h.registerWebRoutes(mux)
 	h.root = h.noStore(mux)
 	return h
@@ -425,6 +432,11 @@ type taskDTO struct {
 	Resolution      string          `json:"resolution"`
 	DurationSeconds *int64          `json:"duration_seconds,omitempty"`
 	CreatedAt       int64           `json:"created_at"`
+	Phase           string          `json:"phase"`
+	RetryCount      int             `json:"retry_count"`
+	CanCancel       bool            `json:"can_cancel"`
+	CanDelete       bool            `json:"can_delete"`
+	VideoURL        *string         `json:"video_url"`
 }
 
 func (h *handler) tasks(w http.ResponseWriter, r *http.Request) {
@@ -468,10 +480,84 @@ func (h *handler) tasks(w http.ResponseWriter, r *http.Request) {
 	response := tasksResponse{Items: make([]taskDTO, 0, len(items)), Total: total, PageNum: pageNum, PageSize: pageSize}
 	now := h.now()
 	for _, item := range items {
-		response.Items = append(response.Items, taskDTO{ID: item.TaskID, APIKeyID: item.APIKeyID, Status: item.Status, UpstreamID: item.UpstreamID, Scenario: item.Scenario, Resolution: item.Resolution, DurationSeconds: taskDurationSeconds(item, now), CreatedAt: unixTime(item.CreatedAt)})
+		response.Items = append(response.Items, taskDTO{ID: item.TaskID, APIKeyID: item.APIKeyID, Status: item.Status, UpstreamID: item.UpstreamID, Scenario: item.Scenario, Resolution: item.Resolution, DurationSeconds: taskDurationSeconds(item, now), CreatedAt: unixTime(item.CreatedAt), Phase: taskPhase(item), RetryCount: item.RetryCount, CanCancel: item.InternalStatus.AdminCanCancel(), CanDelete: item.InternalStatus.AdminCanDelete(), VideoURL: publicVideoURL(item)})
 	}
 	h.writeJSON(w, http.StatusOK, response)
 }
+
+func (h *handler) cancelTask(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("task_id")
+	if !validTaskID(taskID) {
+		h.writeError(w, http.StatusBadRequest, "bad_request_error", "task_id 无效")
+		return
+	}
+	if h.store == nil {
+		h.internalError(w, r, errors.New("monitor task store is nil"))
+		return
+	}
+	if err := h.store.RequestAdminCancel(r.Context(), taskID); err != nil {
+		h.writeTaskActionError(w, r, err)
+		return
+	}
+	if h.wake != nil {
+		h.wake()
+	}
+	h.logger.InfoContext(r.Context(), "管理员已请求中止任务", "task_id", taskID, "stage", "admin_cancel")
+	h.writeJSON(w, http.StatusAccepted, map[string]string{"action": "cancel_requested", "task_id": taskID})
+}
+
+func (h *handler) deleteTask(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("task_id")
+	if !validTaskID(taskID) {
+		h.writeError(w, http.StatusBadRequest, "bad_request_error", "task_id 无效")
+		return
+	}
+	if h.store == nil {
+		h.internalError(w, r, errors.New("monitor task store is nil"))
+		return
+	}
+	if err := h.store.AdminDelete(r.Context(), taskID); err != nil {
+		h.writeTaskActionError(w, r, err)
+		return
+	}
+	h.logger.InfoContext(r.Context(), "管理员已删除任务", "task_id", taskID, "stage", "admin_delete")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *handler) writeTaskActionError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, domain.ErrTaskNotFound):
+		h.writeError(w, http.StatusNotFound, "task_not_found", "任务不存在")
+	case errors.Is(err, domain.ErrTaskNotOperable), errors.Is(err, domain.ErrStateConflict):
+		h.writeError(w, http.StatusConflict, "task_not_operable", "任务当前状态不可操作")
+	default:
+		h.internalError(w, r, err)
+	}
+}
+
+func taskPhase(item domain.AdminTaskSummary) string {
+	if item.RetryCount > 0 && (item.InternalStatus == domain.StatusDispatching || item.InternalStatus == domain.StatusRunning || item.InternalStatus == domain.StatusReconciling) {
+		return "retrying"
+	}
+	switch item.InternalStatus {
+	case domain.StatusQueuedOpen, domain.StatusQueuedLocked:
+		return "queued"
+	case domain.StatusReconciling:
+		return "recovering"
+	default:
+		return string(item.InternalStatus)
+	}
+}
+
+func publicVideoURL(item domain.AdminTaskSummary) *string {
+	if item.Status != domain.V2Succeeded || item.ResultPublicURL == "" {
+		return nil
+	}
+	value := item.ResultPublicURL
+	return &value
+}
+
+func validTaskID(taskID string) bool { return len(taskID) >= 1 && len(taskID) <= 64 }
 
 func taskDurationSeconds(item domain.AdminTaskSummary, now time.Time) *int64 {
 	if item.StartedAt.IsZero() {

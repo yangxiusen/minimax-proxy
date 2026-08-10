@@ -57,6 +57,7 @@ type NodeSnapshot struct {
 	CurrentTask        *CurrentTaskSnapshot  `json:"current_task"`
 	LatestFinishedTask *FinishedTaskSnapshot `json:"latest_finished_task"`
 	LastError          *ErrorSnapshot        `json:"last_error"`
+	SchedulingBlocked  bool                  `json:"-"`
 }
 
 type Cache struct {
@@ -194,6 +195,10 @@ func sanitizeError(code string) *ErrorSnapshot {
 		return &ErrorSnapshot{Code: code, Summary: "私有服务状态查询失败"}
 	case "upstream_protocol_error":
 		return &ErrorSnapshot{Code: code, Summary: "私有服务状态响应异常"}
+	case "upstream_jobs_unhealthy":
+		return &ErrorSnapshot{Code: code, Summary: "私有任务服务连接失败"}
+	case "upstream_cancel_unconfirmed":
+		return &ErrorSnapshot{Code: code, Summary: "私有任务中止状态待确认"}
 	default:
 		return &ErrorSnapshot{Code: "upstream_error", Summary: "私有服务异常"}
 	}

@@ -65,6 +65,126 @@ func TestOpenMigratesLegacyResolutionTier(t *testing.T) {
 	}
 }
 
+func TestOpenAppliesTaskLifecycleMigration(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 100})
+	ctx := context.Background()
+
+	var versionCount int
+	if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations WHERE version=3").Scan(&versionCount); err != nil {
+		t.Fatal(err)
+	}
+	if versionCount != 1 {
+		t.Fatalf("migration version 3 count = %d", versionCount)
+	}
+	if _, err := store.Create(ctx, task("lifecycle", "owner"), "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE video_tasks SET status='cancelling',upstream_job_id='11111111-1111-1111-1111-111111111111',upstream_jobs_before_json='["before"]',retry_count=1,attempt_started_at=10,cancel_requested_at=11 WHERE task_id='lifecycle'`); err != nil {
+		t.Fatalf("update lifecycle fields: %v", err)
+	}
+	var status, jobID, baseline string
+	var retryCount, attemptStartedAt, cancelRequestedAt int64
+	if err := store.db.QueryRowContext(ctx, `SELECT status,upstream_job_id,upstream_jobs_before_json,retry_count,attempt_started_at,cancel_requested_at FROM video_tasks WHERE task_id='lifecycle'`).Scan(&status, &jobID, &baseline, &retryCount, &attemptStartedAt, &cancelRequestedAt); err != nil {
+		t.Fatal(err)
+	}
+	if status != "cancelling" || retryCount != 1 || attemptStartedAt != 10 || cancelRequestedAt != 11 || baseline != `["before"]` || jobID == "" {
+		t.Fatalf("lifecycle fields = %q %q %q %d %d %d", status, jobID, baseline, retryCount, attemptStartedAt, cancelRequestedAt)
+	}
+}
+
+func TestSubmissionContextBindsJobAndAllowsOnlyOneRetry(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0).UTC()
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 100, Now: func() time.Time { return now }})
+	ctx := context.Background()
+	if _, err := store.Create(ctx, task("retry-once", "owner"), "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(ctx, "gpu-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveSubmissionContext(ctx, "retry-once", "gpu-1", []string{"before"}); err != nil {
+		t.Fatal(err)
+	}
+	const firstJob = "11111111-1111-1111-1111-111111111111"
+	if err := store.BindUpstreamJob(ctx, "retry-once", "gpu-1", firstJob); err != nil {
+		t.Fatal(err)
+	}
+	active, err := store.ActiveForUpstream(ctx, "gpu-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.Status != domain.StatusRunning || active.UpstreamJobID != firstJob || active.UpstreamJobsBeforeJSON != `["before"]` || !active.AttemptStartedAt.Equal(now) {
+		t.Fatalf("active = %+v", active)
+	}
+	if err := store.BeginRetry(ctx, "retry-once", "gpu-1", []string{"first"}, []string{"video-before"}); err != nil {
+		t.Fatal(err)
+	}
+	active, err = store.ActiveForUpstream(ctx, "gpu-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.Status != domain.StatusDispatching || active.RetryCount != 1 || active.UpstreamJobID != "" || active.UpstreamJobsBeforeJSON != `["first"]` || active.GalleryBeforeJSON != `["video-before"]` {
+		t.Fatalf("retried active = %+v", active)
+	}
+	if err := store.BeginRetry(ctx, "retry-once", "gpu-1", nil, nil); !errors.Is(err, domain.ErrStateConflict) {
+		t.Fatalf("second BeginRetry() error = %v", err)
+	}
+}
+
+func TestAdminCancelKeepsActiveUpstreamUntilWorkerFinishes(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 100})
+	ctx := context.Background()
+	if _, err := store.Create(ctx, task("running-cancel", "owner"), "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(ctx, "gpu-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveSubmissionContext(ctx, "running-cancel", "gpu-1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindUpstreamJob(ctx, "running-cancel", "gpu-1", "11111111-1111-1111-1111-111111111111"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RequestAdminCancel(ctx, "running-cancel"); err != nil {
+		t.Fatal(err)
+	}
+	active, err := store.ActiveForUpstream(ctx, "gpu-1")
+	if err != nil || active.Status != domain.StatusCancelling || active.CancelRequestedAt.IsZero() {
+		t.Fatalf("active = %+v, %v", active, err)
+	}
+	if err := store.FinishCancelled(ctx, "running-cancel", "gpu-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ActiveForUpstream(ctx, "gpu-1"); !errors.Is(err, domain.ErrTaskNotFound) {
+		t.Fatalf("ActiveForUpstream() error = %v", err)
+	}
+	if err := store.AdminDelete(ctx, "running-cancel"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdminDelete(ctx, "running-cancel"); !errors.Is(err, domain.ErrTaskNotFound) {
+		t.Fatalf("second AdminDelete() error = %v", err)
+	}
+}
+
+func TestAdminCancelQueuedAndRejectsDeletingActiveTask(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 100})
+	ctx := context.Background()
+	if _, err := store.Create(ctx, task("queued-cancel", "owner"), "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdminDelete(ctx, "queued-cancel"); !errors.Is(err, domain.ErrTaskNotOperable) {
+		t.Fatalf("AdminDelete(active) error = %v", err)
+	}
+	if err := store.RequestAdminCancel(ctx, "queued-cancel"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, "owner", "queued-cancel")
+	if err != nil || got.Status != domain.StatusCancelled {
+		t.Fatalf("cancelled task = %+v, %v", got, err)
+	}
+}
+
 func TestCreateProtectsQueueAndClaimsFIFO(t *testing.T) {
 	store := newStore(t, Options{ProtectedSlots: 3, PerKeyLimit: 10, GlobalLimit: 100})
 	ctx := context.Background()

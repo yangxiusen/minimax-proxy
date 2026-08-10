@@ -63,6 +63,26 @@ func TestUnhealthySlotDoesNotBlockHealthySlot(t *testing.T) {
 	<-done
 }
 
+func TestUnhealthySlotStillReconcilesActiveTask(t *testing.T) {
+	started := make(chan string, 1)
+	scheduler := New([]Slot{{
+		ID:        "recovering",
+		Processor: blockingProcessor{id: "recovering", started: started},
+		Health:    func(context.Context) error { return errors.New("unhealthy") },
+		Active:    func(context.Context) (bool, error) { return true, nil },
+	}}, time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { scheduler.Run(ctx); close(done) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("active task was not reconciled while health check failed")
+	}
+	cancel()
+	<-done
+}
+
 type blockingProcessor struct {
 	id      string
 	started chan<- string

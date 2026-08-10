@@ -22,11 +22,29 @@ import (
 )
 
 type taskStoreStub struct {
-	mu     sync.Mutex
-	filter domain.AdminTaskFilter
-	items  []domain.AdminTaskSummary
-	total  int
-	err    error
+	mu            sync.Mutex
+	filter        domain.AdminTaskFilter
+	items         []domain.AdminTaskSummary
+	total         int
+	err           error
+	cancelledTask string
+	deletedTask   string
+	cancelError   error
+	deleteError   error
+}
+
+func (s *taskStoreStub) RequestAdminCancel(_ context.Context, taskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cancelledTask = taskID
+	return s.cancelError
+}
+
+func (s *taskStoreStub) AdminDelete(_ context.Context, taskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deletedTask = taskID
+	return s.deleteError
 }
 
 func TestWebRoutesRedirectAuthenticateAndServeEmbeddedAssets(t *testing.T) {
@@ -92,6 +110,24 @@ func TestMonitorScriptGuardsTaskRenderingWithRequestGeneration(t *testing.T) {
 	} {
 		if !strings.Contains(source, expected) {
 			t.Errorf("monitor.js missing stale task response guard %q", expected)
+		}
+	}
+}
+
+func TestMonitorScriptConfirmsActionsAndOpensPublicVideo(t *testing.T) {
+	script, err := webAssets.ReadFile("web/monitor.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(script)
+	for _, expected := range []string{
+		"window.confirm",
+		"/cancel`",
+		`method: action === "cancel" ? "POST" : "DELETE"`,
+		`window.open(item.video_url, "_blank", "noopener,noreferrer")`,
+	} {
+		if !strings.Contains(source, expected) {
+			t.Errorf("monitor.js missing task action behavior %q", expected)
 		}
 	}
 }
@@ -367,7 +403,7 @@ func TestSnapshotMapsOnlyWhitelistedFieldsAndSummarizesNodes(t *testing.T) {
 func TestTasksValidatesFiltersAndReturnsMinimalShape(t *testing.T) {
 	created := time.Unix(2_000_000_000, 0)
 	started := created.Add(10 * time.Minute)
-	store := &taskStoreStub{total: 1, items: []domain.AdminTaskSummary{{TaskID: "task-1", APIKeyID: "customer", Status: domain.V2Running, UpstreamID: "gpu-1", Scenario: "t2va", Resolution: "768P", Duration: 99, CreatedAt: created, StartedAt: started}}}
+	store := &taskStoreStub{total: 1, items: []domain.AdminTaskSummary{{TaskID: "task-1", APIKeyID: "customer", Status: domain.V2Running, InternalStatus: domain.StatusReconciling, RetryCount: 1, UpstreamID: "gpu-1", Scenario: "t2va", Resolution: "768P", Duration: 99, CreatedAt: created, StartedAt: started}}}
 	h := testHandler(Dependencies{Admin: config.AdminConfig{Username: "a", Password: "b", SessionTTL: time.Hour}, Store: store, Now: func() time.Time { return started.Add(65 * time.Second) }})
 	cookie := login(t, h, "a", "b", "203.0.113.1:1")
 	response := serve(h, http.MethodGet, "/monitor/api/tasks?page_num=2&page_size=20&status=running&upstream_id=gpu-1&search=task", "", "", cookie, "203.0.113.1:1", false)
@@ -384,7 +420,7 @@ func TestTasksValidatesFiltersAndReturnsMinimalShape(t *testing.T) {
 	decodeResponse(t, response, &raw)
 	items := raw["items"].([]any)
 	item := items[0].(map[string]any)
-	if len(item) != 8 || item["id"] != "task-1" || item["created_at"] != float64(created.Unix()) || item["duration_seconds"] != float64(65) || raw["page_num"] != float64(2) || raw["page_size"] != float64(20) {
+	if len(item) != 13 || item["id"] != "task-1" || item["created_at"] != float64(created.Unix()) || item["duration_seconds"] != float64(65) || item["phase"] != "retrying" || item["retry_count"] != float64(1) || item["can_cancel"] != true || item["can_delete"] != false || item["video_url"] != nil || raw["page_num"] != float64(2) || raw["page_size"] != float64(20) {
 		t.Fatalf("body=%v", raw)
 	}
 	for _, forbidden := range []string{"duration", "started_at", "finished_at", "request_json", "result_internal_url"} {
@@ -413,6 +449,35 @@ func TestTasksValidatesFiltersAndReturnsMinimalShape(t *testing.T) {
 	store.mu.Unlock()
 	if filter.PageNum != 1 || filter.PageSize != 10 {
 		t.Fatalf("defaults=%+v", filter)
+	}
+}
+
+func TestTaskActionsRequireSessionAndMapStoreResults(t *testing.T) {
+	wakeCount := 0
+	store := &taskStoreStub{}
+	h := testHandler(Dependencies{Admin: config.AdminConfig{Username: "a", Password: "b", SessionTTL: time.Hour}, Store: store, Wake: func() { wakeCount++ }})
+	cookie := login(t, h, "a", "b", "203.0.113.2:1")
+
+	unauthorized := serve(h, http.MethodPost, "/monitor/api/tasks/task-1/cancel", "", "", "", "203.0.113.2:1", false)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d", unauthorized.Code)
+	}
+	cancelled := serve(h, http.MethodPost, "/monitor/api/tasks/task-1/cancel", "", "", cookie, "203.0.113.2:1", false)
+	if cancelled.Code != http.StatusAccepted || wakeCount != 1 || store.cancelledTask != "task-1" {
+		t.Fatalf("cancel status=%d wake=%d task=%q body=%s", cancelled.Code, wakeCount, store.cancelledTask, cancelled.Body.String())
+	}
+	deleted := serve(h, http.MethodDelete, "/monitor/api/tasks/task-1", "", "", cookie, "203.0.113.2:1", false)
+	if deleted.Code != http.StatusNoContent || store.deletedTask != "task-1" || deleted.Body.Len() != 0 {
+		t.Fatalf("delete status=%d task=%q body=%s", deleted.Code, store.deletedTask, deleted.Body.String())
+	}
+
+	store.cancelError = domain.ErrTaskNotOperable
+	if response := serve(h, http.MethodPost, "/monitor/api/tasks/task-2/cancel", "", "", cookie, "203.0.113.2:1", false); response.Code != http.StatusConflict {
+		t.Fatalf("conflict status=%d body=%s", response.Code, response.Body.String())
+	}
+	store.deleteError = domain.ErrTaskNotFound
+	if response := serve(h, http.MethodDelete, "/monitor/api/tasks/task-2", "", "", cookie, "203.0.113.2:1", false); response.Code != http.StatusNotFound {
+		t.Fatalf("not found status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 

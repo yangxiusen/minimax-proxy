@@ -11,3 +11,8 @@ var Initial string
 //
 //go:embed 002_resolution_tiers.sql
 var ResolutionTiers string
+
+// TaskLifecycleClosure 增加模型任务关联、一次重试和中止中状态。
+//
+//go:embed 003_task_lifecycle_closure.sql
+var TaskLifecycleClosure string

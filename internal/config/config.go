@@ -56,8 +56,9 @@ type QueueConfig struct {
 }
 
 type TaskConfig struct {
-	Retention      time.Duration
-	IdempotencyTTL time.Duration
+	Retention        time.Duration
+	IdempotencyTTL   time.Duration
+	ExecutionTimeout time.Duration
 }
 
 type APIKeyConfig struct {
@@ -69,6 +70,7 @@ type APIKeyConfig struct {
 type UpstreamConfig struct {
 	ID             string
 	BaseURL        *url.URL
+	JobsBaseURL    *url.URL
 	PublicBaseURL  *url.URL
 	HealthPath     string
 	SubmitAPIName  string
@@ -111,13 +113,15 @@ type rawConfig struct {
 		GlobalUnfinishedLimit *int `yaml:"global_unfinished_limit"`
 	} `yaml:"queue"`
 	Task struct {
-		Retention      string `yaml:"retention"`
-		IdempotencyTTL string `yaml:"idempotency_ttl"`
+		Retention        string `yaml:"retention"`
+		IdempotencyTTL   string `yaml:"idempotency_ttl"`
+		ExecutionTimeout string `yaml:"execution_timeout"`
 	} `yaml:"task"`
 	APIKeys   []APIKeyConfig `yaml:"api_keys"`
 	Upstreams []struct {
 		ID             string `yaml:"id"`
 		BaseURL        string `yaml:"base_url"`
+		JobsBaseURL    string `yaml:"jobs_base_url"`
 		PublicBaseURL  string `yaml:"public_base_url"`
 		HealthPath     string `yaml:"health_path"`
 		SubmitAPIName  string `yaml:"submit_api_name"`
@@ -184,7 +188,7 @@ func normalize(raw rawConfig) (Config, error) {
 		Admin:              AdminConfig{Username: "admin", Password: "123", SessionTTL: 12 * time.Hour, MonitorInterval: 5 * time.Second},
 		Database:           raw.Database,
 		Queue:              QueueConfig{ProtectedSlots: 3, PerKeyUnfinishedLimit: 10, GlobalUnfinishedLimit: 100},
-		Task:               TaskConfig{Retention: 7 * 24 * time.Hour, IdempotencyTTL: 24 * time.Hour},
+		Task:               TaskConfig{Retention: 7 * 24 * time.Hour, IdempotencyTTL: 24 * time.Hour, ExecutionTimeout: 10 * time.Minute},
 		APIKeys:            raw.APIKeys,
 		GenerationProfiles: raw.GenerationProfiles,
 	}
@@ -228,18 +232,25 @@ func normalize(raw rawConfig) (Config, error) {
 	if cfg.Task.IdempotencyTTL, err = parseDuration(raw.Task.IdempotencyTTL, cfg.Task.IdempotencyTTL, "task.idempotency_ttl"); err != nil {
 		return Config{}, err
 	}
+	if cfg.Task.ExecutionTimeout, err = parseDuration(raw.Task.ExecutionTimeout, cfg.Task.ExecutionTimeout, "task.execution_timeout"); err != nil {
+		return Config{}, err
+	}
 	migrateLegacyGenerationProfiles(cfg.GenerationProfiles)
 	for _, item := range raw.Upstreams {
 		baseURL, err := parseURL(item.BaseURL)
 		if err != nil {
 			return Config{}, fmt.Errorf("upstream %q base_url: %w", item.ID, err)
 		}
+		jobsBaseURL, err := parseURL(item.JobsBaseURL)
+		if err != nil {
+			return Config{}, fmt.Errorf("upstream %q jobs_base_url: %w", item.ID, err)
+		}
 		publicURL, err := parseURL(item.PublicBaseURL)
 		if err != nil {
 			return Config{}, fmt.Errorf("upstream %q public_base_url: %w", item.ID, err)
 		}
 		u := UpstreamConfig{
-			ID: item.ID, BaseURL: baseURL, PublicBaseURL: publicURL,
+			ID: item.ID, BaseURL: baseURL, JobsBaseURL: jobsBaseURL, PublicBaseURL: publicURL,
 			HealthPath: "/", SubmitAPIName: "submit_minimax_from_slots", CheckAPIName: "check_and_get_video",
 			PollInterval: 3 * time.Second, RequestTimeout: 30 * time.Second,
 		}

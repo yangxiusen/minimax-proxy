@@ -23,7 +23,7 @@ func TestLoadExpandsEnvironmentAndAppliesDefaults(t *testing.T) {
 	if cfg.Queue.ProtectedSlots != 3 || cfg.Queue.PerKeyUnfinishedLimit != 10 {
 		t.Fatalf("Queue defaults = %+v", cfg.Queue)
 	}
-	if cfg.Task.Retention != 7*24*time.Hour || cfg.Task.IdempotencyTTL != 24*time.Hour {
+	if cfg.Task.Retention != 7*24*time.Hour || cfg.Task.IdempotencyTTL != 24*time.Hour || cfg.Task.ExecutionTimeout != 10*time.Minute {
 		t.Fatalf("Task defaults = %+v", cfg.Task)
 	}
 	if cfg.Admin.Username != "admin" || cfg.Admin.Password != "123" {
@@ -38,8 +38,47 @@ func TestLoadExpandsEnvironmentAndAppliesDefaults(t *testing.T) {
 	if got := cfg.Upstreams[0].BaseURL.String(); got != "http://127.0.0.1:7860" {
 		t.Fatalf("expanded upstream = %q", got)
 	}
+	if got := cfg.Upstreams[0].JobsBaseURL.String(); got != "http://127.0.0.1:8188" {
+		t.Fatalf("jobs upstream = %q", got)
+	}
 	if cfg.Upstreams[0].SubmitAPIName != "submit_minimax_from_slots" {
 		t.Fatalf("SubmitAPIName = %q", cfg.Upstreams[0].SubmitAPIName)
+	}
+}
+
+func TestLoadRequiresJobsBaseURL(t *testing.T) {
+	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
+	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
+	yaml := strings.Replace(validYAML(t), "    jobs_base_url: http://127.0.0.1:8188\n", "", 1)
+
+	_, err := Load(writeConfig(t, yaml))
+	if err == nil || !strings.Contains(err.Error(), "jobs_base_url") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestLoadParsesTaskExecutionTimeout(t *testing.T) {
+	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
+	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
+	yaml := "task:\n  execution_timeout: 15m\n" + validYAML(t)
+
+	cfg, err := Load(writeConfig(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Task.ExecutionTimeout != 15*time.Minute {
+		t.Fatalf("Task.ExecutionTimeout = %s", cfg.Task.ExecutionTimeout)
+	}
+}
+
+func TestLoadRejectsNonPositiveTaskExecutionTimeout(t *testing.T) {
+	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
+	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
+	yaml := "task:\n  execution_timeout: 0s\n" + validYAML(t)
+
+	_, err := Load(writeConfig(t, yaml))
+	if err == nil || !strings.Contains(err.Error(), "task.execution_timeout") {
+		t.Fatalf("Load() error = %v", err)
 	}
 }
 
@@ -238,6 +277,7 @@ api_keys:
 upstreams:
   - id: gpu-1
     base_url: ${TEST_UPSTREAM_URL}
+    jobs_base_url: http://127.0.0.1:8188
     public_base_url: https://video.example.com
 generation_profiles:
 ` + generationProfile480PYAML + `  768P:

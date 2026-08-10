@@ -25,6 +25,7 @@ const (
 	StatusDispatching  InternalStatus = "dispatching"
 	StatusRunning      InternalStatus = "running"
 	StatusReconciling  InternalStatus = "reconciling"
+	StatusCancelling   InternalStatus = "cancelling"
 	StatusSucceeded    InternalStatus = "succeeded"
 	StatusFailed       InternalStatus = "failed"
 	StatusCancelled    InternalStatus = "cancelled"
@@ -44,7 +45,7 @@ func (s InternalStatus) V2() V2Status {
 	switch s {
 	case StatusQueuedOpen, StatusQueuedLocked:
 		return V2Queued
-	case StatusDispatching, StatusRunning, StatusReconciling:
+	case StatusDispatching, StatusRunning, StatusReconciling, StatusCancelling:
 		return V2Running
 	case StatusSucceeded:
 		return V2Succeeded
@@ -57,8 +58,21 @@ func (s InternalStatus) V2() V2Status {
 
 func (s InternalStatus) CanCancel() bool { return s == StatusQueuedOpen }
 
+func (s InternalStatus) AdminCanCancel() bool {
+	switch s {
+	case StatusQueuedOpen, StatusQueuedLocked, StatusDispatching, StatusRunning, StatusReconciling:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s InternalStatus) AdminCanDelete() bool {
+	return s == StatusSucceeded || s == StatusFailed || s == StatusCancelled
+}
+
 func AllInternalStatuses() []InternalStatus {
-	return []InternalStatus{StatusQueuedOpen, StatusQueuedLocked, StatusDispatching, StatusRunning, StatusReconciling, StatusSucceeded, StatusFailed, StatusCancelled}
+	return []InternalStatus{StatusQueuedOpen, StatusQueuedLocked, StatusDispatching, StatusRunning, StatusReconciling, StatusCancelling, StatusSucceeded, StatusFailed, StatusCancelled}
 }
 
 type Action string
@@ -81,7 +95,10 @@ type Task struct {
 	RequestJSON, RequestHash                 string
 	Status                                   InternalStatus
 	CancelLocked                             bool
-	UpstreamID, GradioEventID                string
+	UpstreamID, GradioEventID, UpstreamJobID string
+	UpstreamJobsBeforeJSON                   string
+	RetryCount                               int
+	AttemptStartedAt, CancelRequestedAt      time.Time
 	GalleryBeforeJSON                        string
 	ResultInternalURL, ResultPublicURL       string
 	Resolution, RatioRequested, RatioActual  string
@@ -114,6 +131,9 @@ type AdminTaskSummary struct {
 	TaskID, APIKeyID, UpstreamID     string
 	Scenario, Resolution             string
 	Status                           V2Status
+	InternalStatus                   InternalStatus
+	RetryCount                       int
+	ResultPublicURL                  string
 	Duration                         int
 	CreatedAt, StartedAt, FinishedAt time.Time
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"minimax-h3-tc/internal/config"
+	"minimax-h3-tc/internal/upstream/gradio"
 )
 
 func TestCollectorProbesImmediatelyAndMergesObservation(t *testing.T) {
@@ -35,7 +36,7 @@ func TestCollectorProbesImmediatelyAndMergesObservation(t *testing.T) {
 		t.Fatal("collector did not stop after cancellation")
 	}
 
-	if client.order != "health,call" {
+	if client.order != "health,jobs,call" {
 		t.Fatalf("probe order = %q", client.order)
 	}
 	got, _ := cache.Get("gpu-1")
@@ -44,6 +45,43 @@ func TestCollectorProbesImmediatelyAndMergesObservation(t *testing.T) {
 	}
 	if got.PrivateQueue == nil || *got.PrivateQueue != 2 || got.VRAMPercent == nil || *got.VRAMPercent != 40 {
 		t.Fatalf("observation was not merged: %+v", got)
+	}
+}
+
+func TestCollectorJobsFailureMarksNodeUnhealthy(t *testing.T) {
+	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	cache := NewCache([]NodeSnapshot{{ID: "gpu-1", Health: HealthHealthy}})
+	client := &collectorClient{jobsErr: errors.New("jobs unavailable")}
+	collector := Collector{Cache: cache, Nodes: []CollectorNode{{Upstream: config.UpstreamConfig{ID: "gpu-1"}, Client: client}}, Now: func() time.Time { return now }}
+
+	collector.probe(context.Background(), collector.Nodes[0])
+
+	got, _ := cache.Get("gpu-1")
+	if got.Health != HealthUnhealthy || got.LastError == nil || got.LastError.Code != "upstream_jobs_unhealthy" || client.calls != 0 {
+		t.Fatalf("snapshot = %+v, calls = %d", got, client.calls)
+	}
+}
+
+func TestCollectorClearsSchedulingBlockOnlyAfterPrivateIdleConfirmed(t *testing.T) {
+	zero := 0
+	cache := NewCache([]NodeSnapshot{{ID: "gpu-1", SchedulingBlocked: true, Health: HealthUnhealthy}})
+	client := &collectorClient{
+		result: []any{nil, "idle", zero, ""},
+		jobs:   []gradio.Job{{ID: "11111111-1111-1111-1111-111111111111", Status: gradio.JobInProgress}},
+	}
+	collector := Collector{Cache: cache, Nodes: []CollectorNode{{Upstream: config.UpstreamConfig{ID: "gpu-1"}, Client: client}}}
+
+	collector.probe(context.Background(), collector.Nodes[0])
+	blocked, _ := cache.Get("gpu-1")
+	if !blocked.SchedulingBlocked || blocked.Health != HealthUnhealthy {
+		t.Fatalf("active private job cleared scheduling block: %+v", blocked)
+	}
+
+	client.jobs = nil
+	collector.probe(context.Background(), collector.Nodes[0])
+	idle, _ := cache.Get("gpu-1")
+	if idle.SchedulingBlocked || idle.Health != HealthHealthy || idle.Runtime != RuntimeIdle {
+		t.Fatalf("confirmed idle did not clear scheduling block: %+v", idle)
 	}
 }
 
@@ -88,9 +126,16 @@ type collectorClient struct {
 	result    []any
 	healthErr error
 	callErr   error
+	jobsErr   error
+	jobs      []gradio.Job
 	called    chan struct{}
 	calls     int
 	order     string
+}
+
+func (c *collectorClient) ListJobs(context.Context) ([]gradio.Job, error) {
+	c.order += ",jobs"
+	return c.jobs, c.jobsErr
 }
 
 func (c *collectorClient) Healthy(context.Context, string) error {

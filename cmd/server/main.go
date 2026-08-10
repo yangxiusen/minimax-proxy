@@ -65,18 +65,24 @@ func run(configPath string, logger *slog.Logger) error {
 	for _, configured := range cfg.Upstreams {
 		upstream := configured
 		httpClient := &http.Client{Timeout: upstream.RequestTimeout}
-		client := gradio.NewClient(upstream.BaseURL, httpClient, 8<<20)
+		client := gradio.NewClientWithJobs(upstream.BaseURL, upstream.JobsBaseURL, httpClient, 8<<20)
 		gate := &sync.Mutex{}
-		processor := &worker.Processor{Store: store, Client: client, Upstream: upstream, Profiles: cfg.GenerationProfiles, Logger: logger, Cache: cache, Gate: gate}
+		processor := &worker.Processor{Store: store, Client: client, Upstream: upstream, Profiles: cfg.GenerationProfiles, Logger: logger, Cache: cache, Gate: gate, ExecutionTimeout: cfg.Task.ExecutionTimeout}
 		slots = append(slots, scheduler.Slot{ID: upstream.ID, Processor: processor, Health: func(context.Context) error {
-			return cachedNodeHealth(cache, upstream.ID, time.Now(), maxHealthAge)
+			return cachedNodeSchedulable(cache, upstream.ID, time.Now(), maxHealthAge)
+		}, Active: func(ctx context.Context) (bool, error) {
+			_, err := store.ActiveForUpstream(ctx, upstream.ID)
+			if errors.Is(err, domain.ErrTaskNotFound) {
+				return false, nil
+			}
+			return err == nil, err
 		}})
 		collectorNodes = append(collectorNodes, monitorcache.CollectorNode{Upstream: upstream, Client: client, Gate: gate})
 	}
 	dispatcher := scheduler.New(slots, time.Second, logger)
 	available := cacheAvailability(cache, time.Now, maxHealthAge)
 	v2Handler := v2.NewHandler(v2.Dependencies{Store: store, APIKeys: cfg.APIKeys, Profiles: cfg.GenerationProfiles, Logger: logger, Wake: dispatcher.Wake, Available: available})
-	monitorHandler := monitorapi.NewHandler(monitorapi.Dependencies{Admin: cfg.Admin, Cache: cache, Store: store, Logger: logger})
+	monitorHandler := monitorapi.NewHandler(monitorapi.Dependencies{Admin: cfg.Admin, Cache: cache, Store: store, Logger: logger, Wake: dispatcher.Wake})
 	handler := newAppHandler(v2Handler, monitorHandler)
 	server := &http.Server{Addr: cfg.Server.Address, Handler: handler, ReadTimeout: cfg.Server.ReadTimeout, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: cfg.Server.WriteTimeout, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
 	collector := &monitorcache.Collector{Cache: cache, Nodes: collectorNodes, Interval: cfg.Admin.MonitorInterval, Logger: logger}
@@ -148,6 +154,17 @@ func cachedNodeHealth(cache *monitorcache.Cache, id string, now time.Time, maxAg
 	node, ok := cache.Get(id)
 	if !ok || node.Health != monitorcache.HealthHealthy || node.CheckedAt.IsZero() || node.CheckedAt.Before(now.Add(-maxAge)) {
 		return errors.New("节点健康状态不可用或已过期")
+	}
+	return nil
+}
+
+func cachedNodeSchedulable(cache *monitorcache.Cache, id string, now time.Time, maxAge time.Duration) error {
+	if err := cachedNodeHealth(cache, id, now, maxAge); err != nil {
+		return err
+	}
+	node, _ := cache.Get(id)
+	if node.SchedulingBlocked || node.Runtime == monitorcache.RuntimeRunning || node.PrivateQueue != nil && *node.PrivateQueue > 0 {
+		return errors.New("私有实例仍有任务运行")
 	}
 	return nil
 }

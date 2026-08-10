@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -115,6 +116,76 @@ func TestClientRejectsOversizedPostResponse(t *testing.T) {
 	_, err := NewClient(base, server.Client(), 64).Call(context.Background(), "submit", []any{})
 	if err == nil || !strings.Contains(err.Error(), "响应体超过限制") {
 		t.Fatalf("Call() error = %v", err)
+	}
+}
+
+func TestClientListsGetsAndCancelsJobs(t *testing.T) {
+	const jobID = "11111111-1111-1111-1111-111111111111"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/jobs":
+			if r.URL.Query().Get("limit") != "256" {
+				t.Fatalf("limit = %q", r.URL.Query().Get("limit"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jobs":       []map[string]any{{"id": jobID, "status": "in_progress", "create_time": 123}},
+				"pagination": map[string]any{"offset": 0, "limit": nil, "total": 1, "has_more": false},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/jobs/"+jobID:
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": jobID, "status": "completed", "create_time": 123})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/jobs/"+jobID+"/cancel":
+			_ = json.NewEncoder(w).Encode(map[string]bool{"cancelled": true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	base, _ := url.Parse(server.URL)
+	client := NewClient(base, server.Client(), 1<<20)
+
+	jobs, err := client.ListJobs(context.Background())
+	if err != nil || len(jobs) != 1 || jobs[0].ID != jobID || jobs[0].Status != JobInProgress || jobs[0].CreateTime != 123 {
+		t.Fatalf("ListJobs() = %+v, %v", jobs, err)
+	}
+	job, err := client.GetJob(context.Background(), jobID)
+	if err != nil || job.Status != JobCompleted {
+		t.Fatalf("GetJob() = %+v, %v", job, err)
+	}
+	cancelled, err := client.CancelJob(context.Background(), jobID)
+	if err != nil || !cancelled {
+		t.Fatalf("CancelJob() = %v, %v", cancelled, err)
+	}
+}
+
+func TestClientUsesSeparateJobsBaseURL(t *testing.T) {
+	jobsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/jobs" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		_, _ = io.WriteString(w, `{"jobs":[]}`)
+	}))
+	defer jobsServer.Close()
+	gradioURL, _ := url.Parse("http://127.0.0.1:7860")
+	jobsURL, _ := url.Parse(jobsServer.URL)
+	client := NewClientWithJobs(gradioURL, jobsURL, jobsServer.Client(), 1024)
+
+	if _, err := client.ListJobs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientClassifiesMissingJobAndRejectsInvalidID(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	base, _ := url.Parse(server.URL)
+	client := NewClient(base, server.Client(), 1024)
+
+	_, err := client.GetJob(context.Background(), "11111111-1111-1111-1111-111111111111")
+	if !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("GetJob() error = %v", err)
+	}
+	if _, err := client.CancelJob(context.Background(), "not-a-uuid"); err == nil || !strings.Contains(err.Error(), "job_id") {
+		t.Fatalf("CancelJob(invalid) error = %v", err)
 	}
 }
 

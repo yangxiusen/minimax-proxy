@@ -21,6 +21,7 @@ queue:
 task:
   retention: 168h
   idempotency_ttl: 24h
+  execution_timeout: 10m
 
 api_keys:
   - id: customer-1
@@ -30,6 +31,7 @@ api_keys:
 upstreams:
   - id: minimax-private-1
     base_url: "${MINIMAX_UPSTREAM_URL}"
+    jobs_base_url: "${MINIMAX_UPSTREAM_JOBS_URL}"
     public_base_url: "${MINIMAX_PUBLIC_UPSTREAM_URL}"
     health_path: /
     submit_api_name: submit_minimax_from_slots

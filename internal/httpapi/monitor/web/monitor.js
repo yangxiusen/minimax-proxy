@@ -23,7 +23,8 @@ const state = {
   selectedNodeID: "",
   snapshot: null,
   tasksLoaded: false,
-  polling: false
+  polling: false,
+  taskActions: new Set()
 };
 let taskRequestGeneration = 0;
 
@@ -36,6 +37,7 @@ const statusLabels = {
 };
 const healthLabels = { healthy: "健康", unhealthy: "连接失败", unknown: "未知" };
 const runtimeLabels = { running: "运行中", idle: "空闲", unknown: "状态未知" };
+const phaseLabels = { dispatching: "提交中", recovering: "恢复中", retrying: "重试中", cancelling: "中止中" };
 
 function makeElement(tag, className, text) {
   const node = document.createElement(tag);
@@ -69,10 +71,13 @@ function handleUnauthorized(response) {
   return true;
 }
 
-async function requestJSON(url) {
-  const response = await fetch(url, { headers: { Accept: "application/json" } });
+async function requestJSON(url, options = {}) {
+  const headers = new Headers(options.headers || {});
+  headers.set("Accept", "application/json");
+  const response = await fetch(url, { ...options, headers });
   if (handleUnauthorized(response)) throw new Error("unauthorized");
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  if (response.status === 204) return null;
   return response.json();
 }
 
@@ -267,19 +272,63 @@ function renderTasks(response) {
   const rows = items.map((item) => {
     const row = makeElement("div", "task-row");
     row.setAttribute("role", "row");
+    const phaseLabel = phaseLabels[item.phase];
+    const actions = makeElement("span", "task-actions");
+    if (item.video_url) {
+      const play = makeElement("button", "task-action play-action", "播放");
+      play.type = "button";
+      play.title = "播放生成视频";
+      play.addEventListener("click", () => window.open(item.video_url, "_blank", "noopener,noreferrer"));
+      actions.append(play);
+    }
+    if (item.can_cancel) {
+      const cancel = makeElement("button", "task-action cancel-action", "中止");
+      cancel.type = "button";
+      cancel.title = "中止任务";
+      cancel.disabled = state.taskActions.has(item.id);
+      cancel.addEventListener("click", () => runTaskAction(item, "cancel", cancel));
+      actions.append(cancel);
+    }
+    if (item.can_delete) {
+      const remove = makeElement("button", "task-action delete-action", "删除");
+      remove.type = "button";
+      remove.title = "删除任务记录";
+      remove.disabled = state.taskActions.has(item.id);
+      remove.addEventListener("click", () => runTaskAction(item, "delete", remove));
+      actions.append(remove);
+    }
+    if (!actions.childElementCount) actions.append(makeElement("span", "muted", "--"));
     row.append(
       makeElement("span", "", item.id || "--"),
       makeElement("span", "", item.api_key_id || "--"),
-      statusPill(item.status),
+      statusPill(item.status, phaseLabel || statusLabels[item.status]),
       makeElement("span", "", item.upstream_id || "--"),
       makeElement("span", "", item.scenario || "--"),
       makeElement("span", "", item.resolution || "--"),
       makeElement("span", "", duration(item.duration_seconds)),
-      makeElement("span", "", localTime(item.created_at))
+      makeElement("span", "", localTime(item.created_at)),
+      actions
     );
     return row;
   });
   elements.taskRows.replaceChildren(...rows);
+}
+
+async function runTaskAction(item, action, button) {
+  const label = action === "cancel" ? "中止" : "删除";
+  if (!window.confirm(`确认${label}任务 ${item.id}？`)) return;
+  state.taskActions.add(item.id);
+  button.disabled = true;
+  try {
+    const url = action === "cancel" ? `/monitor/api/tasks/${encodeURIComponent(item.id)}/cancel` : `/monitor/api/tasks/${encodeURIComponent(item.id)}`;
+    await requestJSON(url, { method: action === "cancel" ? "POST" : "DELETE" });
+    await Promise.all([loadSnapshot(), loadTasks()]);
+  } catch (error) {
+    if (error.message !== "unauthorized") window.alert(`${label}任务失败，请刷新后重试`);
+  } finally {
+    state.taskActions.delete(item.id);
+    button.disabled = false;
+  }
 }
 
 async function loadSnapshot() {
