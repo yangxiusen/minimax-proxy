@@ -17,7 +17,7 @@ import (
 
 type Store interface {
 	ActiveForUpstream(context.Context, string) (domain.Task, error)
-	ClaimNext(context.Context, string) (domain.Task, error)
+	ClaimNext(context.Context, string, ...int64) (domain.Task, error)
 	SaveBaseline(context.Context, string, string, []string) error
 	SaveSubmissionContext(context.Context, string, string, []string) error
 	BindUpstreamJob(context.Context, string, string, string) error
@@ -54,6 +54,7 @@ type Processor struct {
 	Cache            *monitor.Cache
 	Gate             *sync.Mutex
 	ExecutionTimeout time.Duration
+	NodeVersion      int64
 	Now              func() time.Time
 }
 
@@ -73,7 +74,12 @@ func (p *Processor) ProcessOne(ctx context.Context) error {
 	if !errors.Is(err, domain.ErrTaskNotFound) {
 		return err
 	}
-	task, err := p.Store.ClaimNext(ctx, p.Upstream.ID)
+	var task domain.Task
+	if p.NodeVersion > 0 {
+		task, err = p.Store.ClaimNext(ctx, p.Upstream.ID, p.NodeVersion)
+	} else {
+		task, err = p.Store.ClaimNext(ctx, p.Upstream.ID)
+	}
 	if err != nil {
 		return err
 	}

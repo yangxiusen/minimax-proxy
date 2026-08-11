@@ -216,3 +216,22 @@ func TestCacheAvailableFreshRequiresRecentHealthyCheck(t *testing.T) {
 		})
 	}
 }
+
+func TestCacheAvailabilityExcludesDisabledAndApplyingNodesAndSupportsDelete(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	cache := NewCache([]NodeSnapshot{
+		{ID: "disabled", Health: HealthHealthy, CheckedAt: now, Disabled: true},
+		{ID: "applying", Health: HealthHealthy, CheckedAt: now, Applying: true},
+		{ID: "ready", Health: HealthHealthy, CheckedAt: now},
+	})
+	if !cache.AvailableFresh(now, time.Second) {
+		t.Fatal("ready node was not available")
+	}
+	cache.Delete("ready")
+	if cache.AvailableFresh(now, time.Second) {
+		t.Fatal("disabled or applying node was considered available")
+	}
+	if _, ok := cache.Get("ready"); ok {
+		t.Fatal("deleted node remained in cache")
+	}
+}

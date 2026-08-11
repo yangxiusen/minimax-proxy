@@ -109,6 +109,7 @@ func (c *Collector) mergeObservation(id string, observation gradio.Observation, 
 	queueEmpty := observation.PrivateQueue != nil && *observation.PrivateQueue == 0
 	idleConfirmed := observation.Status == gradio.ObservationIdle && queueEmpty && !privateJobActive
 	c.Cache.Update(id, func(node *NodeSnapshot) {
+		node.Applying = false
 		node.CheckedAt = now
 		node.UpdatedAt = now
 		node.PrivateQueue = observation.PrivateQueue
@@ -157,6 +158,7 @@ func hasActiveJob(jobs []gradio.Job) bool {
 func (c *Collector) markFailure(id, code string) {
 	now := c.now()
 	c.Cache.Update(id, func(node *NodeSnapshot) {
+		node.Applying = false
 		node.Health = HealthUnhealthy
 		node.CheckedAt = now
 		node.UpdatedAt = now

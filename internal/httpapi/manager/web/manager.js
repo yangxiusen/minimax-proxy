@@ -14,7 +14,14 @@ const elements = {
   healthSummary: document.getElementById("health-summary"),
   nodeList: document.getElementById("node-list"),
   nodeDetail: document.getElementById("node-detail"),
-  tasksSection: document.getElementById("tasks-section")
+  tasksSection: document.getElementById("tasks-section"),
+  configDialog: document.getElementById("node-config-dialog"),
+  configForm: document.getElementById("node-config-form"),
+  configNodeList: document.getElementById("config-node-list"),
+  formStatus: document.getElementById("node-form-status"),
+  deleteNode: document.getElementById("delete-node"),
+  testNode: document.getElementById("test-node"),
+  saveNode: document.getElementById("save-node")
 };
 
 const state = {
@@ -24,7 +31,11 @@ const state = {
   snapshot: null,
   tasksLoaded: false,
   polling: false,
-  taskActions: new Set()
+  taskActions: new Set(),
+  configuredNodes: [],
+  editingNode: null,
+  formDirty: false,
+  nodeBusy: false
 };
 let taskRequestGeneration = 0;
 
@@ -67,7 +78,7 @@ function duration(seconds) {
 
 function handleUnauthorized(response) {
   if (response.status !== 401) return false;
-  window.location.replace("/monitor/login");
+  window.location.replace("/manager/login");
   return true;
 }
 
@@ -76,7 +87,14 @@ async function requestJSON(url, options = {}) {
   headers.set("Accept", "application/json");
   const response = await fetch(url, { ...options, headers });
   if (handleUnauthorized(response)) throw new Error("unauthorized");
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  if (!response.ok) {
+    let payload = null;
+    try { payload = await response.json(); } catch (_) { payload = null; }
+    const error = new Error(payload?.error?.message || `HTTP ${response.status}`);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
+  }
   if (response.status === 204) return null;
   return response.json();
 }
@@ -121,6 +139,8 @@ function renderHealthSummary(summary) {
 }
 
 function nodeStatusText(node) {
+  if (node.applying) return "配置应用中";
+  if (node.enabled === false) return "已停用";
   return `${healthLabels[node.health] || "未知"} · ${runtimeLabels[node.runtime] || "状态未知"}`;
 }
 
@@ -133,7 +153,7 @@ function renderNodes(upstreams) {
   }
   if (!upstreams.some((item) => item.id === state.selectedNodeID)) state.selectedNodeID = upstreams[0].id;
   const buttons = upstreams.map((node) => {
-    const button = makeElement("button", `node-button ${node.health || "unknown"}${node.id === state.selectedNodeID ? " active" : ""}`);
+    const button = makeElement("button", `node-button ${node.health || "unknown"}${node.enabled === false ? " disabled" : ""}${node.id === state.selectedNodeID ? " active" : ""}`);
     button.type = "button";
     button.append(
       makeElement("span", "node-name", node.id || "未命名实例"),
@@ -230,7 +250,7 @@ function renderNodeDetail(node) {
     makeElement("h3", "", node.id || "未命名实例"),
     makeElement("div", "detail-subtitle", `${node.address || "地址未知"} · 最后检查 ${localTime(node.checked_at)}`)
   );
-  head.append(identity, statusPill(node.health, nodeStatusText(node)));
+  head.append(identity, statusPill(node.enabled === false ? "idle" : node.applying ? "queued" : node.health, nodeStatusText(node)));
   const metrics = makeElement("div", "metrics");
   metrics.append(metric("CPU", node.cpu_percent), metric("内存", node.memory_percent), metric("GPU", node.gpu_percent), metric("显存", node.vram_percent));
   const tasks = makeElement("div", "node-tasks");
@@ -320,7 +340,7 @@ async function runTaskAction(item, action, button) {
   state.taskActions.add(item.id);
   button.disabled = true;
   try {
-    const url = action === "cancel" ? `/monitor/api/tasks/${encodeURIComponent(item.id)}/cancel` : `/monitor/api/tasks/${encodeURIComponent(item.id)}`;
+    const url = action === "cancel" ? `/manager/api/tasks/${encodeURIComponent(item.id)}/cancel` : `/manager/api/tasks/${encodeURIComponent(item.id)}`;
     await requestJSON(url, { method: action === "cancel" ? "POST" : "DELETE" });
     await Promise.all([loadSnapshot(), loadTasks()]);
   } catch (error) {
@@ -333,7 +353,7 @@ async function runTaskAction(item, action, button) {
 
 async function loadSnapshot() {
   try {
-    const snapshot = await requestJSON("/monitor/api/snapshot");
+    const snapshot = await requestJSON("/manager/api/snapshot");
     state.snapshot = snapshot;
     renderSnapshot(snapshot);
   } catch (error) {
@@ -345,7 +365,7 @@ async function loadTasks() {
 	const requestGeneration = ++taskRequestGeneration;
   if (!state.tasksLoaded) elements.taskRows.replaceChildren(makeElement("p", "table-state", "正在加载任务..."));
   try {
-    const response = await requestJSON(`/monitor/api/tasks?${taskQuery().toString()}`);
+    const response = await requestJSON(`/manager/api/tasks?${taskQuery().toString()}`);
 	if (requestGeneration !== taskRequestGeneration) return;
     state.tasksLoaded = true;
     renderTasks(response);
@@ -358,6 +378,204 @@ async function loadTasks() {
       elements.taskRows.replaceChildren(makeElement("p", "table-state error", "任务加载失败，请稍后重试"));
     }
   }
+}
+
+function formField(name) {
+  return elements.configForm.elements.namedItem(name);
+}
+
+function setNodeBusy(busy) {
+  state.nodeBusy = busy;
+  elements.configForm.querySelectorAll("input, button").forEach((control) => { control.disabled = busy; });
+  formField("id").disabled = busy || Boolean(state.editingNode);
+  document.getElementById("new-node").disabled = busy;
+  document.getElementById("close-node-config").disabled = busy;
+}
+
+function setNodeFormStatus(message, kind = "") {
+  elements.formStatus.className = `form-status${kind ? ` ${kind}` : ""}`;
+  elements.formStatus.textContent = message;
+}
+
+function confirmDiscard() {
+  return !state.formDirty || window.confirm("当前节点配置尚未保存，确认放弃修改？");
+}
+
+function resetNodeForm() {
+  elements.configForm.reset();
+  formField("version").value = "";
+  formField("id").disabled = false;
+  elements.deleteNode.hidden = true;
+  state.editingNode = null;
+  state.formDirty = false;
+  setNodeFormStatus("");
+}
+
+function fillNodeForm(node) {
+  elements.configForm.reset();
+  ["id", "base_url", "jobs_base_url", "public_base_url", "health_path", "submit_api_name", "check_api_name", "poll_interval", "request_timeout", "version"].forEach((name) => {
+    formField(name).value = node[name] ?? "";
+  });
+  formField("enabled").checked = Boolean(node.enabled);
+  formField("id").disabled = true;
+  elements.deleteNode.hidden = false;
+  state.editingNode = node;
+  state.formDirty = false;
+  setNodeFormStatus("");
+}
+
+function renderConfiguredNodes() {
+  if (!state.configuredNodes.length) {
+    elements.configNodeList.replaceChildren(makeElement("p", "inline-state", "暂无节点"));
+    return;
+  }
+  const controls = state.configuredNodes.map((node) => {
+    const selected = state.editingNode?.id === node.id;
+    const button = makeElement("button", `config-node-button${selected ? " active" : ""}`);
+    button.type = "button";
+    button.append(
+      makeElement("strong", "", node.id),
+      makeElement("span", node.enabled ? "summary-healthy" : "muted", node.enabled ? "已启用" : "已停用")
+    );
+    button.addEventListener("click", () => {
+      if (selected || !confirmDiscard()) return;
+      fillNodeForm(node);
+      renderConfiguredNodes();
+    });
+    return button;
+  });
+  elements.configNodeList.replaceChildren(...controls);
+}
+
+async function loadConfiguredNodes(selectedID = "") {
+  elements.configNodeList.replaceChildren(makeElement("p", "inline-state", "正在加载节点..."));
+  const response = await requestJSON("/manager/api/nodes");
+  state.configuredNodes = Array.isArray(response.items) ? response.items : [];
+  const selected = state.configuredNodes.find((node) => node.id === selectedID)
+    || state.configuredNodes.find((node) => node.id === state.editingNode?.id)
+    || state.configuredNodes[0];
+  if (selected) fillNodeForm(selected); else resetNodeForm();
+  renderConfiguredNodes();
+}
+
+function nodePayload(includeVersion) {
+  const payload = {
+    id: formField("id").value.trim(),
+    base_url: formField("base_url").value.trim(),
+    jobs_base_url: formField("jobs_base_url").value.trim(),
+    public_base_url: formField("public_base_url").value.trim(),
+    health_path: formField("health_path").value.trim(),
+    submit_api_name: formField("submit_api_name").value.trim(),
+    check_api_name: formField("check_api_name").value.trim(),
+    poll_interval: formField("poll_interval").value.trim(),
+    request_timeout: formField("request_timeout").value.trim(),
+    enabled: formField("enabled").checked
+  };
+  if (includeVersion) payload.version = Number(formField("version").value);
+  return payload;
+}
+
+function validateNodeForm() {
+  if (elements.configForm.reportValidity()) return true;
+  setNodeFormStatus("请完整填写节点配置", "error");
+  return false;
+}
+
+function renderNodeProbe(checks) {
+  const label = (name, check) => `${name}${check?.ok ? "通过" : `失败（${check?.error_code || "未知错误"}）`}`;
+  return `${label("模型服务：", checks?.gradio)}；${label("任务服务：", checks?.jobs)}`;
+}
+
+async function reloadConflictedNode(id, message) {
+  state.formDirty = false;
+  try {
+    await loadConfiguredNodes(id);
+    setNodeFormStatus(`${message}，已加载最新配置`, "error");
+  } catch (_) {
+    setNodeFormStatus(`${message}，最新配置加载失败，请关闭后重试`, "error");
+  }
+}
+
+async function testNodeConnection() {
+  if (state.nodeBusy || !validateNodeForm()) return;
+  setNodeBusy(true);
+  setNodeFormStatus("正在测试连接...");
+  try {
+    const checks = await requestJSON("/manager/api/nodes/test", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(nodePayload(false))
+    });
+    setNodeFormStatus(renderNodeProbe(checks), "success");
+  } catch (error) {
+    if (error.message !== "unauthorized") setNodeFormStatus(error.payload?.checks ? renderNodeProbe(error.payload.checks) : error.message, "error");
+  } finally {
+    setNodeBusy(false);
+  }
+}
+
+async function saveNode(event) {
+  event.preventDefault();
+  if (state.nodeBusy || !validateNodeForm()) return;
+  const editing = state.editingNode;
+  const payload = nodePayload(Boolean(editing));
+  if (editing && editing.enabled && !payload.enabled && !window.confirm(`确认停用节点 ${editing.id}？`)) return;
+  const url = editing ? `/manager/api/nodes/${encodeURIComponent(editing.id)}` : "/manager/api/nodes";
+  if (editing) delete payload.id;
+  setNodeBusy(true);
+  setNodeFormStatus("正在保存...");
+  try {
+    const saved = await requestJSON(url, {
+      method: editing ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
+    });
+    state.formDirty = false;
+    await Promise.all([loadConfiguredNodes(saved.id), loadSnapshot()]);
+    setNodeFormStatus("节点配置已保存", "success");
+  } catch (error) {
+    if (error.message !== "unauthorized" && error.status === 409 && editing) {
+      await reloadConflictedNode(editing.id, error.message);
+    } else if (error.message !== "unauthorized") {
+      setNodeFormStatus(error.message, "error");
+    }
+  } finally {
+    setNodeBusy(false);
+  }
+}
+
+async function deleteConfiguredNode() {
+  const node = state.editingNode;
+  if (!node || state.nodeBusy || !window.confirm(`确认删除节点 ${node.id}？`)) return;
+  setNodeBusy(true);
+  setNodeFormStatus("正在删除...");
+  try {
+    await requestJSON(`/manager/api/nodes/${encodeURIComponent(node.id)}?version=${encodeURIComponent(node.version)}`, { method: "DELETE" });
+    state.formDirty = false;
+    await Promise.all([loadConfiguredNodes(), loadSnapshot(), loadTasks()]);
+    setNodeFormStatus("节点已删除", "success");
+  } catch (error) {
+    if (error.message !== "unauthorized" && error.status === 409) {
+      await reloadConflictedNode(node.id, error.message);
+    } else if (error.message !== "unauthorized") {
+      setNodeFormStatus(error.message, "error");
+    }
+  } finally {
+    setNodeBusy(false);
+  }
+}
+
+async function openNodeConfiguration() {
+  if (!elements.configDialog.open) elements.configDialog.showModal();
+  setNodeBusy(true);
+  try {
+    await loadConfiguredNodes();
+  } catch (error) {
+    if (error.message !== "unauthorized") setNodeFormStatus("节点配置加载失败", "error");
+  } finally {
+    setNodeBusy(false);
+  }
+}
+
+function closeNodeConfiguration() {
+  if (state.nodeBusy || !confirmDiscard()) return;
+  elements.configDialog.close();
 }
 
 async function poll() {
@@ -385,8 +603,24 @@ elements.searchFilter.addEventListener("input", () => {
   window.clearTimeout(searchTimer);
   searchTimer = window.setTimeout(resetAndLoadTasks, 350);
 });
+elements.configForm.addEventListener("input", () => { state.formDirty = true; });
+elements.configForm.addEventListener("submit", saveNode);
+elements.testNode.addEventListener("click", testNodeConnection);
+elements.deleteNode.addEventListener("click", deleteConfiguredNode);
+document.getElementById("open-node-config").addEventListener("click", openNodeConfiguration);
+document.getElementById("close-node-config").addEventListener("click", closeNodeConfiguration);
+document.getElementById("new-node").addEventListener("click", () => {
+  if (!confirmDiscard()) return;
+  resetNodeForm();
+  renderConfiguredNodes();
+  formField("id").focus();
+});
+elements.configDialog.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeNodeConfiguration();
+});
 document.getElementById("logout").addEventListener("click", async () => {
-  try { await fetch("/monitor/api/session", { method: "DELETE" }); } finally { window.location.replace("/monitor/login"); }
+  try { await fetch("/manager/api/session", { method: "DELETE" }); } finally { window.location.replace("/manager/login"); }
 });
 
 poll();

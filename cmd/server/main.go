@@ -8,20 +8,17 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
 	"minimax-h3-tc/internal/cleaner"
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
-	monitorapi "minimax-h3-tc/internal/httpapi/monitor"
+	managerapi "minimax-h3-tc/internal/httpapi/manager"
 	"minimax-h3-tc/internal/httpapi/v2"
 	monitorcache "minimax-h3-tc/internal/monitor"
-	"minimax-h3-tc/internal/scheduler"
 	storepkg "minimax-h3-tc/internal/store/sqlite"
-	"minimax-h3-tc/internal/upstream/gradio"
-	"minimax-h3-tc/internal/worker"
+	upstreamregistry "minimax-h3-tc/internal/upstream/registry"
 )
 
 func main() {
@@ -51,83 +48,107 @@ func run(configPath string, logger *slog.Logger) error {
 	}
 	defer store.Close()
 
-	cache := newNodeCache(cfg.Upstreams)
-	upstreamIDs := make([]string, 0, len(cfg.Upstreams))
-	for _, upstream := range cfg.Upstreams {
-		upstreamIDs = append(upstreamIDs, upstream.ID)
-	}
-	if err := restoreNodeSnapshots(ctx, cache, store, upstreamIDs); err != nil {
+	importedCount, err := bootstrapLegacyNodes(ctx, store, cfg.LegacyUpstreams)
+	if err != nil {
 		return err
 	}
-	maxHealthAge := maxHealthSnapshotAge(cfg.Admin.MonitorInterval, cfg.Upstreams)
-	slots := make([]scheduler.Slot, 0, len(cfg.Upstreams))
-	collectorNodes := make([]monitorcache.CollectorNode, 0, len(cfg.Upstreams))
-	for _, configured := range cfg.Upstreams {
-		upstream := configured
-		httpClient := &http.Client{Timeout: upstream.RequestTimeout}
-		client := gradio.NewClientWithJobs(upstream.BaseURL, upstream.JobsBaseURL, httpClient, 8<<20)
-		gate := &sync.Mutex{}
-		processor := &worker.Processor{Store: store, Client: client, Upstream: upstream, Profiles: cfg.GenerationProfiles, Logger: logger, Cache: cache, Gate: gate, ExecutionTimeout: cfg.Task.ExecutionTimeout}
-		slots = append(slots, scheduler.Slot{ID: upstream.ID, Processor: processor, Health: func(context.Context) error {
-			return cachedNodeSchedulable(cache, upstream.ID, time.Now(), maxHealthAge)
-		}, Active: func(ctx context.Context) (bool, error) {
-			_, err := store.ActiveForUpstream(ctx, upstream.ID)
-			if errors.Is(err, domain.ErrTaskNotFound) {
-				return false, nil
-			}
-			return err == nil, err
-		}})
-		collectorNodes = append(collectorNodes, monitorcache.CollectorNode{Upstream: upstream, Client: client, Gate: gate})
+	if importedCount > 0 {
+		logger.Info("已从旧配置导入模型服务节点", "stage", "node_bootstrap", "imported_count", importedCount)
 	}
-	dispatcher := scheduler.New(slots, time.Second, logger)
+	nodes, err := store.ListModelNodes(ctx)
+	if err != nil {
+		return err
+	}
+	cache := monitorcache.NewCache(nil)
+	runtimeFactory := upstreamregistry.NodeRuntimeFactory{
+		Store: store, Cache: cache, Profiles: cfg.GenerationProfiles, ExecutionTimeout: cfg.Task.ExecutionTimeout,
+		MonitorInterval: cfg.Admin.MonitorInterval, Logger: logger,
+	}
+	nodeRegistry := upstreamregistry.New(store, runtimeFactory.Start, cache, time.Second, logger)
+	maxHealthAge := 3 * cfg.Admin.MonitorInterval
 	available := cacheAvailability(cache, time.Now, maxHealthAge)
-	v2Handler := v2.NewHandler(v2.Dependencies{Store: store, APIKeys: cfg.APIKeys, Profiles: cfg.GenerationProfiles, Logger: logger, Wake: dispatcher.Wake, Available: available})
-	monitorHandler := monitorapi.NewHandler(monitorapi.Dependencies{Admin: cfg.Admin, Cache: cache, Store: store, Logger: logger, Wake: dispatcher.Wake})
-	handler := newAppHandler(v2Handler, monitorHandler)
+	v2Handler := v2.NewHandler(v2.Dependencies{Store: store, APIKeys: cfg.APIKeys, Profiles: cfg.GenerationProfiles, Logger: logger, Wake: nodeRegistry.Wake, Available: available})
+	prober := upstreamregistry.NodeProber{}
+	managerHandler := managerapi.NewHandler(managerapi.Dependencies{
+		Admin: cfg.Admin, Cache: cache, Store: store, Nodes: store, Logger: logger, Wake: nodeRegistry.Wake,
+		ProbeNode: func(ctx context.Context, input domain.ModelNodeInput) managerapi.NodeProbeResult {
+			result := prober.Probe(ctx, input)
+			return managerapi.NodeProbeResult{
+				Gradio: managerapi.NodeCheck{OK: result.GradioOK, ErrorCode: result.GradioErrorCode},
+				Jobs:   managerapi.NodeCheck{OK: result.JobsOK, ErrorCode: result.JobsErrorCode},
+			}
+		},
+	})
+	handler := newAppHandler(v2Handler, managerHandler)
 	server := &http.Server{Addr: cfg.Server.Address, Handler: handler, ReadTimeout: cfg.Server.ReadTimeout, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: cfg.Server.WriteTimeout, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
-	collector := &monitorcache.Collector{Cache: cache, Nodes: collectorNodes, Interval: cfg.Admin.MonitorInterval, Logger: logger}
 
-	go dispatcher.Run(ctx)
-	go collector.Run(ctx)
+	registryDone := make(chan struct{})
+	go func() {
+		defer close(registryDone)
+		nodeRegistry.Run(ctx)
+	}()
 	go (cleaner.Cleaner{Store: store, Interval: time.Hour, BatchSize: 100, Logger: logger}).Run(ctx)
 	serverErrors := make(chan error, 1)
 	go func() {
-		logger.Info("MiniMax H3 V2 中转服务开始监听", "stage", "lifecycle", "address", cfg.Server.Address, "upstream_count", len(cfg.Upstreams))
+		logger.Info("MiniMax H3 V2 中转服务开始监听", "stage", "lifecycle", "address", cfg.Server.Address, "node_count", len(nodes))
 		serverErrors <- server.ListenAndServe()
 	}()
+	var serveErr error
 	select {
 	case <-ctx.Done():
 	case err := <-serverErrors:
 		if !errors.Is(err, http.ErrServerClosed) {
-			cancel()
-			return err
+			serveErr = err
 		}
 	}
 	cancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shutdownCancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		return err
+	shutdownErr := server.Shutdown(shutdownCtx)
+	<-registryDone
+	if serveErr != nil {
+		return serveErr
+	}
+	if shutdownErr != nil {
+		return shutdownErr
 	}
 	logger.Info("服务已安全停止", "stage", "lifecycle")
 	return nil
 }
 
-type nodeStateStore interface {
-	ActiveForUpstream(context.Context, string) (domain.Task, error)
-	LatestFinishedForUpstream(context.Context, string) (domain.AdminTaskSummary, error)
+type legacyNodeStore interface {
+	LegacyNodeImportPending(context.Context) (bool, error)
+	ListModelNodes(context.Context) ([]domain.ModelNode, error)
+	ImportLegacyNodes(context.Context, []domain.ModelNodeInput) (int, bool, error)
 }
 
-func newNodeCache(upstreams []config.UpstreamConfig) *monitorcache.Cache {
-	nodes := make([]monitorcache.NodeSnapshot, 0, len(upstreams))
-	for _, upstream := range upstreams {
-		address := ""
-		if upstream.BaseURL != nil {
-			address = upstream.BaseURL.Host
-		}
-		nodes = append(nodes, monitorcache.NodeSnapshot{ID: upstream.ID, Address: address})
+func bootstrapLegacyNodes(ctx context.Context, store legacyNodeStore, legacy []config.LegacyUpstreamConfig) (int, error) {
+	pending, err := store.LegacyNodeImportPending(ctx)
+	if err != nil || !pending {
+		return 0, err
 	}
-	return monitorcache.NewCache(nodes)
+	nodes, err := store.ListModelNodes(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if len(nodes) > 0 {
+		_, _, err := store.ImportLegacyNodes(ctx, nil)
+		return 0, err
+	}
+	upstreams, err := config.ParseLegacyUpstreams(legacy)
+	if err != nil {
+		return 0, err
+	}
+	inputs := make([]domain.ModelNodeInput, 0, len(upstreams))
+	for _, upstream := range upstreams {
+		inputs = append(inputs, domain.ModelNodeInput{
+			ID: upstream.ID, BaseURL: upstream.BaseURL.String(), JobsBaseURL: upstream.JobsBaseURL.String(), PublicBaseURL: upstream.PublicBaseURL.String(),
+			HealthPath: upstream.HealthPath, SubmitAPIName: upstream.SubmitAPIName, CheckAPIName: upstream.CheckAPIName,
+			PollInterval: upstream.PollInterval, RequestTimeout: upstream.RequestTimeout, Enabled: true,
+		})
+	}
+	count, _, err := store.ImportLegacyNodes(ctx, inputs)
+	return count, err
 }
 
 func cacheAvailability(cache *monitorcache.Cache, now func() time.Time, maxAge time.Duration) func() bool {
@@ -136,72 +157,21 @@ func cacheAvailability(cache *monitorcache.Cache, now func() time.Time, maxAge t
 	}
 }
 
-func maxHealthSnapshotAge(interval time.Duration, upstreams []config.UpstreamConfig) time.Duration {
-	maxAge := 2 * interval
-	for _, upstream := range upstreams {
-		candidate := upstream.RequestTimeout + interval
-		if candidate > maxAge {
-			maxAge = candidate
-		}
-	}
-	return maxAge
-}
-
-func cachedNodeHealth(cache *monitorcache.Cache, id string, now time.Time, maxAge time.Duration) error {
-	if cache == nil {
-		return errors.New("节点状态缓存不可用")
-	}
-	node, ok := cache.Get(id)
-	if !ok || node.Health != monitorcache.HealthHealthy || node.CheckedAt.IsZero() || node.CheckedAt.Before(now.Add(-maxAge)) {
-		return errors.New("节点健康状态不可用或已过期")
-	}
-	return nil
-}
-
-func cachedNodeSchedulable(cache *monitorcache.Cache, id string, now time.Time, maxAge time.Duration) error {
-	if err := cachedNodeHealth(cache, id, now, maxAge); err != nil {
-		return err
-	}
-	node, _ := cache.Get(id)
-	if node.SchedulingBlocked || node.Runtime == monitorcache.RuntimeRunning || node.PrivateQueue != nil && *node.PrivateQueue > 0 {
-		return errors.New("私有实例仍有任务运行")
-	}
-	return nil
-}
-
-func restoreNodeSnapshots(ctx context.Context, cache *monitorcache.Cache, store nodeStateStore, upstreamIDs []string) error {
-	for _, upstreamID := range upstreamIDs {
-		active, err := store.ActiveForUpstream(ctx, upstreamID)
-		if err != nil && !errors.Is(err, domain.ErrTaskNotFound) {
-			return err
-		}
-		latest, latestErr := store.LatestFinishedForUpstream(ctx, upstreamID)
-		if latestErr != nil && !errors.Is(latestErr, domain.ErrTaskNotFound) {
-			return latestErr
-		}
-		cache.Update(upstreamID, func(node *monitorcache.NodeSnapshot) {
-			if err == nil {
-				node.Runtime = monitorcache.RuntimeRunning
-				node.CurrentTask = &monitorcache.CurrentTaskSnapshot{ID: active.TaskID, Status: string(active.Status.V2()), StartedAt: active.StartedAt}
-			}
-			if latestErr == nil {
-				duration := int64(0)
-				if !latest.StartedAt.IsZero() && !latest.FinishedAt.Before(latest.StartedAt) {
-					duration = int64(latest.FinishedAt.Sub(latest.StartedAt) / time.Second)
-				}
-				node.LatestFinishedTask = &monitorcache.FinishedTaskSnapshot{ID: latest.TaskID, APIKeyID: latest.APIKeyID, Status: string(latest.Status), DurationSeconds: duration, FinishedAt: latest.FinishedAt}
-			}
-		})
-	}
-	return nil
-}
-
-func newAppHandler(v2Handler, monitorHandler http.Handler) http.Handler {
+func newAppHandler(v2Handler, managerHandler http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/v2/", v2Handler)
-	mux.Handle("/monitor", monitorHandler)
-	mux.Handle("/monitor/", monitorHandler)
+	mux.Handle("/manager", managerHandler)
+	mux.Handle("/manager/", managerHandler)
+	mux.HandleFunc("GET /monitor", redirectLegacyManagerPath("/manager/"))
+	mux.HandleFunc("GET /monitor/{$}", redirectLegacyManagerPath("/manager/"))
+	mux.HandleFunc("GET /monitor/login", redirectLegacyManagerPath("/manager/login"))
 	return mux
+}
+
+func redirectLegacyManagerPath(target string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target, http.StatusPermanentRedirect)
+	}
 }
 
 func configPathDefault() string {

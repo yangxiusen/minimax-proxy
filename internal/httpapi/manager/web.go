@@ -1,36 +1,36 @@
-package monitor
+package manager
 
 import (
 	"embed"
 	"net/http"
 )
 
-//go:embed web/login.html web/monitor.html web/styles.css web/login.js web/monitor.js
+//go:embed web/login.html web/manager.html web/styles.css web/login.js web/manager.js
 var webAssets embed.FS
 
 func (h *handler) registerWebRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /monitor", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/monitor/", http.StatusPermanentRedirect)
+	mux.HandleFunc("GET /manager", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/manager/", http.StatusPermanentRedirect)
 	})
-	mux.HandleFunc("GET /monitor/login", h.loginPage)
-	mux.HandleFunc("GET /monitor/", h.monitorPage)
-	mux.HandleFunc("GET /monitor/assets/{name}", h.asset)
+	mux.HandleFunc("GET /manager/login", h.loginPage)
+	mux.HandleFunc("GET /manager/", h.managerPage)
+	mux.HandleFunc("GET /manager/assets/{name}", h.asset)
 }
 
 func (h *handler) loginPage(w http.ResponseWriter, r *http.Request) {
 	if h.requestHasValidSession(r) {
-		http.Redirect(w, r, "/monitor/", http.StatusSeeOther)
+		http.Redirect(w, r, "/manager/", http.StatusSeeOther)
 		return
 	}
 	h.serveEmbedded(w, "web/login.html", "text/html; charset=utf-8")
 }
 
-func (h *handler) monitorPage(w http.ResponseWriter, r *http.Request) {
+func (h *handler) managerPage(w http.ResponseWriter, r *http.Request) {
 	if !h.requestHasValidSession(r) {
-		http.Redirect(w, r, "/monitor/login", http.StatusSeeOther)
+		http.Redirect(w, r, "/manager/login", http.StatusSeeOther)
 		return
 	}
-	h.serveEmbedded(w, "web/monitor.html", "text/html; charset=utf-8")
+	h.serveEmbedded(w, "web/manager.html", "text/html; charset=utf-8")
 }
 
 func (h *handler) asset(w http.ResponseWriter, r *http.Request) {
@@ -39,7 +39,7 @@ func (h *handler) asset(w http.ResponseWriter, r *http.Request) {
 	switch name {
 	case "styles.css":
 		contentType = "text/css; charset=utf-8"
-	case "login.js", "monitor.js":
+	case "login.js", "manager.js":
 		contentType = "text/javascript; charset=utf-8"
 	default:
 		http.NotFound(w, r)

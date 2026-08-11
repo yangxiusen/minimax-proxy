@@ -7,7 +7,7 @@ document.getElementById("login-form").addEventListener("submit", async (event) =
   submit.disabled = true;
   error.textContent = "";
   try {
-    const response = await fetch("/monitor/api/session", {
+    const response = await fetch("/manager/api/session", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -16,7 +16,7 @@ document.getElementById("login-form").addEventListener("submit", async (event) =
       })
     });
     if (response.ok) {
-      window.location.replace("/monitor/");
+      window.location.replace("/manager/");
       return;
     }
     error.textContent = response.status === 429 ? "登录尝试过于频繁，请稍后重试" : "账号或密码错误";

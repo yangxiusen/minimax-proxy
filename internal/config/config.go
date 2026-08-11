@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"minimax-h3-tc/internal/domain"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -27,7 +29,7 @@ type Config struct {
 	Queue              QueueConfig
 	Task               TaskConfig
 	APIKeys            []APIKeyConfig
-	Upstreams          []UpstreamConfig
+	LegacyUpstreams    []LegacyUpstreamConfig
 	GenerationProfiles map[string]GenerationProfile
 }
 
@@ -79,6 +81,18 @@ type UpstreamConfig struct {
 	RequestTimeout time.Duration
 }
 
+type LegacyUpstreamConfig struct {
+	ID             string `yaml:"id"`
+	BaseURL        string `yaml:"base_url"`
+	JobsBaseURL    string `yaml:"jobs_base_url"`
+	PublicBaseURL  string `yaml:"public_base_url"`
+	HealthPath     string `yaml:"health_path"`
+	SubmitAPIName  string `yaml:"submit_api_name"`
+	CheckAPIName   string `yaml:"check_api_name"`
+	PollInterval   string `yaml:"poll_interval"`
+	RequestTimeout string `yaml:"request_timeout"`
+}
+
 type GenerationProfile struct {
 	ModelMode       string               `yaml:"model_mode"`
 	CustomModel     string               `yaml:"custom_model"`
@@ -117,18 +131,8 @@ type rawConfig struct {
 		IdempotencyTTL   string `yaml:"idempotency_ttl"`
 		ExecutionTimeout string `yaml:"execution_timeout"`
 	} `yaml:"task"`
-	APIKeys   []APIKeyConfig `yaml:"api_keys"`
-	Upstreams []struct {
-		ID             string `yaml:"id"`
-		BaseURL        string `yaml:"base_url"`
-		JobsBaseURL    string `yaml:"jobs_base_url"`
-		PublicBaseURL  string `yaml:"public_base_url"`
-		HealthPath     string `yaml:"health_path"`
-		SubmitAPIName  string `yaml:"submit_api_name"`
-		CheckAPIName   string `yaml:"check_api_name"`
-		PollInterval   string `yaml:"poll_interval"`
-		RequestTimeout string `yaml:"request_timeout"`
-	} `yaml:"upstreams"`
+	APIKeys            []APIKeyConfig               `yaml:"api_keys"`
+	Upstreams          []LegacyUpstreamConfig       `yaml:"upstreams"`
 	GenerationProfiles map[string]GenerationProfile `yaml:"generation_profiles"`
 }
 
@@ -137,23 +141,19 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("读取配置文件: %w", err)
 	}
-	expanded, err := expandEnvironment(string(data))
+	mainYAML, legacyUpstreams, err := splitLegacyUpstreams(data)
 	if err != nil {
 		return Config{}, err
 	}
-
-	var raw rawConfig
-	decoder := yaml.NewDecoder(bytes.NewBufferString(expanded))
-	decoder.KnownFields(true)
-	if err := decoder.Decode(&raw); err != nil {
-		return Config{}, fmt.Errorf("解析 YAML 配置: %w", err)
+	expanded, err := expandEnvironment(mainYAML)
+	if err != nil {
+		return Config{}, err
 	}
-	var extra any
-	if err := decoder.Decode(&extra); err == nil {
-		return Config{}, errors.New("配置文件只能包含一个 YAML 文档")
-	} else if !errors.Is(err, io.EOF) {
-		return Config{}, fmt.Errorf("解析额外 YAML 内容: %w", err)
+	raw, err := decodeRawConfig(expanded)
+	if err != nil {
+		return Config{}, err
 	}
+	raw.Upstreams = legacyUpstreams
 
 	cfg, err := normalize(raw)
 	if err != nil {
@@ -163,6 +163,62 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func splitLegacyUpstreams(data []byte) (string, []LegacyUpstreamConfig, error) {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	var document yaml.Node
+	if err := decoder.Decode(&document); err != nil {
+		return "", nil, fmt.Errorf("解析 YAML 配置: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err == nil {
+		return "", nil, errors.New("配置文件只能包含一个 YAML 文档")
+	} else if !errors.Is(err, io.EOF) {
+		return "", nil, fmt.Errorf("解析 YAML 配置: %w", err)
+	}
+	if len(document.Content) != 1 || document.Content[0].Kind != yaml.MappingNode {
+		return "", nil, errors.New("配置文件必须是 YAML 对象")
+	}
+	root := document.Content[0]
+	var legacy []LegacyUpstreamConfig
+	for index := 0; index < len(root.Content); index += 2 {
+		if root.Content[index].Value != "upstreams" {
+			continue
+		}
+		upstreamData, err := yaml.Marshal(root.Content[index+1])
+		if err != nil {
+			return "", nil, fmt.Errorf("解析 YAML 配置: %w", err)
+		}
+		upstreamDecoder := yaml.NewDecoder(bytes.NewReader(upstreamData))
+		upstreamDecoder.KnownFields(true)
+		if err := upstreamDecoder.Decode(&legacy); err != nil {
+			return "", nil, fmt.Errorf("解析 YAML 配置: %w", err)
+		}
+		root.Content = append(root.Content[:index], root.Content[index+2:]...)
+		break
+	}
+	mainData, err := yaml.Marshal(&document)
+	if err != nil {
+		return "", nil, fmt.Errorf("规范化 YAML 配置: %w", err)
+	}
+	return string(mainData), legacy, nil
+}
+
+func decodeRawConfig(input string) (rawConfig, error) {
+	var raw rawConfig
+	decoder := yaml.NewDecoder(bytes.NewBufferString(input))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&raw); err != nil {
+		return rawConfig{}, fmt.Errorf("解析 YAML 配置: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err == nil {
+		return rawConfig{}, errors.New("配置文件只能包含一个 YAML 文档")
+	} else if !errors.Is(err, io.EOF) {
+		return rawConfig{}, fmt.Errorf("解析额外 YAML 内容: %w", err)
+	}
+	return raw, nil
 }
 
 func expandEnvironment(input string) (string, error) {
@@ -190,6 +246,7 @@ func normalize(raw rawConfig) (Config, error) {
 		Queue:              QueueConfig{ProtectedSlots: 3, PerKeyUnfinishedLimit: 10, GlobalUnfinishedLimit: 100},
 		Task:               TaskConfig{Retention: 7 * 24 * time.Hour, IdempotencyTTL: 24 * time.Hour, ExecutionTimeout: 10 * time.Minute},
 		APIKeys:            raw.APIKeys,
+		LegacyUpstreams:    append([]LegacyUpstreamConfig(nil), raw.Upstreams...),
 		GenerationProfiles: raw.GenerationProfiles,
 	}
 	if raw.Server.Address != "" {
@@ -236,42 +293,63 @@ func normalize(raw rawConfig) (Config, error) {
 		return Config{}, err
 	}
 	migrateLegacyGenerationProfiles(cfg.GenerationProfiles)
-	for _, item := range raw.Upstreams {
-		baseURL, err := parseURL(item.BaseURL)
+	return cfg, nil
+}
+
+func ParseLegacyUpstreams(items []LegacyUpstreamConfig) ([]UpstreamConfig, error) {
+	upstreams := make([]UpstreamConfig, 0, len(items))
+	ids := make(map[string]struct{}, len(items))
+	for _, rawItem := range items {
+		item, err := expandLegacyUpstream(rawItem)
 		if err != nil {
-			return Config{}, fmt.Errorf("upstream %q base_url: %w", item.ID, err)
+			return nil, err
 		}
-		jobsBaseURL, err := parseURL(item.JobsBaseURL)
-		if err != nil {
-			return Config{}, fmt.Errorf("upstream %q jobs_base_url: %w", item.ID, err)
+		if strings.TrimSpace(item.ID) == "" {
+			return nil, errors.New("upstream.id 不能为空")
 		}
-		publicURL, err := parseURL(item.PublicBaseURL)
-		if err != nil {
-			return Config{}, fmt.Errorf("upstream %q public_base_url: %w", item.ID, err)
-		}
-		u := UpstreamConfig{
-			ID: item.ID, BaseURL: baseURL, JobsBaseURL: jobsBaseURL, PublicBaseURL: publicURL,
+		input := domain.ModelNodeInput{
+			ID: item.ID, BaseURL: item.BaseURL, JobsBaseURL: item.JobsBaseURL, PublicBaseURL: item.PublicBaseURL,
 			HealthPath: "/", SubmitAPIName: "submit_minimax_from_slots", CheckAPIName: "check_and_get_video",
-			PollInterval: 3 * time.Second, RequestTimeout: 30 * time.Second,
+			PollInterval: 3 * time.Second, RequestTimeout: 30 * time.Second, Enabled: true,
 		}
 		if item.HealthPath != "" {
-			u.HealthPath = item.HealthPath
+			input.HealthPath = item.HealthPath
 		}
 		if item.SubmitAPIName != "" {
-			u.SubmitAPIName = item.SubmitAPIName
+			input.SubmitAPIName = item.SubmitAPIName
 		}
 		if item.CheckAPIName != "" {
-			u.CheckAPIName = item.CheckAPIName
+			input.CheckAPIName = item.CheckAPIName
 		}
-		if u.PollInterval, err = parseDuration(item.PollInterval, u.PollInterval, "upstream.poll_interval"); err != nil {
-			return Config{}, err
+		if input.PollInterval, err = parseDuration(item.PollInterval, input.PollInterval, "upstream.poll_interval"); err != nil {
+			return nil, err
 		}
-		if u.RequestTimeout, err = parseDuration(item.RequestTimeout, u.RequestTimeout, "upstream.request_timeout"); err != nil {
-			return Config{}, err
+		if input.RequestTimeout, err = parseDuration(item.RequestTimeout, input.RequestTimeout, "upstream.request_timeout"); err != nil {
+			return nil, err
 		}
-		cfg.Upstreams = append(cfg.Upstreams, u)
+		normalized, upstream, err := NormalizeModelNode(input)
+		if err != nil {
+			return nil, fmt.Errorf("upstream %q: %w", item.ID, err)
+		}
+		if _, exists := ids[normalized.ID]; exists {
+			return nil, fmt.Errorf("upstream id %q 重复", normalized.ID)
+		}
+		ids[normalized.ID] = struct{}{}
+		upstreams = append(upstreams, upstream)
 	}
-	return cfg, nil
+	return upstreams, nil
+}
+
+func expandLegacyUpstream(item LegacyUpstreamConfig) (LegacyUpstreamConfig, error) {
+	fields := []*string{&item.ID, &item.BaseURL, &item.JobsBaseURL, &item.PublicBaseURL, &item.HealthPath, &item.SubmitAPIName, &item.CheckAPIName, &item.PollInterval, &item.RequestTimeout}
+	for _, field := range fields {
+		expanded, err := expandEnvironment(*field)
+		if err != nil {
+			return LegacyUpstreamConfig{}, err
+		}
+		*field = expanded
+	}
+	return item, nil
 }
 
 func migrateLegacyGenerationProfiles(profiles map[string]GenerationProfile) {
@@ -411,22 +489,6 @@ func validate(cfg Config) error {
 	}
 	if enabledKeys == 0 {
 		return errors.New("至少配置一个启用的 API Key")
-	}
-	if len(cfg.Upstreams) == 0 {
-		return errors.New("至少配置一个上游实例")
-	}
-	upstreamIDs := map[string]struct{}{}
-	for _, upstream := range cfg.Upstreams {
-		if upstream.ID == "" {
-			return errors.New("upstream.id 不能为空")
-		}
-		if _, ok := upstreamIDs[upstream.ID]; ok {
-			return fmt.Errorf("upstream id %q 重复", upstream.ID)
-		}
-		upstreamIDs[upstream.ID] = struct{}{}
-		if !strings.HasPrefix(upstream.HealthPath, "/") {
-			return fmt.Errorf("upstream %q health_path 必须以 / 开头", upstream.ID)
-		}
 	}
 	for _, resolution := range requiredResolutions {
 		profile, ok := cfg.GenerationProfiles[resolution]

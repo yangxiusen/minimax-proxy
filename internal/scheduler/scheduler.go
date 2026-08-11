@@ -78,7 +78,9 @@ func (s *Scheduler) runSlot(ctx context.Context, slot Slot) {
 			err := slot.Health(healthCtx)
 			cancel()
 			if err != nil {
-				s.logger.WarnContext(ctx, "私有服务健康检查失败，暂停该实例调度", "upstream_id", slot.ID, "stage", "health", "error_code", "upstream_unhealthy")
+				if !errors.Is(err, domain.ErrNodeDisabled) {
+					s.logger.WarnContext(ctx, "私有服务健康检查失败，暂停该实例调度", "upstream_id", slot.ID, "stage", "health", "error_code", "upstream_unhealthy")
+				}
 				if !s.wait(ctx) {
 					return
 				}

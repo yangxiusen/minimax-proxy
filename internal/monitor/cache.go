@@ -57,6 +57,8 @@ type NodeSnapshot struct {
 	CurrentTask        *CurrentTaskSnapshot  `json:"current_task"`
 	LatestFinishedTask *FinishedTaskSnapshot `json:"latest_finished_task"`
 	LastError          *ErrorSnapshot        `json:"last_error"`
+	Disabled           bool                  `json:"-"`
+	Applying           bool                  `json:"-"`
 	SchedulingBlocked  bool                  `json:"-"`
 }
 
@@ -93,6 +95,12 @@ func (c *Cache) Update(id string, update func(*NodeSnapshot)) {
 	c.nodes[id] = cloneNode(node)
 }
 
+func (c *Cache) Delete(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.nodes, id)
+}
+
 func (c *Cache) Get(id string) (NodeSnapshot, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -116,7 +124,7 @@ func (c *Cache) HealthyCount() int {
 	defer c.mu.RUnlock()
 	count := 0
 	for _, node := range c.nodes {
-		if node.Health == HealthHealthy {
+		if !node.Disabled && !node.Applying && node.Health == HealthHealthy {
 			count++
 		}
 	}
@@ -131,7 +139,7 @@ func (c *Cache) AvailableFresh(now time.Time, maxAge time.Duration) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	for _, node := range c.nodes {
-		if node.Health == HealthHealthy && !node.CheckedAt.IsZero() && !node.CheckedAt.Before(now.Add(-maxAge)) {
+		if !node.Disabled && !node.Applying && node.Health == HealthHealthy && !node.CheckedAt.IsZero() && !node.CheckedAt.Before(now.Add(-maxAge)) {
 			return true
 		}
 	}

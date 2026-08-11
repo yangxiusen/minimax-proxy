@@ -1,4 +1,4 @@
-package monitor
+package manager
 
 import (
 	"bytes"
@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	SessionCookieName = "monitor_session"
+	SessionCookieName = "manager_session"
 	loginBodyLimit    = 4 << 10
 	loginFailureLimit = 5
 	loginBlockPeriod  = time.Minute
@@ -39,20 +39,30 @@ type TaskStore interface {
 	AdminDelete(context.Context, string) error
 }
 
+type NodeStore interface {
+	ListModelNodes(context.Context) ([]domain.ModelNode, error)
+	CreateModelNode(context.Context, domain.ModelNodeInput) (domain.ModelNode, error)
+	UpdateModelNode(context.Context, string, int64, domain.ModelNodeInput) (domain.ModelNode, error)
+	DeleteModelNode(context.Context, string, int64) error
+}
+
 type Dependencies struct {
-	Admin  config.AdminConfig
-	Cache  *monitorcache.Cache
-	Store  TaskStore
-	Logger *slog.Logger
-	Now    func() time.Time
-	Rand   io.Reader
-	Wake   func()
+	Admin     config.AdminConfig
+	Cache     *monitorcache.Cache
+	Store     TaskStore
+	Nodes     NodeStore
+	Logger    *slog.Logger
+	Now       func() time.Time
+	Rand      io.Reader
+	Wake      func()
+	ProbeNode func(context.Context, domain.ModelNodeInput) NodeProbeResult
 }
 
 type handler struct {
 	root            http.Handler
 	cache           *monitorcache.Cache
 	store           TaskStore
+	nodes           NodeStore
 	logger          *slog.Logger
 	now             func() time.Time
 	random          io.Reader
@@ -62,6 +72,7 @@ type handler struct {
 	secureCookie    bool
 	monitorInterval time.Duration
 	wake            func()
+	probeNode       func(context.Context, domain.ModelNodeInput) NodeProbeResult
 
 	sessionMu          sync.Mutex
 	sessions           map[[sha256.Size]byte]time.Time
@@ -101,6 +112,7 @@ func NewHandler(dependencies Dependencies) http.Handler {
 	h := &handler{
 		cache:           cache,
 		store:           dependencies.Store,
+		nodes:           dependencies.Nodes,
 		logger:          logger,
 		now:             now,
 		random:          random,
@@ -110,17 +122,23 @@ func NewHandler(dependencies Dependencies) http.Handler {
 		secureCookie:    dependencies.Admin.SecureCookie,
 		monitorInterval: monitorInterval,
 		wake:            dependencies.Wake,
+		probeNode:       dependencies.ProbeNode,
 		sessions:        make(map[[sha256.Size]byte]time.Time),
 		failures:        make(map[string]loginFailure),
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /monitor/api/session", h.createSession)
-	mux.Handle("DELETE /monitor/api/session", h.authenticate(http.HandlerFunc(h.deleteSession)))
-	mux.Handle("GET /monitor/api/snapshot", h.authenticate(http.HandlerFunc(h.snapshot)))
-	mux.Handle("GET /monitor/api/tasks", h.authenticate(http.HandlerFunc(h.tasks)))
-	mux.Handle("POST /monitor/api/tasks/{task_id}/cancel", h.authenticate(http.HandlerFunc(h.cancelTask)))
-	mux.Handle("DELETE /monitor/api/tasks/{task_id}", h.authenticate(http.HandlerFunc(h.deleteTask)))
+	mux.HandleFunc("POST /manager/api/session", h.createSession)
+	mux.Handle("DELETE /manager/api/session", h.authenticate(http.HandlerFunc(h.deleteSession)))
+	mux.Handle("GET /manager/api/snapshot", h.authenticate(http.HandlerFunc(h.snapshot)))
+	mux.Handle("GET /manager/api/tasks", h.authenticate(http.HandlerFunc(h.tasks)))
+	mux.Handle("POST /manager/api/tasks/{task_id}/cancel", h.authenticate(http.HandlerFunc(h.cancelTask)))
+	mux.Handle("DELETE /manager/api/tasks/{task_id}", h.authenticate(http.HandlerFunc(h.deleteTask)))
+	mux.Handle("GET /manager/api/nodes", h.authenticate(http.HandlerFunc(h.listNodes)))
+	mux.Handle("POST /manager/api/nodes", h.authenticate(http.HandlerFunc(h.createNode)))
+	mux.Handle("PUT /manager/api/nodes/{node_id}", h.authenticate(http.HandlerFunc(h.updateNode)))
+	mux.Handle("DELETE /manager/api/nodes/{node_id}", h.authenticate(http.HandlerFunc(h.deleteNode)))
+	mux.Handle("POST /manager/api/nodes/test", h.authenticate(http.HandlerFunc(h.testNode)))
 	h.registerWebRoutes(mux)
 	h.root = h.noStore(mux)
 	return h
@@ -189,7 +207,7 @@ func (h *handler) createSession(w http.ResponseWriter, r *http.Request) {
 		h.sessionMu.Unlock()
 	})
 	succeeded = true
-	h.logger.InfoContext(r.Context(), "管理控制台会话已创建", "event", "monitor_session_created")
+	h.logger.InfoContext(r.Context(), "管理控制台会话已创建", "event", "manager_session_created")
 	h.setSessionCookie(w, hex.EncodeToString(token), expires, h.secureCookie || r.TLS != nil, 0)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -208,7 +226,7 @@ func (h *handler) deleteSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	h.setSessionCookie(w, "", time.Unix(1, 0), h.secureCookie || r.TLS != nil, -1)
-	h.logger.InfoContext(r.Context(), "管理控制台会话已销毁", "event", "monitor_session_deleted")
+	h.logger.InfoContext(r.Context(), "管理控制台会话已销毁", "event", "manager_session_deleted")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -317,7 +335,7 @@ func (h *handler) setSessionCookie(w http.ResponseWriter, value string, expires 
 	http.SetCookie(w, &http.Cookie{
 		Name:     SessionCookieName,
 		Value:    value,
-		Path:     "/monitor",
+		Path:     "/manager",
 		Expires:  expires,
 		MaxAge:   maxAge,
 		HttpOnly: true,
@@ -343,6 +361,8 @@ type snapshotSummary struct {
 type upstreamDTO struct {
 	ID                 string                     `json:"id"`
 	Address            string                     `json:"address"`
+	Enabled            bool                       `json:"enabled"`
+	Applying           bool                       `json:"applying"`
 	Health             monitorcache.HealthStatus  `json:"health"`
 	Runtime            monitorcache.RuntimeStatus `json:"runtime"`
 	PrivateQueue       *int                       `json:"private_queue"`
@@ -383,21 +403,23 @@ func (h *handler) snapshot(w http.ResponseWriter, _ *http.Request) {
 	response := snapshotResponse{StaleAfterSecond: staleAfter, Upstreams: make([]upstreamDTO, 0, len(nodes))}
 	for _, node := range nodes {
 		item := upstreamDTO{
-			ID: node.ID, Address: node.Address, Health: node.Health, Runtime: node.Runtime,
+			ID: node.ID, Address: node.Address, Enabled: !node.Disabled, Applying: node.Applying, Health: node.Health, Runtime: node.Runtime,
 			PrivateQueue: node.PrivateQueue, CPUPercent: node.CPUPercent, MemoryPercent: node.MemoryPercent,
 			GPUPercent: node.GPUPercent, VRAMPercent: node.VRAMPercent, CheckedAt: unixTime(node.CheckedAt),
 			LastHealthyAt: unixTime(node.LastHealthyAt), UpdatedAt: unixTime(node.UpdatedAt),
 		}
-		switch node.Health {
-		case monitorcache.HealthHealthy:
-			response.Summary.Healthy++
-		case monitorcache.HealthUnhealthy:
-			response.Summary.Unhealthy++
-		default:
-			response.Summary.Unknown++
-		}
-		if node.Runtime == monitorcache.RuntimeRunning {
-			response.Summary.Running++
+		if !node.Disabled {
+			switch node.Health {
+			case monitorcache.HealthHealthy:
+				response.Summary.Healthy++
+			case monitorcache.HealthUnhealthy:
+				response.Summary.Unhealthy++
+			default:
+				response.Summary.Unknown++
+			}
+			if node.Runtime == monitorcache.RuntimeRunning {
+				response.Summary.Running++
+			}
 		}
 		if item.UpdatedAt > response.UpdatedAt {
 			response.UpdatedAt = item.UpdatedAt

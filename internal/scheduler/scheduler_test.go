@@ -1,12 +1,15 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
 	"testing"
 	"time"
+
+	"minimax-h3-tc/internal/domain"
 )
 
 func TestSchedulerRunsUpstreamSlotsInParallel(t *testing.T) {
@@ -81,6 +84,25 @@ func TestUnhealthySlotStillReconcilesActiveTask(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+func TestDisabledSlotWaitsWithoutHealthWarning(t *testing.T) {
+	var output bytes.Buffer
+	called := make(chan struct{}, 1)
+	scheduler := New([]Slot{{
+		ID: "disabled", Processor: notifyingProcessor{called: called}, Health: func(context.Context) error { return domain.ErrNodeDisabled },
+	}}, 10*time.Millisecond, slog.New(slog.NewJSONHandler(&output, nil)))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	scheduler.Run(ctx)
+	select {
+	case <-called:
+		t.Fatal("disabled processor was called")
+	default:
+	}
+	if bytes.Contains(output.Bytes(), []byte("upstream_unhealthy")) {
+		t.Fatalf("disabled node emitted health warning: %s", output.String())
+	}
 }
 
 type blockingProcessor struct {

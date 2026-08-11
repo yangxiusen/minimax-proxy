@@ -50,14 +50,14 @@ func TestCollectorProbesImmediatelyAndMergesObservation(t *testing.T) {
 
 func TestCollectorJobsFailureMarksNodeUnhealthy(t *testing.T) {
 	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
-	cache := NewCache([]NodeSnapshot{{ID: "gpu-1", Health: HealthHealthy}})
+	cache := NewCache([]NodeSnapshot{{ID: "gpu-1", Health: HealthHealthy, Applying: true}})
 	client := &collectorClient{jobsErr: errors.New("jobs unavailable")}
 	collector := Collector{Cache: cache, Nodes: []CollectorNode{{Upstream: config.UpstreamConfig{ID: "gpu-1"}, Client: client}}, Now: func() time.Time { return now }}
 
 	collector.probe(context.Background(), collector.Nodes[0])
 
 	got, _ := cache.Get("gpu-1")
-	if got.Health != HealthUnhealthy || got.LastError == nil || got.LastError.Code != "upstream_jobs_unhealthy" || client.calls != 0 {
+	if got.Health != HealthUnhealthy || got.Applying || got.LastError == nil || got.LastError.Code != "upstream_jobs_unhealthy" || client.calls != 0 {
 		t.Fatalf("snapshot = %+v, calls = %d", got, client.calls)
 	}
 }

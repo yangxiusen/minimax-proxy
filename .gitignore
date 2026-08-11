@@ -4,5 +4,6 @@ data/
 *.db-shm
 *.db-wal
 .superpowers/
+.playwright-cli/
 .worktrees/
 .env.docker

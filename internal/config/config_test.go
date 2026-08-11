@@ -35,14 +35,18 @@ func TestLoadExpandsEnvironmentAndAppliesDefaults(t *testing.T) {
 	if got := cfg.APIKeys[0].Key; got != "secret-a" {
 		t.Fatalf("expanded key = %q", got)
 	}
-	if got := cfg.Upstreams[0].BaseURL.String(); got != "http://127.0.0.1:7860" {
+	upstreams, err := ParseLegacyUpstreams(cfg.LegacyUpstreams)
+	if err != nil {
+		t.Fatalf("ParseLegacyUpstreams() error = %v", err)
+	}
+	if got := upstreams[0].BaseURL.String(); got != "http://127.0.0.1:7860" {
 		t.Fatalf("expanded upstream = %q", got)
 	}
-	if got := cfg.Upstreams[0].JobsBaseURL.String(); got != "http://127.0.0.1:8188" {
+	if got := upstreams[0].JobsBaseURL.String(); got != "http://127.0.0.1:8188" {
 		t.Fatalf("jobs upstream = %q", got)
 	}
-	if cfg.Upstreams[0].SubmitAPIName != "submit_minimax_from_slots" {
-		t.Fatalf("SubmitAPIName = %q", cfg.Upstreams[0].SubmitAPIName)
+	if upstreams[0].SubmitAPIName != "submit_minimax_from_slots" {
+		t.Fatalf("SubmitAPIName = %q", upstreams[0].SubmitAPIName)
 	}
 }
 
@@ -51,9 +55,63 @@ func TestLoadRequiresJobsBaseURL(t *testing.T) {
 	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
 	yaml := strings.Replace(validYAML(t), "    jobs_base_url: http://127.0.0.1:8188\n", "", 1)
 
-	_, err := Load(writeConfig(t, yaml))
-	if err == nil || !strings.Contains(err.Error(), "jobs_base_url") {
+	cfg, err := Load(writeConfig(t, yaml))
+	if err != nil {
 		t.Fatalf("Load() error = %v", err)
+	}
+	_, err = ParseLegacyUpstreams(cfg.LegacyUpstreams)
+	if err == nil || !strings.Contains(err.Error(), "jobs_base_url") {
+		t.Fatalf("ParseLegacyUpstreams() error = %v", err)
+	}
+}
+
+func TestLoadAllowsConfigWithoutUpstreams(t *testing.T) {
+	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
+	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
+	yaml := strings.Replace(validYAML(t), `upstreams:
+  - id: gpu-1
+    base_url: ${TEST_UPSTREAM_URL}
+    jobs_base_url: http://127.0.0.1:8188
+    public_base_url: https://video.example.com
+`, "", 1)
+
+	cfg, err := Load(writeConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.LegacyUpstreams) != 0 {
+		t.Fatalf("LegacyUpstreams = %+v, want empty", cfg.LegacyUpstreams)
+	}
+}
+
+func TestLoadDefersLegacyUpstreamEnvironmentExpansion(t *testing.T) {
+	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
+	yaml := strings.ReplaceAll(validYAML(t), "${TEST_UPSTREAM_URL}", "${MISSING_LEGACY_URL}")
+
+	cfg, err := Load(writeConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if _, err := ParseLegacyUpstreams(cfg.LegacyUpstreams); err == nil || !strings.Contains(err.Error(), "MISSING_LEGACY_URL") {
+		t.Fatalf("ParseLegacyUpstreams() error = %v", err)
+	}
+}
+
+func TestLoadExpandsEnvironmentBeforeParsingBooleanAndIntegerFields(t *testing.T) {
+	t.Setenv("TEST_MINIMAX_KEY", "secret")
+	t.Setenv("TEST_API_ENABLED", "true")
+	t.Setenv("TEST_PROTECTED_SLOTS", "2")
+	t.Setenv("TEST_EASY_CACHE", "true")
+	yaml := validYAML(t)
+	yaml = strings.Replace(yaml, "api_keys:\n", "queue:\n  protected_slots: ${TEST_PROTECTED_SLOTS}\napi_keys:\n", 1)
+	yaml = strings.Replace(yaml, "enabled: true", "enabled: ${TEST_API_ENABLED}", 1)
+	yaml = strings.Replace(yaml, "  480P:\n    model_mode: high_quality\n", "  480P:\n    model_mode: high_quality\n    easy_cache: ${TEST_EASY_CACHE}\n", 1)
+	cfg, err := Load(writeConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Queue.ProtectedSlots != 2 || !cfg.APIKeys[0].Enabled || !cfg.GenerationProfiles["480P"].EasyCache {
+		t.Fatalf("expanded config = %+v api=%+v profile=%+v", cfg.Queue, cfg.APIKeys[0], cfg.GenerationProfiles["480P"])
 	}
 }
 
@@ -225,9 +283,13 @@ func TestLoadRejectsConfigWithoutEnabledAPIKey(t *testing.T) {
 func TestLoadRejectsInvalidUpstreamURL(t *testing.T) {
 	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
 	t.Setenv("TEST_UPSTREAM_URL", "ftp://127.0.0.1:7860")
-	_, err := Load(writeConfig(t, validYAML(t)))
-	if err == nil || !strings.Contains(err.Error(), "HTTP/HTTPS") {
+	cfg, err := Load(writeConfig(t, validYAML(t)))
+	if err != nil {
 		t.Fatalf("Load() error = %v", err)
+	}
+	_, err = ParseLegacyUpstreams(cfg.LegacyUpstreams)
+	if err == nil || !strings.Contains(err.Error(), "HTTP/HTTPS") {
+		t.Fatalf("ParseLegacyUpstreams() error = %v", err)
 	}
 }
 
@@ -239,7 +301,11 @@ func TestLoadAllowsHTTPPublicBaseURLForPrivateDeployment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if got := cfg.Upstreams[0].PublicBaseURL.String(); got != "http://192.168.1.202:7861" {
+	upstreams, err := ParseLegacyUpstreams(cfg.LegacyUpstreams)
+	if err != nil {
+		t.Fatalf("ParseLegacyUpstreams() error = %v", err)
+	}
+	if got := upstreams[0].PublicBaseURL.String(); got != "http://192.168.1.202:7861" {
 		t.Fatalf("PublicBaseURL = %q", got)
 	}
 }

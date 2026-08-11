@@ -104,6 +104,18 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("记录数据库迁移版本: %w", err)
 		}
 	}
+	var version4Applied int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations WHERE version=4").Scan(&version4Applied); err != nil {
+		return fmt.Errorf("查询数据库迁移版本: %w", err)
+	}
+	if version4Applied == 0 {
+		if _, err := tx.ExecContext(ctx, migrations.ModelServiceNodes); err != nil {
+			return fmt.Errorf("执行模型节点配置迁移: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES(4, ?)", s.nowUnix()); err != nil {
+			return fmt.Errorf("记录数据库迁移版本: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交数据库迁移: %w", err)
 	}
@@ -300,12 +312,21 @@ func (s *Store) LatestFinishedForUpstream(ctx context.Context, upstreamID string
 	return item, err
 }
 
-func (s *Store) ClaimNext(ctx context.Context, upstreamID string) (taskResult domain.Task, err error) {
+func (s *Store) ClaimNext(ctx context.Context, upstreamID string, expectedVersion ...int64) (taskResult domain.Task, err error) {
 	conn, finish, err := s.immediate(ctx)
 	if err != nil {
 		return domain.Task{}, err
 	}
 	defer completeTransaction(finish, &err)
+	if len(expectedVersion) > 0 {
+		var current int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM model_service_nodes WHERE id=? AND version=? AND enabled=1 AND deleted_at IS NULL`, upstreamID, expectedVersion[0]).Scan(&current); err != nil {
+			return domain.Task{}, err
+		}
+		if current != 1 {
+			return domain.Task{}, domain.ErrNodeConfigStale
+		}
+	}
 	var active int
 	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM video_tasks WHERE upstream_id=? AND status IN ('dispatching','running','reconciling','cancelling')`, upstreamID).Scan(&active); err != nil {
 		return domain.Task{}, err

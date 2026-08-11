@@ -28,16 +28,8 @@ api_keys:
     key: "${MINIMAX_API_KEY_CUSTOMER_1}"
     enabled: true
 
-upstreams:
-  - id: minimax-private-1
-    base_url: "${MINIMAX_UPSTREAM_URL}"
-    jobs_base_url: "${MINIMAX_UPSTREAM_JOBS_URL}"
-    public_base_url: "${MINIMAX_PUBLIC_UPSTREAM_URL}"
-    health_path: /
-    submit_api_name: submit_minimax_from_slots
-    check_api_name: check_and_get_video
-    poll_interval: 3s
-    request_timeout: 30s
+# 模型服务节点在 /manager 的“节点配置”中维护，并存储于 SQLite。
+# 升级时若数据库尚无节点，旧版 upstreams 会在首次启动时自动导入一次。
 
 generation_profiles:
   480P:

@@ -92,6 +92,28 @@ func TestOpenAppliesTaskLifecycleMigration(t *testing.T) {
 	}
 }
 
+func TestOpenAppliesModelServiceNodeMigration(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 100})
+	ctx := context.Background()
+
+	var versionCount int
+	if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations WHERE version=4").Scan(&versionCount); err != nil {
+		t.Fatal(err)
+	}
+	if versionCount != 1 {
+		t.Fatalf("migration version 4 count = %d", versionCount)
+	}
+	for _, table := range []string{"model_service_nodes", "node_config_bootstrap"} {
+		var count int
+		if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("table %s count = %d", table, count)
+		}
+	}
+}
+
 func TestSubmissionContextBindsJobAndAllowsOnlyOneRetry(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0).UTC()
 	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 100, Now: func() time.Time { return now }})

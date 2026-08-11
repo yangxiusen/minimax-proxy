@@ -16,3 +16,8 @@ var ResolutionTiers string
 //
 //go:embed 003_task_lifecycle_closure.sql
 var TaskLifecycleClosure string
+
+// ModelServiceNodes 增加模型节点配置和旧 YAML 一次性导入标记。
+//
+//go:embed 004_model_service_nodes.sql
+var ModelServiceNodes string

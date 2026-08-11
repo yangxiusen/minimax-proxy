@@ -7,15 +7,16 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
-	monitorapi "minimax-h3-tc/internal/httpapi/monitor"
+	managerapi "minimax-h3-tc/internal/httpapi/manager"
 	"minimax-h3-tc/internal/httpapi/v2"
 	monitorcache "minimax-h3-tc/internal/monitor"
+	storepkg "minimax-h3-tc/internal/store/sqlite"
 )
 
 func TestWarnDefaultAdminPasswordDependsOnlyOnPasswordAndDoesNotLogIt(t *testing.T) {
@@ -43,17 +44,11 @@ func TestWarnDefaultAdminPasswordDependsOnlyOnPasswordAndDoesNotLogIt(t *testing
 	}
 }
 
-func TestNodeCacheAvailabilityAndCachedHealthUseFreshSnapshots(t *testing.T) {
+func TestNodeCacheAvailabilityUsesFreshEnabledSnapshots(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0).UTC()
-	baseURL, _ := url.Parse("http://private.example:7860/internal/path")
-	cache := newNodeCache([]config.UpstreamConfig{{ID: "gpu-1", BaseURL: baseURL}, {ID: "gpu-2", BaseURL: baseURL}})
-
-	initial, _ := cache.Get("gpu-1")
-	if initial.Address != "private.example:7860" || initial.Health != monitorcache.HealthUnknown {
-		t.Fatalf("initial snapshot = %+v", initial)
-	}
+	cache := monitorcache.NewCache([]monitorcache.NodeSnapshot{{ID: "gpu-1"}, {ID: "gpu-2"}})
 	available := cacheAvailability(cache, func() time.Time { return now }, 10*time.Second)
-	if available() || cachedNodeHealth(cache, "gpu-1", now, 10*time.Second) == nil {
+	if available() {
 		t.Fatal("unknown nodes must be unavailable")
 	}
 
@@ -62,83 +57,25 @@ func TestNodeCacheAvailabilityAndCachedHealthUseFreshSnapshots(t *testing.T) {
 		node.Runtime = monitorcache.RuntimeRunning
 		node.CheckedAt = now.Add(-9 * time.Second)
 	})
-	if !available() || cachedNodeHealth(cache, "gpu-2", now, 10*time.Second) != nil {
+	if !available() {
 		t.Fatal("one fresh healthy node must be available even when running")
 	}
 
 	cache.Update("gpu-2", func(node *monitorcache.NodeSnapshot) { node.CheckedAt = now.Add(-11 * time.Second) })
-	if available() || cachedNodeHealth(cache, "gpu-2", now, 10*time.Second) == nil {
+	if available() {
 		t.Fatal("stale health must be unavailable")
 	}
 	cache.Update("gpu-2", func(node *monitorcache.NodeSnapshot) {
-		node.Health = monitorcache.HealthUnhealthy
+		node.Health = monitorcache.HealthHealthy
 		node.CheckedAt = now
+		node.Disabled = true
 	})
 	if available() {
-		t.Fatal("all unhealthy nodes must be unavailable")
+		t.Fatal("disabled nodes must be unavailable")
 	}
 }
 
-func TestCachedNodeSchedulableRejectsPrivateWorkWithoutLocalTask(t *testing.T) {
-	now := time.Unix(2_000_000_000, 0).UTC()
-	queue := 1
-	cache := monitorcache.NewCache([]monitorcache.NodeSnapshot{{ID: "gpu-1", Health: monitorcache.HealthHealthy, Runtime: monitorcache.RuntimeRunning, PrivateQueue: &queue, CheckedAt: now}})
-	if err := cachedNodeSchedulable(cache, "gpu-1", now, 10*time.Second); err == nil {
-		t.Fatal("running private instance was considered schedulable")
-	}
-	cache.Update("gpu-1", func(node *monitorcache.NodeSnapshot) {
-		node.Runtime = monitorcache.RuntimeIdle
-		zero := 0
-		node.PrivateQueue = &zero
-	})
-	if err := cachedNodeSchedulable(cache, "gpu-1", now, 10*time.Second); err != nil {
-		t.Fatalf("idle private instance was not schedulable: %v", err)
-	}
-}
-
-func TestCachedNodeSchedulableRejectsExplicitSchedulingBlock(t *testing.T) {
-	now := time.Unix(2_000_000_000, 0).UTC()
-	zero := 0
-	cache := monitorcache.NewCache([]monitorcache.NodeSnapshot{{ID: "gpu-1", Health: monitorcache.HealthHealthy, Runtime: monitorcache.RuntimeIdle, PrivateQueue: &zero, CheckedAt: now, SchedulingBlocked: true}})
-	if err := cachedNodeSchedulable(cache, "gpu-1", now, 10*time.Second); err == nil {
-		t.Fatal("explicitly blocked node was considered schedulable")
-	}
-}
-
-func TestMaxHealthAgeCoversSlowestProbe(t *testing.T) {
-	upstreams := []config.UpstreamConfig{
-		{ID: "gpu-1", RequestTimeout: 30 * time.Second},
-		{ID: "gpu-2", RequestTimeout: 8 * time.Second},
-	}
-	if got, want := maxHealthSnapshotAge(5*time.Second, upstreams), 35*time.Second; got != want {
-		t.Fatalf("maxHealthSnapshotAge() = %s, want %s", got, want)
-	}
-	if got, want := maxHealthSnapshotAge(20*time.Second, upstreams[:1]), 50*time.Second; got != want {
-		t.Fatalf("interval floor = %s, want %s", got, want)
-	}
-}
-
-func TestRestoreNodeSnapshotsRestoresCurrentAndLatestDuration(t *testing.T) {
-	started := time.Unix(2_000_000_000, 0).UTC()
-	finished := started.Add(97 * time.Second)
-	cache := monitorcache.NewCache([]monitorcache.NodeSnapshot{{ID: "gpu-1"}})
-	store := restoreStore{
-		active: domain.Task{TaskID: "current-1", Status: domain.StatusReconciling, StartedAt: started},
-		latest: domain.AdminTaskSummary{TaskID: "done-1", APIKeyID: "customer-a", Status: domain.V2Succeeded, StartedAt: started, FinishedAt: finished},
-	}
-	if err := restoreNodeSnapshots(context.Background(), cache, store, []string{"gpu-1"}); err != nil {
-		t.Fatal(err)
-	}
-	node, _ := cache.Get("gpu-1")
-	if node.CurrentTask == nil || node.CurrentTask.ID != "current-1" || !node.CurrentTask.StartedAt.Equal(started) || node.Runtime != monitorcache.RuntimeRunning {
-		t.Fatalf("current task = %+v runtime=%s", node.CurrentTask, node.Runtime)
-	}
-	if node.LatestFinishedTask == nil || node.LatestFinishedTask.ID != "done-1" || node.LatestFinishedTask.DurationSeconds != 97 || !node.LatestFinishedTask.FinishedAt.Equal(finished) {
-		t.Fatalf("latest task = %+v", node.LatestFinishedTask)
-	}
-}
-
-func TestAppHandlerKeepsMonitorCookieAndV2BearerIsolated(t *testing.T) {
+func TestAppHandlerKeepsManagerCookieAndV2BearerIsolated(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0).UTC()
 	cache := monitorcache.NewCache([]monitorcache.NodeSnapshot{{ID: "gpu-1", Health: monitorcache.HealthHealthy, CheckedAt: now}})
 	store := &appStore{}
@@ -148,13 +85,13 @@ func TestAppHandlerKeepsMonitorCookieAndV2BearerIsolated(t *testing.T) {
 		Profiles: map[string]config.GenerationProfile{"2K": {Dimensions: map[string]config.Dimension{"16:9": {Width: 1920, Height: 1080}}}},
 		Logger:   logger, Available: cacheAvailability(cache, func() time.Time { return now }, 10*time.Second),
 	})
-	monitorHandler := monitorapi.NewHandler(monitorapi.Dependencies{
+	managerHandler := managerapi.NewHandler(managerapi.Dependencies{
 		Admin: config.AdminConfig{Username: "admin", Password: "password", SessionTTL: time.Hour}, Cache: cache, Store: store,
 		Logger: logger, Now: func() time.Time { return now }, Rand: bytes.NewReader(bytes.Repeat([]byte{1}, 32)),
 	})
-	handler := newAppHandler(v2Handler, monitorHandler)
+	handler := newAppHandler(v2Handler, managerHandler)
 
-	login := httptest.NewRequest(http.MethodPost, "/monitor/api/session", bytes.NewBufferString(`{"username":"admin","password":"password"}`))
+	login := httptest.NewRequest(http.MethodPost, "/manager/api/session", bytes.NewBufferString(`{"username":"admin","password":"password"}`))
 	login.Header.Set("Content-Type", "application/json")
 	loginResponse := httptest.NewRecorder()
 	handler.ServeHTTP(loginResponse, login)
@@ -172,7 +109,7 @@ func TestAppHandlerKeepsMonitorCookieAndV2BearerIsolated(t *testing.T) {
 		t.Fatalf("monitor cookie authorized V2: status=%d", v2Response.Code)
 	}
 
-	monitorWithBearer := httptest.NewRequest(http.MethodGet, "/monitor/api/snapshot", nil)
+	monitorWithBearer := httptest.NewRequest(http.MethodGet, "/manager/api/snapshot", nil)
 	monitorWithBearer.Header.Set("Authorization", "Bearer api-secret")
 	monitorResponse := httptest.NewRecorder()
 	handler.ServeHTTP(monitorResponse, monitorWithBearer)
@@ -190,27 +127,86 @@ func TestAppHandlerKeepsMonitorCookieAndV2BearerIsolated(t *testing.T) {
 	}
 	redirect := httptest.NewRecorder()
 	handler.ServeHTTP(redirect, httptest.NewRequest(http.MethodGet, "/monitor", nil))
-	if redirect.Code != http.StatusPermanentRedirect || redirect.Header().Get("Location") != "/monitor/" {
+	if redirect.Code != http.StatusPermanentRedirect || redirect.Header().Get("Location") != "/manager/" {
 		t.Fatalf("monitor redirect status=%d location=%q", redirect.Code, redirect.Header().Get("Location"))
 	}
 }
 
-type restoreStore struct {
-	active domain.Task
-	latest domain.AdminTaskSummary
+func TestAppHandlerServesManagerAndRedirectsLegacyMonitor(t *testing.T) {
+	managerHandler := managerapi.NewHandler(managerapi.Dependencies{
+		Admin: config.AdminConfig{Username: "admin", Password: "password", SessionTTL: time.Hour},
+		Cache: monitorcache.NewCache(nil), Store: &appStore{}, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	handler := newAppHandler(http.NotFoundHandler(), managerHandler)
+
+	manager := httptest.NewRecorder()
+	handler.ServeHTTP(manager, httptest.NewRequest(http.MethodGet, "/manager", nil))
+	if manager.Code == http.StatusNotFound {
+		t.Fatal("/manager was not registered")
+	}
+	legacy := httptest.NewRecorder()
+	handler.ServeHTTP(legacy, httptest.NewRequest(http.MethodGet, "/monitor", nil))
+	if legacy.Code != http.StatusPermanentRedirect || legacy.Header().Get("Location") != "/manager/" {
+		t.Fatalf("legacy redirect status=%d location=%q", legacy.Code, legacy.Header().Get("Location"))
+	}
+	legacyAPI := httptest.NewRecorder()
+	handler.ServeHTTP(legacyAPI, httptest.NewRequest(http.MethodGet, "/monitor/api/snapshot", nil))
+	if legacyAPI.Code != http.StatusNotFound {
+		t.Fatalf("legacy API status=%d, want 404", legacyAPI.Code)
+	}
 }
 
-func (s restoreStore) ActiveForUpstream(context.Context, string) (domain.Task, error) {
-	if s.active.TaskID == "" {
-		return domain.Task{}, domain.ErrTaskNotFound
+func TestBootstrapLegacyNodesImportsOnceAndThenIgnoresYAML(t *testing.T) {
+	ctx := context.Background()
+	store, err := storepkg.Open(ctx, filepath.Join(t.TempDir(), "bootstrap.db"), storepkg.Options{
+		ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 10, Retention: time.Hour, IdempotencyTTL: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	return s.active, nil
+	t.Cleanup(func() { _ = store.Close() })
+	legacy := []config.LegacyUpstreamConfig{{
+		ID: "node-1", BaseURL: "http://private.example:7860", JobsBaseURL: "http://jobs.example:8188", PublicBaseURL: "https://video.example",
+		HealthPath: "/", SubmitAPIName: "submit", CheckAPIName: "check", PollInterval: "3s", RequestTimeout: "30s",
+	}}
+	count, err := bootstrapLegacyNodes(ctx, store, legacy)
+	if err != nil || count != 1 {
+		t.Fatalf("bootstrap count=%d err=%v", count, err)
+	}
+	nodes, err := store.ListModelNodes(ctx)
+	if err != nil || len(nodes) != 1 || nodes[0].ID != "node-1" || !nodes[0].Enabled {
+		t.Fatalf("nodes=%+v err=%v", nodes, err)
+	}
+	count, err = bootstrapLegacyNodes(ctx, store, []config.LegacyUpstreamConfig{{ID: "broken", BaseURL: "${MISSING_AFTER_IMPORT}"}})
+	if err != nil || count != 0 {
+		t.Fatalf("second bootstrap count=%d err=%v", count, err)
+	}
 }
-func (s restoreStore) LatestFinishedForUpstream(context.Context, string) (domain.AdminTaskSummary, error) {
-	if s.latest.TaskID == "" {
-		return domain.AdminTaskSummary{}, domain.ErrTaskNotFound
+
+func TestBootstrapLegacyNodesDoesNotParseYAMLWhenDatabaseHasNodes(t *testing.T) {
+	ctx := context.Background()
+	store, err := storepkg.Open(ctx, filepath.Join(t.TempDir(), "existing.db"), storepkg.Options{
+		ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 10, Retention: time.Hour, IdempotencyTTL: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	return s.latest, nil
+	t.Cleanup(func() { _ = store.Close() })
+	input := domain.ModelNodeInput{
+		ID: "db-node", BaseURL: "http://private.example:7860", JobsBaseURL: "http://jobs.example:8188", PublicBaseURL: "https://video.example",
+		HealthPath: "/", SubmitAPIName: "submit", CheckAPIName: "check", PollInterval: time.Second, RequestTimeout: time.Second, Enabled: true,
+	}
+	if _, err := store.CreateModelNode(ctx, input); err != nil {
+		t.Fatal(err)
+	}
+	count, err := bootstrapLegacyNodes(ctx, store, []config.LegacyUpstreamConfig{{ID: "broken", BaseURL: "${MISSING_EXISTING_NODE}"}})
+	if err != nil || count != 0 {
+		t.Fatalf("bootstrap count=%d err=%v", count, err)
+	}
+	pending, err := store.LegacyNodeImportPending(ctx)
+	if err != nil || pending {
+		t.Fatalf("pending=%v err=%v", pending, err)
+	}
 }
 
 type appStore struct{ createCalls int }
