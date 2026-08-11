@@ -72,8 +72,8 @@ func ValidateCreate(request CreateRequest, profiles map[string]config.Generation
 		item := &validated.Content[index]
 		switch item.Type {
 		case "text":
-			if item.Text == "" || strings.TrimSpace(item.Text) == "" || utf8.RuneCountInString(item.Text) > 7000 {
-				return ValidatedRequest{}, fmt.Errorf("content 必须包含 1 个非空且不超过 7000 字符的 text")
+			if item.Text == "" || strings.TrimSpace(item.Text) == "" || utf8.RuneCountInString(item.Text) > 14000 {
+				return ValidatedRequest{}, fmt.Errorf("content 必须包含 1 个非空且不超过 14000 字符的 text")
 			}
 			if item.ImageURL != nil || item.VideoURL != nil || item.AudioURL != nil || item.Role != "" {
 				return ValidatedRequest{}, fmt.Errorf("text 元素包含不允许的字段")

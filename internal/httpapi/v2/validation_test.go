@@ -31,6 +31,21 @@ func TestValidateCreateRecognizesOfficialScenarios(t *testing.T) {
 	}
 }
 
+func TestValidateCreateAcceptsPromptAt14000Characters(t *testing.T) {
+	request := CreateRequest{Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: strings.Repeat("字", 14000)}}, Resolution: "2K", Duration: 5, Ratio: "16:9"}
+	if _, err := ValidateCreate(request, profiles()); err != nil {
+		t.Fatalf("ValidateCreate() error = %v", err)
+	}
+}
+
+func TestValidateCreateRejectsPromptOver14000Characters(t *testing.T) {
+	request := CreateRequest{Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: strings.Repeat("字", 14001)}}, Resolution: "2K", Duration: 5, Ratio: "16:9"}
+	_, err := ValidateCreate(request, profiles())
+	if err == nil || !strings.Contains(err.Error(), "不超过 14000 字符") {
+		t.Fatalf("ValidateCreate() error = %v", err)
+	}
+}
+
 func TestValidateCreateNormalizesI2VARatio(t *testing.T) {
 	request := CreateRequest{Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: "动起来"}, image("https://media.example.com/a.png", "")}, Resolution: "768P", Duration: 4, Ratio: "16:9"}
 	got, err := ValidateCreate(request, profiles())
