@@ -62,9 +62,9 @@ webui:
 
 ## Node 认证与 WebUI
 
-`ServiceSettings` 增加由加载器显式注入的单一 API Key和 WebUI 明文凭据；与凭据有关的 `.env` 字段和 `APIKeyConfig` 多 Key 模型删除。非凭据设置仍可从现有来源加载。
+凭据不进入 `ServiceSettings`，避免 Pydantic Settings 自动把 `H3_API_KEY` 或类似环境变量重新变成隐式配置源。加载器返回独立的 `CredentialConfig`，`start.py` 将它显式传给 `create_app` 和 WebUI 认证构造器；`ServiceSettings` 只保留非凭据运行参数。现有 `APIKeyConfig` 多 Key 模型和凭据环境字段删除。
 
-Node 的 `Authenticator` 只解析标准 Bearer 头，并使用恒定时间比较请求 Key 和配置 Key。以下请求都返回统一 401：缺少 Bearer、空 Key、错误 Key、旧 `key_id.secret` Token。认证成功后不再构造 Key ID 或 scope Principal；路由仍保留认证依赖，但不做 scope 分支。
+Node 的 `Authenticator` 从 `CredentialConfig` 取得唯一 Key，只解析标准 Bearer 头，并使用恒定时间比较请求 Key 和配置 Key。以下请求都返回统一 401：缺少 Bearer、空 Key、错误 Key、旧 `key_id.secret` Token。认证成功后不再构造 Key ID 或 scope Principal；路由仍保留认证依赖，但不做 scope 分支。
 
 WebUI 启动时把 `conf.yml` 中的明文密码转换为内存中的认证校验器。密码不写入其他文件、不生成额外摘要配置、不进入日志。Gradio 登录用户名固定使用 `admin`。
 
