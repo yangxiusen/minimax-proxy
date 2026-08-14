@@ -26,6 +26,9 @@ func TestInputMaterializerImportsDataURIWithRoleAndReusesNodeLocation(t *testing
 	if len(first) != 1 || first[0].Role != "first_frame" || first[0].ArtifactID != "node-input-1" || client.calls != 1 {
 		t.Fatalf("first=%+v calls=%d", first, client.calls)
 	}
+	if client.last.ExternalTaskID != "task-1" {
+		t.Fatalf("external task id=%q", client.last.ExternalTaskID)
+	}
 	second, err := materializer.Materialize(context.Background(), "task-1", "node-1", "request-2", client)
 	if err != nil {
 		t.Fatal(err)
@@ -55,10 +58,14 @@ func (s *inputStoreFake) RegisterInputArtifact(_ context.Context, artifactID, _,
 	return nil
 }
 
-type inputClientFake struct{ calls int }
+type inputClientFake struct {
+	calls int
+	last  nodeapi.ImportArtifactRequest
+}
 
 func (c *inputClientFake) ImportArtifact(_ context.Context, _ string, request nodeapi.ImportArtifactRequest) (nodeapi.Artifact, error) {
 	c.calls++
+	c.last = request
 	data, err := io.ReadAll(request.Content)
 	if err != nil {
 		return nodeapi.Artifact{}, err

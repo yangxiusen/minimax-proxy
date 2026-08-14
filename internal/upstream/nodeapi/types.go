@@ -131,6 +131,7 @@ type ArtifactContent struct {
 type ImportArtifactRequest struct {
 	OperationID      string
 	SourceArtifactID string
+	ExternalTaskID   string
 	ExpectedSize     int64
 	ExpectedSHA256   string
 	Kind             string

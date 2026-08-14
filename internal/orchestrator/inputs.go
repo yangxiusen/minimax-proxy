@@ -101,7 +101,8 @@ func (m *InputMaterializer) Materialize(ctx context.Context, taskID, nodeID, req
 		}
 		artifact, importErr := client.ImportArtifact(ctx, requestID+fmt.Sprintf("-input-%d", index), nodeapi.ImportArtifactRequest{
 			OperationID: "import-" + logicalID + "-" + nodeID, SourceArtifactID: logicalID,
-			ExpectedSize: size, ExpectedSHA256: digest, Kind: inputKind(mediaType), Filename: logicalID + suffix, Content: file,
+			ExternalTaskID: taskID, ExpectedSize: size, ExpectedSHA256: digest, Kind: inputKind(mediaType),
+			Filename: logicalID + suffix, Content: file,
 		})
 		fileName := file.Name()
 		closeErr := file.Close()

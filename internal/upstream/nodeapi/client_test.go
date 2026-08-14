@@ -76,7 +76,7 @@ func TestImportArtifactStreamsMultipartAndCarriesIntegrityMetadata(t *testing.T)
 			t.Fatal(err)
 		}
 		defer reader.RemoveAll()
-		if reader.Value["operation_id"][0] != "import-1" || reader.Value["source_artifact_id"][0] != "source-1" || reader.Value["expected_sha256"][0] != digest {
+		if reader.Value["operation_id"][0] != "import-1" || reader.Value["source_artifact_id"][0] != "source-1" || reader.Value["expected_sha256"][0] != digest || reader.Value["external_task_id"][0] != "task-1" {
 			t.Fatalf("form=%+v", reader.Value)
 		}
 		file, err := reader.File["file"][0].Open()
@@ -96,7 +96,7 @@ func TestImportArtifactStreamsMultipartAndCarriesIntegrityMetadata(t *testing.T)
 
 	result, err := client.ImportArtifact(context.Background(), "request-1", ImportArtifactRequest{
 		OperationID: "import-1", SourceArtifactID: "source-1", ExpectedSize: int64(len(payload)),
-		ExpectedSHA256: digest, Kind: "video", Filename: "source.mp4", Content: bytes.NewReader(payload),
+		ExpectedSHA256: digest, Kind: "video", Filename: "source.mp4", ExternalTaskID: "task-1", Content: bytes.NewReader(payload),
 	})
 	if err != nil || result.ArtifactID != "target-1" {
 		t.Fatalf("ImportArtifact()=%+v, %v", result, err)

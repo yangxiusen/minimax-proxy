@@ -260,7 +260,13 @@ func writeImportMultipart(writer *multipart.Writer, input ImportArtifactRequest)
 		"expected_size": strconv.FormatInt(input.ExpectedSize, 10), "expected_sha256": input.ExpectedSHA256,
 		"kind": input.Kind,
 	}
-	for _, key := range []string{"operation_id", "source_artifact_id", "expected_size", "expected_sha256", "kind"} {
+	if input.ExternalTaskID != "" {
+		fields["external_task_id"] = input.ExternalTaskID
+	}
+	for _, key := range []string{"operation_id", "source_artifact_id", "expected_size", "expected_sha256", "kind", "external_task_id"} {
+		if fields[key] == "" {
+			continue
+		}
 		if err := writer.WriteField(key, fields[key]); err != nil {
 			return err
 		}
