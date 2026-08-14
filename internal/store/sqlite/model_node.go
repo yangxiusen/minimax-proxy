@@ -194,8 +194,7 @@ func sameNodeConnection(left, right domain.ModelNodeInput) bool {
 			left.PollInterval == right.PollInterval && left.RequestTimeout == right.RequestTimeout
 	}
 	return left.ServiceURL == right.ServiceURL && left.ProtocolVersion == right.ProtocolVersion &&
-		left.APIKeyFingerprint == right.APIKeyFingerprint && left.BaseURL == right.BaseURL && left.JobsBaseURL == right.JobsBaseURL && left.PublicBaseURL == right.PublicBaseURL &&
-		left.HealthPath == right.HealthPath && left.SubmitAPIName == right.SubmitAPIName && left.CheckAPIName == right.CheckAPIName &&
+		left.APIKeyFingerprint == right.APIKeyFingerprint &&
 		left.PollInterval == right.PollInterval && left.RequestTimeout == right.RequestTimeout
 }
 

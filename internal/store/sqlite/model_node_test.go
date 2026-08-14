@@ -155,6 +155,31 @@ func TestModelNodeCRUDEnforcesVersionActivityAndPermanentID(t *testing.T) {
 	}
 }
 
+func TestUpdateNodeAPINodeAllowsDisableWithActiveTask(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 100})
+	ctx := context.Background()
+	node := domain.ModelNodeInput{
+		ID: "node-1", ServiceURL: "http://127.0.0.1:7860", ProtocolVersion: "h3-node-v1",
+		APIKeyCiphertext: []byte("ciphertext"), APIKeyNonce: []byte("nonce"), APIKeyFingerprint: "sha256:test",
+		PollInterval: 3 * time.Second, RequestTimeout: 30 * time.Second, Enabled: true,
+	}
+	if _, err := store.CreateModelNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(ctx, task("active", "owner"), "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE video_tasks SET status='running',upstream_id='node-1' WHERE task_id='active'`); err != nil {
+		t.Fatal(err)
+	}
+
+	node.Enabled = false
+	disabled, err := store.UpdateModelNode(ctx, "node-1", 1, node)
+	if err != nil || disabled.Enabled || disabled.Version != 2 {
+		t.Fatalf("disable = %+v, %v", disabled, err)
+	}
+}
+
 func TestImportLegacyNodesIsAtomicAndRunsOnlyOnce(t *testing.T) {
 	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 100})
 	ctx := context.Background()
