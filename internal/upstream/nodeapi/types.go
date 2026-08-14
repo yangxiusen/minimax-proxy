@@ -17,14 +17,29 @@ type Health struct {
 }
 
 type HealthRuntime struct {
-	QueueRunning     *int     `json:"queue_running"`
-	QueuePending     *int     `json:"queue_pending"`
-	MemoryTotalBytes *int64   `json:"memory_total_bytes"`
-	MemoryFreeBytes  *int64   `json:"memory_free_bytes"`
-	VRAMTotalBytes   *int64   `json:"vram_total_bytes"`
-	VRAMFreeBytes    *int64   `json:"vram_free_bytes"`
-	CPUPercent       *float64 `json:"cpu_percent"`
-	GPUPercent       *float64 `json:"gpu_percent"`
+	QueueRunning     *int                  `json:"queue_running"`
+	QueuePending     *int                  `json:"queue_pending"`
+	MemoryTotalBytes *int64                `json:"memory_total_bytes"`
+	MemoryFreeBytes  *int64                `json:"memory_free_bytes"`
+	VRAMTotalBytes   *int64                `json:"vram_total_bytes"`
+	VRAMFreeBytes    *int64                `json:"vram_free_bytes"`
+	CPUPercent       *float64              `json:"cpu_percent"`
+	GPUPercent       *float64              `json:"gpu_percent"`
+	Devices          []HealthRuntimeDevice `json:"devices"`
+	ExecutionSlots   *ExecutionSlots       `json:"execution_slots"`
+}
+
+type HealthRuntimeDevice struct {
+	Index          int      `json:"index"`
+	Name           string   `json:"name"`
+	GPUPercent     *float64 `json:"gpu_percent"`
+	VRAMTotalBytes *int64   `json:"vram_total_bytes"`
+	VRAMFreeBytes  *int64   `json:"vram_free_bytes"`
+}
+
+type ExecutionSlots struct {
+	Used     int `json:"used"`
+	Capacity int `json:"capacity"`
 }
 
 type Capabilities struct {

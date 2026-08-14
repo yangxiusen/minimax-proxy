@@ -43,10 +43,9 @@ type AdminConfig struct {
 }
 
 type ServerConfig struct {
-	Address       string
-	PublicBaseURL *url.URL
-	ReadTimeout   time.Duration
-	WriteTimeout  time.Duration
+	Address      string
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
 }
 
 type DatabaseConfig struct {
@@ -135,10 +134,9 @@ type Dimension struct {
 
 type rawConfig struct {
 	Server struct {
-		Address       string `yaml:"address"`
-		PublicBaseURL string `yaml:"public_base_url"`
-		ReadTimeout   string `yaml:"read_timeout"`
-		WriteTimeout  string `yaml:"write_timeout"`
+		Address      string `yaml:"address"`
+		ReadTimeout  string `yaml:"read_timeout"`
+		WriteTimeout string `yaml:"write_timeout"`
 	} `yaml:"server"`
 	Admin struct {
 		Username        *string `yaml:"username"`
@@ -356,10 +354,6 @@ func normalize(raw rawConfig) (Config, error) {
 	if raw.Server.Address != "" {
 		cfg.Server.Address = raw.Server.Address
 	}
-	var err error
-	if cfg.Server.PublicBaseURL, err = parsePublicBaseURL(raw.Server.PublicBaseURL); err != nil {
-		return Config{}, err
-	}
 	if raw.Admin.Username != nil {
 		cfg.Admin.Username = *raw.Admin.Username
 	}
@@ -369,6 +363,7 @@ func normalize(raw rawConfig) (Config, error) {
 	if raw.Admin.SecureCookie != nil {
 		cfg.Admin.SecureCookie = *raw.Admin.SecureCookie
 	}
+	var err error
 	if cfg.Server.ReadTimeout, err = parseDuration(raw.Server.ReadTimeout, cfg.Server.ReadTimeout, "server.read_timeout"); err != nil {
 		return Config{}, err
 	}
@@ -558,20 +553,6 @@ func parseURL(value string) (*url.URL, error) {
 		return nil, errors.New("不得包含凭据、查询参数或片段")
 	}
 	u.Path = strings.TrimSuffix(u.Path, "/")
-	return u, nil
-}
-
-func parsePublicBaseURL(value string) (*url.URL, error) {
-	if strings.TrimSpace(value) == "" {
-		return nil, errors.New("server.public_base_url 不能为空")
-	}
-	u, err := parseURL(strings.TrimSpace(value))
-	if err != nil {
-		return nil, fmt.Errorf("server.public_base_url %w", err)
-	}
-	if u.Path != "" {
-		return nil, errors.New("server.public_base_url 必须是根地址，不得包含子路径")
-	}
 	return u, nil
 }
 

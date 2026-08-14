@@ -1,5 +1,8 @@
 config.yaml
 data/
+output/
+*.log
+*.exe
 *.db
 *.db-shm
 *.db-wal

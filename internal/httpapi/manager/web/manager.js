@@ -843,7 +843,7 @@ function defaultProfileConfig() {
     resolution: "",
     generation: { model_mode: "high_quality", steps: 8, sage_attention: "auto", cache_mode: "easycache" },
     ratios: Object.fromEntries(ratios.map((ratio) => [ratio, { base_width: ratioDefaults[ratio][0], base_height: ratioDefaults[ratio][1], target_width: ratioDefaults[ratio][0] * 3, target_height: ratioDefaults[ratio][1] * 3 }])),
-    loras: [], interpolation: { enabled: true, engine: "rife", scale: 2 }, restoration: { enabled: true, engine: "seedvr2", scale: 3 }
+    loras: [], interpolation: { enabled: true, engine: "rife", scale: 2 }, restoration: { enabled: true, engine: "flashvsr", scale: 3 }
   };
 }
 function cloneProfileConfig(config) { return JSON.parse(JSON.stringify(config)); }
@@ -870,7 +870,7 @@ function fillProfile(detail = null, template = null) {
   ["model_mode", "steps", "sage_attention", "cache_mode"].forEach((name) => { profileField(name).value = config.generation[name] ?? ""; });
   profileField("interpolation_enabled").checked = Boolean(config.interpolation.enabled);
   profileField("restoration_enabled").checked = Boolean(config.restoration.enabled);
-  profileField("restoration_engine").value = config.restoration.engine || "seedvr2";
+  profileField("restoration_engine").value = config.restoration.engine || "flashvsr";
   profileField("restoration_scale").value = config.restoration.scale || 1;
   renderRatioRows(config); renderLoRAs(config.loras || []);
   state.profileDetail = detail;

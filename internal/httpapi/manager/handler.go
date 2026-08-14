@@ -41,7 +41,7 @@ type TaskStore interface {
 }
 
 type ArtifactURLSigner interface {
-	SignURL(artifactID, ownerID string) (string, error)
+	SignURL(context.Context, string, string) (string, error)
 }
 
 type NodeStore interface {
@@ -526,7 +526,7 @@ func (h *handler) tasks(w http.ResponseWriter, r *http.Request) {
 	response := tasksResponse{Items: make([]taskDTO, 0, len(items)), Total: total, PageNum: pageNum, PageSize: pageSize}
 	now := h.now()
 	for _, item := range items {
-		videoURL, err := h.publicVideoURL(item)
+		videoURL, err := h.publicVideoURL(r.Context(), item)
 		if err != nil {
 			h.internalError(w, r, err)
 			return
@@ -600,7 +600,7 @@ func taskPhase(item domain.AdminTaskSummary) string {
 	}
 }
 
-func (h *handler) publicVideoURL(item domain.AdminTaskSummary) (*string, error) {
+func (h *handler) publicVideoURL(ctx context.Context, item domain.AdminTaskSummary) (*string, error) {
 	if item.Status != domain.V2Succeeded {
 		return nil, nil
 	}
@@ -608,7 +608,7 @@ func (h *handler) publicVideoURL(item domain.AdminTaskSummary) (*string, error) 
 		if h.artifactURLs == nil {
 			return nil, errors.New("artifact URL signer is not configured")
 		}
-		value, err := h.artifactURLs.SignURL(item.ResultArtifactID, item.APIKeyID)
+		value, err := h.artifactURLs.SignURL(ctx, item.ResultArtifactID, item.APIKeyID)
 		if err != nil {
 			return nil, err
 		}

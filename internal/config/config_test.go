@@ -21,9 +21,6 @@ func TestLoadExpandsEnvironmentAndAppliesDefaults(t *testing.T) {
 	if cfg.Server.Address != ":8080" {
 		t.Fatalf("Server.Address = %q", cfg.Server.Address)
 	}
-	if cfg.Server.PublicBaseURL == nil || cfg.Server.PublicBaseURL.String() != "http://127.0.0.1:8080" {
-		t.Fatalf("Server.PublicBaseURL = %v", cfg.Server.PublicBaseURL)
-	}
 	if cfg.Queue.ProtectedSlots != 3 || cfg.Queue.PerKeyUnfinishedLimit != 10 {
 		t.Fatalf("Queue defaults = %+v", cfg.Queue)
 	}
@@ -58,45 +55,11 @@ func TestLoadExpandsEnvironmentAndAppliesDefaults(t *testing.T) {
 	}
 }
 
-func TestLoadRequiresProxyPublicBaseURL(t *testing.T) {
+func TestLoadAllowsNoProxyPublicBaseURL(t *testing.T) {
 	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
 	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
-	yaml := strings.Replace(validYAML(t), "  public_base_url: http://127.0.0.1:8080\n", "", 1)
-	if _, err := Load(writeConfig(t, yaml)); err == nil || !strings.Contains(err.Error(), "server.public_base_url") {
+	if _, err := Load(writeConfig(t, validYAML(t))); err != nil {
 		t.Fatalf("Load() error = %v", err)
-	}
-}
-
-func TestLoadValidatesProxyPublicBaseURL(t *testing.T) {
-	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
-	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
-	tests := []struct {
-		name  string
-		value string
-	}{
-		{name: "unsupported scheme", value: "ftp://proxy.example"},
-		{name: "missing host", value: "http:///proxy"},
-		{name: "userinfo", value: "https://user:pass@proxy.example"},
-		{name: "query", value: "https://proxy.example?tenant=one"},
-		{name: "fragment", value: "https://proxy.example#fragment"},
-		{name: "subpath", value: "https://proxy.example/ui"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			yaml := strings.Replace(validYAML(t), "http://127.0.0.1:8080", test.value, 1)
-			if _, err := Load(writeConfig(t, yaml)); err == nil || !strings.Contains(err.Error(), "server.public_base_url") {
-				t.Fatalf("Load() error = %v", err)
-			}
-		})
-	}
-
-	yaml := strings.Replace(validYAML(t), "http://127.0.0.1:8080", "https://proxy.example/", 1)
-	cfg, err := Load(writeConfig(t, yaml))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := cfg.Server.PublicBaseURL.String(); got != "https://proxy.example" {
-		t.Fatalf("Server.PublicBaseURL = %q", got)
 	}
 }
 
@@ -426,7 +389,6 @@ func validYAML(t *testing.T) string {
 	dbPath := filepath.ToSlash(filepath.Join(t.TempDir(), "minimax.db"))
 	return `server:
   address: ":8080"
-  public_base_url: http://127.0.0.1:8080
 database:
   path: "` + dbPath + `"
 api_keys:

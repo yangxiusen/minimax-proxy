@@ -114,7 +114,6 @@ func run(configPath string, logger *slog.Logger) error {
 	cache := monitorcache.NewCache(nil)
 	artifactService, err := artifactservice.NewService(store, store, nodeSecrets, artifactservice.Options{
 		SigningKey: artifactSigningKey,
-		URLPrefix:  cfg.Server.PublicBaseURL.String() + "/v2/files",
 	})
 	if err != nil {
 		return err

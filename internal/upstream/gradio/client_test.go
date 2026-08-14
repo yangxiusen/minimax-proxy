@@ -253,6 +253,22 @@ func TestBuildArgumentsUsesOfficialImageToVideoModeForFirstAndLastFrames(t *test
 	}
 }
 
+func TestBuildArgumentsKeepsFirstSlotEmptyForLastFrameOnly(t *testing.T) {
+	request := v2.ValidatedRequest{CreateRequest: v2.CreateRequest{Model: "MiniMax-H3", Content: []v2.ContentItem{{Type: "text", Text: "尾帧约束"}, {Type: "image_url", ImageURL: &v2.URLValue{URL: "https://media.example/last.png"}, Role: "last_frame"}}, Resolution: "768P", Duration: 4, Ratio: "adaptive"}, Scenario: "i2va", Prompt: "尾帧约束", Width: 768, Height: 768, InputImageCount: 1}
+
+	args, err := BuildArguments(request, config.GenerationProfile{ModelMode: "high_quality", Steps: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args[5] != nil {
+		t.Fatalf("first frame slot = %#v, want nil", args[5])
+	}
+	last, ok := args[6].(FileData)
+	if !ok || last.Path != "https://media.example/last.png" {
+		t.Fatalf("last frame slot = %#v", args[6])
+	}
+}
+
 func TestBuildArgumentsUsesURLFieldForBase64Image(t *testing.T) {
 	const imageData = "data:image/png;base64,iVBORw0KGgo="
 	request := v2.ValidatedRequest{CreateRequest: v2.CreateRequest{Model: "MiniMax-H3", Content: []v2.ContentItem{{Type: "text", Text: "首帧"}, {Type: "image_url", ImageURL: &v2.URLValue{URL: imageData}, Role: "first_frame"}}, Resolution: "768P", Duration: 4, Ratio: "adaptive"}, Scenario: "i2va", Prompt: "首帧", Width: 768, Height: 768, InputImageCount: 1}

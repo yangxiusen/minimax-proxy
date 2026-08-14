@@ -321,7 +321,7 @@ func TestCreateRejectsNullAndWhitespacePrompt(t *testing.T) {
 func TestSucceededArtifactUsesOwnerBoundSignedURL(t *testing.T) {
 	signer := &signerSpy{url: "https://proxy.example/v2/files/artifact-1/content?expires=1&signature=signed"}
 	h := &handler{artifactURLs: signer}
-	response, err := h.mapTask(domain.Task{TaskID: "task-1", APIKeyID: "owner-a", Model: "MiniMax-H3", Status: domain.StatusSucceeded, ResultArtifactID: "artifact-1", CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(2, 0)})
+	response, err := h.mapTask(context.Background(), domain.Task{TaskID: "task-1", APIKeyID: "owner-a", Model: "MiniMax-H3", Status: domain.StatusSucceeded, ResultArtifactID: "artifact-1", CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(2, 0)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +332,7 @@ func TestSucceededArtifactUsesOwnerBoundSignedURL(t *testing.T) {
 
 func TestSucceededLegacyURLDoesNotExposePrivateNodeAddress(t *testing.T) {
 	h := &handler{}
-	unsafe, err := h.mapTask(domain.Task{
+	unsafe, err := h.mapTask(context.Background(), domain.Task{
 		TaskID: "task-private", Model: "MiniMax-H3", Status: domain.StatusSucceeded,
 		ResultPublicURL: "http://127.0.0.1:7860/gradio_api/file=video.mp4",
 		CreatedAt:       time.Unix(1, 0), UpdatedAt: time.Unix(2, 0),
@@ -344,7 +344,7 @@ func TestSucceededLegacyURLDoesNotExposePrivateNodeAddress(t *testing.T) {
 		t.Fatalf("private legacy URL exposed: %+v", unsafe.Content)
 	}
 
-	safe, err := h.mapTask(domain.Task{
+	safe, err := h.mapTask(context.Background(), domain.Task{
 		TaskID: "task-public", Model: "MiniMax-H3", Status: domain.StatusSucceeded,
 		ResultPublicURL: "https://cdn.example/video.mp4?token=legacy",
 		CreatedAt:       time.Unix(1, 0), UpdatedAt: time.Unix(2, 0),
@@ -360,7 +360,7 @@ func TestSucceededLegacyURLDoesNotExposePrivateNodeAddress(t *testing.T) {
 func TestSucceededArtifactSigningFailureDoesNotFallBackToLegacyURL(t *testing.T) {
 	signerErr := errors.New("signing unavailable")
 	h := &handler{artifactURLs: &signerSpy{err: signerErr}}
-	response, err := h.mapTask(domain.Task{
+	response, err := h.mapTask(context.Background(), domain.Task{
 		TaskID: "task-1", APIKeyID: "owner-a", Model: "MiniMax-H3", Status: domain.StatusSucceeded,
 		ResultArtifactID: "artifact-1", ResultPublicURL: "https://cdn.example/legacy.mp4",
 		CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(2, 0),
@@ -457,7 +457,7 @@ func (s *fixedTaskStore) CancelOrDelete(context.Context, string, string) (domain
 	return "", errors.New("unexpected CancelOrDelete call")
 }
 
-func (s *signerSpy) SignURL(artifactID, ownerID string) (string, error) {
+func (s *signerSpy) SignURL(_ context.Context, artifactID, ownerID string) (string, error) {
 	s.artifactID, s.ownerID = artifactID, ownerID
 	return s.url, s.err
 }

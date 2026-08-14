@@ -141,6 +141,55 @@ func TestClientUsesSingleServiceURLAndBearerKey(t *testing.T) {
 	}
 }
 
+func TestHealthAcceptsRuntimeDevicesAndExecutionSlots(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{
+			"status": "healthy",
+			"protocol_version": "h3-node-v1",
+			"node_time": 1797299513,
+			"components": {"comfyui": "healthy"},
+			"comfyui_exposure": "private",
+			"runtime": {
+				"queue_running": 1,
+				"queue_pending": 0,
+				"memory_total_bytes": 1000,
+				"memory_free_bytes": 500,
+				"vram_total_bytes": 800,
+				"vram_free_bytes": 300,
+				"cpu_percent": 12.5,
+				"gpu_percent": 34.5,
+				"devices": [
+					{
+						"index": 0,
+						"name": "NVIDIA",
+						"vram_total_bytes": 800,
+						"vram_free_bytes": 300,
+						"gpu_percent": 34.5
+					}
+				],
+				"execution_slots": {
+					"used": 1,
+					"capacity": 1
+				}
+			}
+		}`))
+	}))
+	defer server.Close()
+	base, _ := url.Parse(server.URL)
+	client := NewClient(base, testNodeAPIKey, server.Client(), 1<<20)
+
+	health, err := client.Health(context.Background(), "req-1")
+	if err != nil {
+		t.Fatalf("Health() error=%v", err)
+	}
+	if health.Runtime == nil || health.Runtime.GPUPercent == nil || *health.Runtime.GPUPercent != 34.5 {
+		t.Fatalf("runtime=%+v", health.Runtime)
+	}
+	if len(health.Runtime.Devices) != 1 || health.Runtime.Devices[0].Name != "NVIDIA" || health.Runtime.ExecutionSlots == nil || health.Runtime.ExecutionSlots.Capacity != 1 {
+		t.Fatalf("runtime=%+v", health.Runtime)
+	}
+}
+
 func TestCreateExecutionSendsIdempotencyAndStrictJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/internal/v1/executions" {

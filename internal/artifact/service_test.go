@@ -34,9 +34,20 @@ func (s fakeNodes) GetModelNode(context.Context, string) (domain.ModelNode, erro
 	return s.node, nil
 }
 
-type fakeSecrets struct{}
+type fakeSecrets struct {
+	key string
+	err error
+}
 
-func (fakeSecrets) Open([]byte, []byte) (string, error) { return "node-secret", nil }
+func (s fakeSecrets) Open([]byte, []byte) (string, error) {
+	if s.err != nil {
+		return "", s.err
+	}
+	if s.key != "" {
+		return s.key, nil
+	}
+	return "node-secret", nil
+}
 
 type fakeClient struct {
 	content  *nodeapi.ArtifactContent
@@ -57,13 +68,9 @@ func (c *fakeClient) ImportArtifact(context.Context, string, nodeapi.ImportArtif
 func TestSignedURLBindsOwnerArtifactMethodAndExpiry(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0)
 	service, client := testService(t, now)
-	signed, err := service.SignURL("artifact-1", "owner-a")
-	if err != nil {
-		t.Fatal(err)
-	}
-	parsed, _ := url.Parse(signed)
-	expires, _ := ParseExpires(parsed.Query().Get("expires"))
-	auth := Authorization{Expires: expires, Signature: parsed.Query().Get("signature"), Method: http.MethodGet}
+	expires := now.Add(15 * time.Minute).Unix()
+	signature := service.signature(http.MethodGet, "artifact-1", "owner-a", expires)
+	auth := Authorization{Expires: expires, Signature: signature, Method: http.MethodGet}
 	content, err := service.Open(context.Background(), "req", "artifact-1", "bytes=0-3", auth)
 	if err != nil {
 		t.Fatal(err)
@@ -77,7 +84,7 @@ func TestSignedURLBindsOwnerArtifactMethodAndExpiry(t *testing.T) {
 	if _, err := service.Open(context.Background(), "req", "artifact-1", "", auth); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("tampered err=%v", err)
 	}
-	auth.Signature = parsed.Query().Get("signature")
+	auth.Signature = signature
 	auth.Expires = now.Add(-time.Second).Unix()
 	if _, err := service.Open(context.Background(), "req", "artifact-1", "", auth); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("expired err=%v", err)
@@ -125,16 +132,15 @@ func TestLegacyPublicURLAllowsOnlySafeAbsoluteHTTPURLs(t *testing.T) {
 	}
 }
 
-func TestSignedURLUsesConfiguredProxyPublicPrefix(t *testing.T) {
+func TestSignedURLUsesNodePublicRouteAndSharedContract(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0)
 	client := &fakeClient{}
 	service, err := NewService(
-		fakeStore{},
+		fakeStore{access: accessRecord(now, domain.StatusSucceeded, now.Add(time.Hour).UnixMilli())},
 		fakeNodes{node: migrationNode("node", "https://node.example")},
-		fakeSecrets{},
+		fakeSecrets{key: "Abcdefghijklmnopqrstuvwx12345678"},
 		Options{
 			SigningKey: []byte("01234567890123456789012345678901"),
-			URLPrefix:  "https://proxy.example/v2/files",
 			Now:        func() time.Time { return now },
 			ClientFactory: func(*url.URL, string, *http.Client, int64) NodeClient {
 				return client
@@ -145,12 +151,39 @@ func TestSignedURLUsesConfiguredProxyPublicPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	signed, err := service.SignURL("artifact/one", "owner-a")
+	signed, err := service.SignURL(context.Background(), "artifact-1", "owner-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(signed, "https://proxy.example/v2/files/artifact%2Fone/content?") {
-		t.Fatalf("SignURL() = %q", signed)
+	want := "https://node.example/public/v1/artifacts/node-artifact/content?expires=2000172800&signature=1O8mgkHczi1j49Z-1DHL32jiq8iD6as6KNF6DvbLCZU"
+	if signed != want {
+		t.Fatalf("SignURL() = %q, want %q", signed, want)
+	}
+}
+
+func TestSignedURLRejectsWrongOwnerExpiredArtifactAndInvalidNodeURL(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0)
+	service, _ := testService(t, now)
+
+	if _, err := service.SignURL(context.Background(), "artifact-1", "owner-b"); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("cross owner err=%v", err)
+	}
+
+	service.store = fakeStore{access: accessRecord(now, domain.StatusSucceeded, now.Add(-time.Second).UnixMilli())}
+	if _, err := service.SignURL(context.Background(), "artifact-1", "owner-a"); !errors.Is(err, ErrExpired) {
+		t.Fatalf("expired artifact err=%v", err)
+	}
+
+	service.store = fakeStore{access: accessRecord(now, domain.StatusSucceeded, now.Add(time.Hour).UnixMilli())}
+	service.nodes = fakeNodes{node: migrationNode("node", "https://node.example/private")}
+	if _, err := service.SignURL(context.Background(), "artifact-1", "owner-a"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("invalid node URL err=%v", err)
+	}
+
+	service.nodes = fakeNodes{node: migrationNode("node", "https://node.example")}
+	service.secrets = fakeSecrets{err: errors.New("decrypt failed")}
+	if _, err := service.SignURL(context.Background(), "artifact-1", "owner-a"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("unavailable node key err=%v", err)
 	}
 }
 

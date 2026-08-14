@@ -1,6 +1,5 @@
 server:
   address: ":8080"
-  public_base_url: "http://127.0.0.1:8080"
   read_timeout: 15s
   write_timeout: 15s
 

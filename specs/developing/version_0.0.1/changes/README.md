@@ -25,6 +25,7 @@
 | 005-api-key-management | 对外 API Key 后台管理与数据库迁移 | 迭代/安全优化 | In Progress | 待人工填写 | CHANGE_SPEC.md、PRD_DELTA.md、PROTOTYPE_DELTA.md、TECH_SOLUTION.md、API_DELTA.md、DATABASE_DELTA.md、task.md、TEST_ACCEPTANCE.md | `specs/developing/version_0.0.1/changes/005-api-key-management/` | 开发与本地自动验证完成；真实升级、回滚和发布仍需人工验收 |
 | 006-node-single-key-conf | Node 单 Key 与 conf.yml 凭据配置 | 安全优化/配置与接口调整 | In Progress | 待人工填写 | CHANGE_SPEC.md、PRD_DELTA.md、PROTOTYPE_DELTA.md、TECH_SOLUTION.md、API_DELTA.md、DATABASE_DELTA.md、task.md、TEST_ACCEPTANCE.md | `specs/developing/version_0.0.1/changes/006-node-single-key-conf/` | `/s-develop` 实现与独立审查完成；取代 004 中 Node Key ID、scope 和复合 Token 规则，真实联调、ACL、GPU 与发布验收待人工确认 |
 | 007-request-profile-simplification | 模型请求配置简化与参数收敛 | 缺陷修复/配置模型与页面优化 | Pending | 待人工填写 | CHANGE_SPEC.md、PRD_DELTA.md、PARAMETER_AUDIT.md、DATABASE_DELTA.md、PROTOTYPE_DELTA.md、TECH_SOLUTION.md、API_DELTA.md、task.md、TEST_ACCEPTANCE.md | `specs/developing/version_0.0.1/changes/007-request-profile-simplification/` | `/s-design` 完成；单 resolution 单配置、保存即生效、支持删除，并修复水印与无效参数问题，待 `/s-develop` 实施 |
+| 008-direct-node-artifact-delivery | 节点直出视频签名链接 | 架构优化/接口与配置调整 | Pending | 待人工填写 | CHANGE_SPEC.md、PRD_DELTA.md、TECH_SOLUTION.md、API_DELTA.md、task.md、TEST_ACCEPTANCE.md | `specs/developing/version_0.0.1/changes/008-direct-node-artifact-delivery/` | 48 小时可重复访问的 Node 签名 URL，复用外部可达 `service_url`，待 `/s-develop` 实施 |
 
 ## 维护规则
 

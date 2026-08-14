@@ -77,6 +77,18 @@ func TestValidateCreateNormalizesI2VARatio(t *testing.T) {
 	}
 }
 
+func TestValidateCreateAcceptsExplicitLastFrameOnly(t *testing.T) {
+	request := CreateRequest{Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: "停在城市夜景"}, image("https://media.example.com/last.png", "last_frame")}, Resolution: "768P", Duration: 4, Ratio: "16:9"}
+
+	got, err := ValidateCreate(request, profiles())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Scenario != "i2va" || got.Ratio != "adaptive" || got.Content[1].Role != "last_frame" {
+		t.Fatalf("validated = %+v", got)
+	}
+}
+
 func TestValidateCreateSupportsResolutionTiers(t *testing.T) {
 	tests := []struct {
 		resolution string

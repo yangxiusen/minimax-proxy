@@ -39,7 +39,7 @@ type managerSignerSpy struct {
 	err                      error
 }
 
-func (s *managerSignerSpy) SignURL(artifactID, ownerID string) (string, error) {
+func (s *managerSignerSpy) SignURL(_ context.Context, artifactID, ownerID string) (string, error) {
 	s.artifactID, s.ownerID = artifactID, ownerID
 	return s.url, s.err
 }
@@ -207,6 +207,29 @@ func TestManagerPageIncludesNodeConfigurationWorkflow(t *testing.T) {
 		if strings.Contains(string(script), removed) {
 			t.Errorf("manager.js still references removed profile behavior %q", removed)
 		}
+	}
+}
+
+func TestManagerDefaultsNewProfilesToFlashVSRWithoutOverridingSavedEngine(t *testing.T) {
+	page, err := webAssets.ReadFile("web/manager.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := webAssets.ReadFile("web/manager.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, expected := range []string{
+		`restoration: { enabled: true, engine: "flashvsr", scale: 3 }`,
+		`config.restoration.engine || "flashvsr"`,
+	} {
+		if !strings.Contains(string(script), expected) {
+			t.Errorf("manager.js missing FlashVSR default contract %q", expected)
+		}
+	}
+	if !strings.Contains(string(page), `<option value="flashvsr" selected>FlashVSR</option>`) {
+		t.Error("manager.html must select FlashVSR before JavaScript initializes the form")
 	}
 }
 
@@ -618,7 +641,7 @@ func TestTasksSignsArtifactPlaybackURLWithoutExposingArtifactID(t *testing.T) {
 
 func TestPublicVideoURLDoesNotExposePrivateLegacyNodeAddress(t *testing.T) {
 	h := &handler{}
-	unsafe, err := h.publicVideoURL(domain.AdminTaskSummary{
+	unsafe, err := h.publicVideoURL(context.Background(), domain.AdminTaskSummary{
 		Status: domain.V2Succeeded, ResultPublicURL: "http://127.0.0.1:7860/gradio_api/file=video.mp4",
 	})
 	if err != nil {
@@ -628,7 +651,7 @@ func TestPublicVideoURLDoesNotExposePrivateLegacyNodeAddress(t *testing.T) {
 		t.Fatalf("private legacy URL exposed: %q", *unsafe)
 	}
 
-	safe, err := h.publicVideoURL(domain.AdminTaskSummary{
+	safe, err := h.publicVideoURL(context.Background(), domain.AdminTaskSummary{
 		Status: domain.V2Succeeded, ResultPublicURL: "https://cdn.example/video.mp4?token=legacy",
 	})
 	if err != nil {
@@ -642,7 +665,7 @@ func TestPublicVideoURLDoesNotExposePrivateLegacyNodeAddress(t *testing.T) {
 func TestPublicVideoURLSigningFailureDoesNotFallBackToLegacyURL(t *testing.T) {
 	signerErr := errors.New("signing unavailable")
 	h := &handler{artifactURLs: &managerSignerSpy{err: signerErr}}
-	videoURL, err := h.publicVideoURL(domain.AdminTaskSummary{
+	videoURL, err := h.publicVideoURL(context.Background(), domain.AdminTaskSummary{
 		APIKeyID: "owner-a", Status: domain.V2Succeeded,
 		ResultArtifactID: "artifact-1", ResultPublicURL: "https://cdn.example/legacy.mp4",
 	})

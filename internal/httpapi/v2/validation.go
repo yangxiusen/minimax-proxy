@@ -117,9 +117,6 @@ func ValidateCreate(request CreateRequest, profiles map[string]config.Generation
 	if firstCount > 1 || lastCount > 1 {
 		return ValidatedRequest{}, fmt.Errorf("首帧和尾帧最多各 1 张")
 	}
-	if lastCount > 0 && firstCount == 0 {
-		return ValidatedRequest{}, fmt.Errorf("尾帧必须与首帧一起提供")
-	}
 	if referenceImages > 9 || referenceVideos > 3 || referenceAudios > 3 {
 		return ValidatedRequest{}, fmt.Errorf("参考媒体数量超过限制")
 	}

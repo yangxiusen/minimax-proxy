@@ -64,7 +64,6 @@ type ClientFactory func(*url.URL, string, *http.Client, int64) NodeClient
 
 type Options struct {
 	SigningKey       []byte
-	URLPrefix        string
 	TTL              time.Duration
 	Now              func() time.Time
 	HTTPClient       *http.Client
@@ -79,7 +78,6 @@ type Service struct {
 	nodes         NodeStore
 	secrets       SecretOpener
 	signingKey    []byte
-	urlPrefix     string
 	ttl           time.Duration
 	now           func() time.Time
 	httpClient    *http.Client
@@ -123,9 +121,6 @@ func NewService(store Store, nodes NodeStore, secrets SecretOpener, options Opti
 	if len(options.SigningKey) < 32 {
 		return nil, errors.New("产物下载签名密钥至少需要 32 字节")
 	}
-	if options.URLPrefix == "" {
-		options.URLPrefix = "/v2/files"
-	}
 	if options.TTL <= 0 {
 		options.TTL = 15 * time.Minute
 	}
@@ -159,20 +154,48 @@ func NewService(store Store, nodes NodeStore, secrets SecretOpener, options Opti
 	}
 	return &Service{
 		store: store, nodes: nodes, secrets: secrets, signingKey: append([]byte(nil), options.SigningKey...),
-		urlPrefix: strings.TrimSuffix(options.URLPrefix, "/"), ttl: options.TTL, now: options.Now,
+		ttl: options.TTL, now: options.Now,
 		httpClient: options.HTTPClient, maxJSONBody: options.MaxJSONBody, clientFactory: options.ClientFactory,
 		ownerLimiter: newKeyedLimiter(options.OwnerConcurrency), nodeLimiter: newKeyedLimiter(options.NodeConcurrency),
 	}, nil
 }
 
-func (s *Service) SignURL(artifactID, ownerID string) (string, error) {
+func (s *Service) SignURL(ctx context.Context, artifactID, ownerID string) (string, error) {
 	if artifactID == "" || ownerID == "" {
 		return "", ErrUnauthorized
 	}
-	expires := s.now().UTC().Add(s.ttl).Unix()
-	signature := s.signature(http.MethodGet, artifactID, ownerID, expires)
+	access, err := s.store.GetArtifactAccess(ctx, artifactID)
+	if errors.Is(err, sqlite.ErrArtifactNotFound) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	if access.APIKeyID != ownerID {
+		return "", ErrUnauthorized
+	}
+	if err := s.validateAccess(access); err != nil {
+		return "", err
+	}
+	node, err := s.nodes.GetModelNode(ctx, access.Location.NodeID)
+	if err != nil || !node.UsesNodeAPI() {
+		return "", ErrUnavailable
+	}
+	base, err := parseNodePublicBaseURL(node.ServiceURL)
+	if err != nil {
+		return "", ErrUnavailable
+	}
+	apiKey, err := s.secrets.Open(node.APIKeyNonce, node.APIKeyCiphertext)
+	if err != nil || apiKey == "" {
+		return "", ErrUnavailable
+	}
+	expires := s.now().UTC().Add(48 * time.Hour).Unix()
+	signature := nodeDownloadSignature(apiKey, access.Location.NodeArtifactID, expires)
 	values := url.Values{"expires": {strconv.FormatInt(expires, 10)}, "signature": {signature}}
-	return s.urlPrefix + "/" + url.PathEscape(artifactID) + "/content?" + values.Encode(), nil
+	base.Path = "/public/v1/artifacts/" + access.Location.NodeArtifactID + "/content"
+	base.RawPath = "/public/v1/artifacts/" + url.PathEscape(access.Location.NodeArtifactID) + "/content"
+	base.RawQuery = values.Encode()
+	return base.String(), nil
 }
 
 func (s *Service) Open(ctx context.Context, requestID, artifactID, rangeHeader string, auth Authorization) (*Content, error) {
@@ -186,11 +209,8 @@ func (s *Service) Open(ctx context.Context, requestID, artifactID, rangeHeader s
 	if err := s.authorize(access.APIKeyID, artifactID, auth); err != nil {
 		return nil, err
 	}
-	if access.TaskStatus != domain.StatusSucceeded || access.TaskDeletedAt != 0 || access.Artifact.State != "active" || access.Artifact.Kind != "final_video" {
-		return nil, ErrNotFound
-	}
-	if access.Artifact.ExpiresAt > 0 && access.Artifact.ExpiresAt <= s.now().UTC().UnixMilli() {
-		return nil, ErrExpired
+	if err := s.validateAccess(access); err != nil {
+		return nil, err
 	}
 	releaseOwner, ok := s.ownerLimiter.acquire(access.APIKeyID)
 	if !ok {
@@ -229,6 +249,36 @@ func (s *Service) Open(ctx context.Context, requestID, artifactID, rangeHeader s
 		ContentRange: result.ContentRange, ContentType: safeContentType(result.ContentType), ETag: result.ETag,
 		ArtifactID: artifactID,
 	}, nil
+}
+
+func (s *Service) validateAccess(access sqlite.ArtifactAccess) error {
+	if access.TaskStatus != domain.StatusSucceeded || access.TaskDeletedAt != 0 || access.Artifact.State != "active" || access.Artifact.Kind != "final_video" {
+		return ErrNotFound
+	}
+	if access.Artifact.ExpiresAt > 0 && access.Artifact.ExpiresAt <= s.now().UTC().UnixMilli() {
+		return ErrExpired
+	}
+	return nil
+}
+
+func parseNodePublicBaseURL(value string) (*url.URL, error) {
+	base, err := url.Parse(value)
+	if err != nil || base.Host == "" || base.Scheme != "http" && base.Scheme != "https" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
+		return nil, errors.New("节点公开根地址无效")
+	}
+	if strings.Trim(base.EscapedPath(), "/") != "" {
+		return nil, errors.New("节点公开地址必须是根地址")
+	}
+	base.Path, base.RawPath = "", ""
+	return base, nil
+}
+
+func nodeDownloadSignature(apiKey, artifactID string, expires int64) string {
+	keyMAC := hmac.New(sha256.New, []byte(apiKey))
+	_, _ = keyMAC.Write([]byte("minimax-h3-node-artifact-download-v1"))
+	mac := hmac.New(sha256.New, keyMAC.Sum(nil))
+	_, _ = fmt.Fprintf(mac, "v1\nGET\n%s\n%d", artifactID, expires)
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
 func (s *Service) Migrate(ctx context.Context, requestID string, input MigrationRequest) (sqlite.ArtifactLocation, error) {

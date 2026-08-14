@@ -16,7 +16,7 @@ After signing in to `/manager`, open **密钥管理** to create public V2 Bearer
 
 `MINIMAX_PROXY_MASTER_KEY` encrypts Node API keys and callback targets and derives independent callback and artifact signing keys. Back it up in a secret manager; changing or losing it makes existing encrypted values unreadable. Use HTTPS and set `admin.secure_cookie: true` when TLS is terminated by a reverse proxy.
 
-Set `server.public_base_url` to the HTTP/HTTPS Proxy root that API clients can reach. It is used to build short-lived `/v2/files/...` result and playback URLs. Do not set it to a MiniMax-H3 node URL such as port `7860`, and do not include credentials, a query, fragment, or subpath. Docker deployments provide the value through `MINIMAX_PUBLIC_BASE_URL`.
+Successful tasks return 48-hour signed video URLs on the artifact's MiniMax-H3 node. The node `service_url` saved in Manager must therefore be an HTTP/HTTPS root reachable by both the Proxy and API clients. Video bytes flow directly from the node and do not pass through the Proxy; the signed URL can be reused and shared until it expires.
 
 Open `http://127.0.0.1:8080/manager`. A new `h3-node-v1` node needs only:
 
@@ -45,7 +45,7 @@ curl.exe -X POST http://127.0.0.1:8080/v2/video_generation `
 
 `aigc_watermark` is optional and defaults to `false`. A watermark stage is added only when the request explicitly sends `true`.
 
-Query with `GET /v2/query/video_generation/{task_id}`. Successful tasks return a short-lived absolute Proxy download URL. The download route validates a signature or the owning Bearer key, supports Range requests, and does not reveal node addresses or keys.
+Query with `GET /v2/query/video_generation/{task_id}`. Successful tasks return a reusable, 48-hour signed URL on the artifact's MiniMax-H3 node. The node serves the video directly with Range support, so video traffic does not pass through the Proxy. The URL reveals the configured node address but never its API key; treat the complete URL as a temporary bearer credential.
 
 `callback_url` is optional. When present it is challenged before task creation, encrypted at rest, and notified with a stable HMAC-signed body and retry policy. When absent it causes no callback network request. Callback and remote input URLs reject local, private, link-local, metadata, reserved, and DNS-rebinding targets.
 

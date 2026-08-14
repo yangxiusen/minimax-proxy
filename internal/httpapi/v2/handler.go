@@ -35,7 +35,7 @@ type ActiveProfileStore interface {
 }
 
 type ArtifactURLSigner interface {
-	SignURL(artifactID, ownerID string) (string, error)
+	SignURL(context.Context, string, string) (string, error)
 }
 
 type BearerAuthenticator interface {
@@ -372,7 +372,7 @@ func (h *handler) get(w http.ResponseWriter, r *http.Request) {
 		h.storeError(w, r, err)
 		return
 	}
-	response, err := h.mapTask(task)
+	response, err := h.mapTask(r.Context(), task)
 	if err != nil {
 		h.internalError(w, r, err)
 		return
@@ -420,7 +420,7 @@ func (h *handler) list(w http.ResponseWriter, r *http.Request) {
 	}
 	responses := make([]TaskResponse, 0, len(items))
 	for _, item := range items {
-		response, err := h.mapTask(item)
+		response, err := h.mapTask(r.Context(), item)
 		if err != nil {
 			h.internalError(w, r, err)
 			return
@@ -515,7 +515,7 @@ func (h *handler) writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-func (h *handler) mapTask(task domain.Task) (TaskResponse, error) {
+func (h *handler) mapTask(ctx context.Context, task domain.Task) (TaskResponse, error) {
 	ratio := task.RatioActual
 	if ratio == "" {
 		ratio = task.RatioRequested
@@ -526,7 +526,7 @@ func (h *handler) mapTask(task domain.Task) (TaskResponse, error) {
 			if h.artifactURLs == nil {
 				return TaskResponse{}, errors.New("artifact URL signer is not configured")
 			}
-			resultURL, err := h.artifactURLs.SignURL(task.ResultArtifactID, task.APIKeyID)
+			resultURL, err := h.artifactURLs.SignURL(ctx, task.ResultArtifactID, task.APIKeyID)
 			if err != nil {
 				return TaskResponse{}, err
 			}

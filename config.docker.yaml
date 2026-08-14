@@ -1,6 +1,5 @@
 server:
   address: ":18080"
-  public_base_url: "${MINIMAX_PUBLIC_BASE_URL}"
   read_timeout: 15s
   write_timeout: 15s
 
