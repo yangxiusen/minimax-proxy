@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -194,6 +195,54 @@ func TestImportLegacyNodesDoesNotMergeIntoExistingDatabase(t *testing.T) {
 	nodes, err := store.ListModelNodes(ctx)
 	if err != nil || len(nodes) != 1 || nodes[0].ID != "managed" {
 		t.Fatalf("nodes = %+v, %v", nodes, err)
+	}
+}
+
+func TestH3NodeUsesEmptyKeyIDCompatibilityValue(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 100})
+	ctx := context.Background()
+	input := domain.ModelNodeInput{
+		ID: "node-1", ServiceURL: "http://127.0.0.1:7860", ProtocolVersion: "h3-node-v1",
+		APIKeyCiphertext: []byte("ciphertext"), APIKeyNonce: []byte("nonce"), APIKeyFingerprint: "sha256:test",
+		PollInterval: 3 * time.Second, RequestTimeout: 30 * time.Second, Enabled: true,
+	}
+
+	if _, err := store.CreateModelNode(ctx, input); err != nil {
+		t.Fatal(err)
+	}
+	var compatibilityValue string
+	if err := store.db.QueryRowContext(ctx, `SELECT api_key_id FROM model_service_nodes WHERE id='node-1'`).Scan(&compatibilityValue); err != nil {
+		t.Fatal(err)
+	}
+	if compatibilityValue != "" {
+		t.Fatalf("api_key_id=%q, want empty compatibility value", compatibilityValue)
+	}
+	if _, ok := reflect.TypeOf(domain.ModelNodeInput{}).FieldByName("APIKeyID"); ok {
+		t.Fatal("ModelNodeInput must not expose APIKeyID")
+	}
+}
+
+func TestHistoricalH3KeyIDIsIgnoredWhenReadingNode(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 100})
+	ctx := context.Background()
+	input := domain.ModelNodeInput{
+		ID: "node-1", ServiceURL: "http://127.0.0.1:7860", ProtocolVersion: "h3-node-v1",
+		APIKeyCiphertext: []byte("ciphertext"), APIKeyNonce: []byte("nonce"), APIKeyFingerprint: "sha256:test",
+		PollInterval: 3 * time.Second, RequestTimeout: 30 * time.Second, Enabled: true,
+	}
+	if _, err := store.CreateModelNode(ctx, input); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE model_service_nodes SET api_key_id='historical-id' WHERE id='node-1'`); err != nil {
+		t.Fatal(err)
+	}
+
+	node, err := store.GetModelNode(ctx, "node-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.APIKeyFingerprint != "sha256:test" || string(node.APIKeyCiphertext) != "ciphertext" {
+		t.Fatalf("node credentials changed: %+v", node)
 	}
 }
 

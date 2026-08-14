@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -31,6 +32,16 @@ type taskStoreStub struct {
 	deletedTask   string
 	cancelError   error
 	deleteError   error
+}
+
+type managerSignerSpy struct {
+	url, artifactID, ownerID string
+	err                      error
+}
+
+func (s *managerSignerSpy) SignURL(artifactID, ownerID string) (string, error) {
+	s.artifactID, s.ownerID = artifactID, ownerID
+	return s.url, s.err
 }
 
 func (s *taskStoreStub) RequestAdminCancel(_ context.Context, taskID string) error {
@@ -114,21 +125,44 @@ func TestManagerScriptGuardsTaskRenderingWithRequestGeneration(t *testing.T) {
 	}
 }
 
-func TestManagerScriptConfirmsActionsAndOpensPublicVideo(t *testing.T) {
+func TestManagerPageConfirmsActionsAndPlaysVideoInDialog(t *testing.T) {
+	page, err := webAssets.ReadFile("web/manager.html")
+	if err != nil {
+		t.Fatal(err)
+	}
 	script, err := webAssets.ReadFile("web/manager.js")
 	if err != nil {
 		t.Fatal(err)
+	}
+	markup := string(page)
+	for _, expected := range []string{
+		`id="video-player-dialog"`,
+		`id="video-player" class="video-player"`,
+		`controls`,
+		`id="video-player-status"`,
+		`id="close-video-player"`,
+	} {
+		if !strings.Contains(markup, expected) {
+			t.Errorf("manager.html missing video player control %q", expected)
+		}
 	}
 	source := string(script)
 	for _, expected := range []string{
 		"window.confirm",
 		"/cancel`",
 		`method: action === "cancel" ? "POST" : "DELETE"`,
-		`window.open(item.video_url, "_blank", "noopener,noreferrer")`,
+		"openVideoPlayer(item)",
+		"closeVideoPlayer()",
+		"elements.videoPlayer.pause()",
+		`elements.videoPlayer.removeAttribute("src")`,
+		"elements.videoPlayer.load()",
 	} {
 		if !strings.Contains(source, expected) {
 			t.Errorf("manager.js missing task action behavior %q", expected)
 		}
+	}
+	if strings.Contains(source, "window.open(item.video_url") {
+		t.Error("manager.js still opens task video in a new window")
 	}
 }
 
@@ -141,14 +175,90 @@ func TestManagerPageIncludesNodeConfigurationWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"open-node-config", "node-config-dialog", "node-config-form", "jobs_base_url", "test-node", "save-node", "delete-node"} {
+	styles, err := webAssets.ReadFile("web/styles.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"open-node-config", "node-config-dialog", "node-config-form", "service_url", "pattern=\"[A-Za-z0-9._\\-]{1,64}\"", "节点 ID 仅支持 1 至 64 位字母、数字、点、下划线或短横线", "minlength=\"32\"", "maxlength=\"32\"", "pattern=\"[A-Za-z0-9]{32}\"", "test-node", "save-node", "delete-node", "profile-config-dialog", "cleanup-dialog", "逻辑分辨率", "保存并生效", "delete-profile"} {
 		if !strings.Contains(string(page), expected) {
 			t.Errorf("manager.html missing node configuration control %q", expected)
 		}
 	}
-	for _, expected := range []string{"/manager/api/nodes", "window.confirm", "formDirty", "NodeProbe", "requestJSON"} {
+	if strings.Contains(string(page), "name=\"api_key_id\"") || strings.Contains(string(page), "<span>Key ID</span>") {
+		t.Error("manager.html still exposes node Key ID")
+	}
+	for _, removed := range []string{"配置版本", "生成场景", "生成帧率", "主模型", ">CFG<", "AIGC 水印（强制开启）", "音画同步阈值", "发布门禁", "复制为草稿"} {
+		if strings.Contains(string(page), removed) {
+			t.Errorf("manager.html still contains removed profile control %q", removed)
+		}
+	}
+	for _, expected := range []string{"/manager/api/nodes", "/manager/api/request-profiles", "/manager/api/artifact-cleanups", "method: \"DELETE\"", "window.confirm", "formDirty", "profileFormDirty", "confirmDiscardProfileChanges", "cloneProfileConfig", "profile_template", `formField("api_key").required = true`, `formField("api_key").required = false`, "requestJSON"} {
 		if !strings.Contains(string(script), expected) {
 			t.Errorf("manager.js missing node configuration behavior %q", expected)
+		}
+	}
+	if !strings.Contains(string(script), "节点 ID 仅支持 1 至 64 位字母、数字、点、下划线或短横线") {
+		t.Error("manager.js missing the node ID validation message")
+	}
+	if !strings.Contains(string(styles), `[hidden] { display: none !important; }`) {
+		t.Error("manager styles must keep hidden profile template fields hidden")
+	}
+	for _, removed := range []string{"/publish", "/clone", "/tests", "profile_version", "aigc_watermark", "av_sync_tolerance_ms", "main_model", "cfg:"} {
+		if strings.Contains(string(script), removed) {
+			t.Errorf("manager.js still references removed profile behavior %q", removed)
+		}
+	}
+}
+
+func TestManagerPageIncludesAPIKeyManagementWorkflow(t *testing.T) {
+	page, err := webAssets.ReadFile("web/manager.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := webAssets.ReadFile("web/manager.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	styles, err := webAssets.ReadFile("web/styles.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, expected := range []string{
+		"open-api-keys", "密钥管理", "api-key-dialog", "api-key-list", "new-api-key",
+		"api-key-name", "api-key-secret-dialog", "api-key-secret", "copy-api-key",
+		"close-api-key-secret", "当前无可用对外密钥", "正在加载密钥", "暂无对外 API Key",
+	} {
+		if !strings.Contains(string(page), expected) {
+			t.Errorf("manager.html missing API key control %q", expected)
+		}
+	}
+
+	for _, expected := range []string{
+		`const apiKeysPath = "/manager/api/api-keys"`,
+		"apiKeyRequestGeneration", "apiKeyBusy", "enabled_count", "masked_key",
+		`navigator.clipboard.writeText`, `document.execCommand("copy")`,
+		`copy.addEventListener("click", () => copyStoredAPIKey(item))`,
+		"clearOneTimeAPIKey", `elements.apiKeySecret.textContent = ""`, "state.oneTimeAPIKey = null",
+		"api_key_name_conflict", "api_key_version_conflict", "key_in_use", "cache_refresh_failed",
+	} {
+		if !strings.Contains(string(script), expected) {
+			t.Errorf("manager.js missing API key behavior %q", expected)
+		}
+	}
+	if strings.Contains(string(script), `innerHTML`) {
+		t.Error("manager.js must not use innerHTML for dynamic API key content")
+	}
+	if got := strings.Count(string(script), `"/manager/api/api-keys`); got != 1 {
+		t.Errorf("manager.js must centralize the exact API key collection path, occurrences=%d", got)
+	}
+
+	for _, expected := range []string{
+		".api-key-dialog", ".api-key-list", ".api-key-secret", "overflow-wrap: anywhere", "overflow-x: auto",
+		"@media (max-width: 480px)",
+	} {
+		if !strings.Contains(string(styles), expected) {
+			t.Errorf("styles.css missing API key responsive contract %q", expected)
 		}
 	}
 }
@@ -472,6 +582,72 @@ func TestTasksValidatesFiltersAndReturnsMinimalShape(t *testing.T) {
 	store.mu.Unlock()
 	if filter.PageNum != 1 || filter.PageSize != 10 {
 		t.Fatalf("defaults=%+v", filter)
+	}
+}
+
+func TestTasksSignsArtifactPlaybackURLWithoutExposingArtifactID(t *testing.T) {
+	created := time.Unix(2_000_000_000, 0)
+	store := &taskStoreStub{total: 1, items: []domain.AdminTaskSummary{{
+		TaskID: "task-1", APIKeyID: "customer", Status: domain.V2Succeeded, InternalStatus: domain.StatusSucceeded,
+		ResultArtifactID: "artifact-1", CreatedAt: created,
+	}}}
+	signer := &managerSignerSpy{url: "https://proxy.example/v2/files/artifact-1/content?expires=1&signature=signed"}
+	h := testHandler(Dependencies{
+		Admin: config.AdminConfig{Username: "a", Password: "b", SessionTTL: time.Hour},
+		Store: store, ArtifactURLs: signer,
+	})
+	cookie := login(t, h, "a", "b", "203.0.113.8:1")
+	response := serve(h, http.MethodGet, "/manager/api/tasks", "", "", cookie, "203.0.113.8:1", false)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Items []map[string]any `json:"items"`
+	}
+	decodeResponse(t, response, &body)
+	if len(body.Items) != 1 || body.Items[0]["video_url"] != signer.url {
+		t.Fatalf("body=%+v", body)
+	}
+	if signer.artifactID != "artifact-1" || signer.ownerID != "customer" {
+		t.Fatalf("signer=%+v", signer)
+	}
+	if _, exists := body.Items[0]["result_artifact_id"]; exists {
+		t.Fatalf("artifact id leaked: %+v", body.Items[0])
+	}
+}
+
+func TestPublicVideoURLDoesNotExposePrivateLegacyNodeAddress(t *testing.T) {
+	h := &handler{}
+	unsafe, err := h.publicVideoURL(domain.AdminTaskSummary{
+		Status: domain.V2Succeeded, ResultPublicURL: "http://127.0.0.1:7860/gradio_api/file=video.mp4",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unsafe != nil {
+		t.Fatalf("private legacy URL exposed: %q", *unsafe)
+	}
+
+	safe, err := h.publicVideoURL(domain.AdminTaskSummary{
+		Status: domain.V2Succeeded, ResultPublicURL: "https://cdn.example/video.mp4?token=legacy",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if safe == nil || *safe != "https://cdn.example/video.mp4?token=legacy" {
+		t.Fatalf("safe legacy URL missing: %v", safe)
+	}
+}
+
+func TestPublicVideoURLSigningFailureDoesNotFallBackToLegacyURL(t *testing.T) {
+	signerErr := errors.New("signing unavailable")
+	h := &handler{artifactURLs: &managerSignerSpy{err: signerErr}}
+	videoURL, err := h.publicVideoURL(domain.AdminTaskSummary{
+		APIKeyID: "owner-a", Status: domain.V2Succeeded,
+		ResultArtifactID: "artifact-1", ResultPublicURL: "https://cdn.example/legacy.mp4",
+	})
+	if !errors.Is(err, signerErr) || videoURL != nil {
+		t.Fatalf("publicVideoURL() = %v, %v; want signing error without fallback", videoURL, err)
 	}
 }
 

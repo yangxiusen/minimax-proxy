@@ -1,11 +1,12 @@
 server:
   address: ":8080"
+  public_base_url: "http://127.0.0.1:8080"
   read_timeout: 15s
   write_timeout: 15s
 
 admin:
   username: admin
-  password: "123"
+  password: "${MINIMAX_ADMIN_PASSWORD}"
   session_ttl: 12h
   monitor_interval: 5s
   secure_cookie: false
@@ -23,10 +24,8 @@ task:
   idempotency_ttl: 24h
   execution_timeout: 10m
 
-api_keys:
-  - id: customer-a
-    key: "${MINIMAX_API_KEY_CUSTOMER_A}"
-    enabled: true
+# 对外 API Key 在 /manager 的“密钥管理”中创建和维护。
+# 升级时，旧版 api_keys 会在首次启动后一次性导入 SQLite。
 
 # 模型服务节点在 /manager 的“节点配置”中维护，并存储于 SQLite。
 # 升级时若数据库尚无节点，旧版 upstreams 会在首次启动时自动导入一次。
@@ -35,6 +34,7 @@ api_keys:
 generation_profiles:
   480P:
     model_mode: high_quality
+    fps: 24
     custom_model: __follow_model_mode__
     custom_model_high: __follow_model_mode__
     easy_cache: true
@@ -49,6 +49,7 @@ generation_profiles:
       "9:16": {width: 480, height: 832}
   768P:
     model_mode: high_quality
+    fps: 24
     custom_model: __follow_model_mode__
     custom_model_high: __follow_model_mode__
     easy_cache: true
@@ -63,6 +64,7 @@ generation_profiles:
       "9:16": {width: 768, height: 1344}
   2K:
     model_mode: custom
+    fps: 24
     custom_model: __follow_model_mode__
     custom_model_high: __follow_model_mode__
     easy_cache: true

@@ -189,7 +189,7 @@ func TestClientClassifiesMissingJobAndRejectsInvalidID(t *testing.T) {
 	}
 }
 
-func TestBuildArgumentsKeepsAll32Positions(t *testing.T) {
+func TestBuildArgumentsKeepsAll32LegacyPositions(t *testing.T) {
 	request := v2.ValidatedRequest{CreateRequest: v2.CreateRequest{Model: "MiniMax-H3", Content: []v2.ContentItem{{Type: "text", Text: "保持一致"}, {Type: "image_url", ImageURL: &v2.URLValue{URL: "https://media.example/ref.png"}, Role: "reference_image"}}, Resolution: "2K", Duration: 5, Ratio: "16:9"}, Scenario: "r2va", Prompt: "保持一致", Width: 1920, Height: 1080, InputImageCount: 1}
 	profile := config.GenerationProfile{ModelMode: "custom", CustomModel: "__follow_model_mode__", CustomModelHigh: "__follow_model_mode__", EasyCache: true, Steps: 20}
 	args, err := BuildArguments(request, profile)
@@ -208,6 +208,37 @@ func TestBuildArgumentsKeepsAll32Positions(t *testing.T) {
 	}
 	if args[18] != nil || args[31] != nil {
 		t.Fatalf("unused slots are not nil")
+	}
+}
+
+func TestLegacyArgumentContractRejectsNonDefaultFPS(t *testing.T) {
+	request := v2.ValidatedRequest{
+		CreateRequest: v2.CreateRequest{
+			Model:      "MiniMax-H3",
+			Content:    []v2.ContentItem{{Type: "text", Text: "contract"}},
+			Resolution: "768P",
+			Duration:   4,
+			Ratio:      "16:9",
+		},
+		Scenario: "t2va",
+		Prompt:   "contract",
+		Width:    768,
+		Height:   432,
+	}
+	_, err := BuildArguments(request, config.GenerationProfile{ModelMode: "high_quality", FPS: 15, Steps: 8})
+	if err == nil || !strings.Contains(err.Error(), "only supports 24 fps") {
+		t.Fatalf("BuildArguments() error = %v, want explicit legacy FPS rejection", err)
+	}
+}
+
+func TestLegacyArgumentContractDefaultsMissingFPSTo24(t *testing.T) {
+	request := v2.ValidatedRequest{CreateRequest: v2.CreateRequest{Model: "MiniMax-H3", Resolution: "768P", Duration: 4, Ratio: "16:9"}, Scenario: "t2va", Prompt: "contract", Width: 768, Height: 432}
+	args, err := BuildArguments(request, config.GenerationProfile{ModelMode: "high_quality", Steps: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(args) != 32 || args[15] != 8 || args[16] != -1 {
+		t.Fatalf("legacy arguments = %#v", args)
 	}
 }
 

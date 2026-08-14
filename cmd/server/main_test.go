@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"minimax-h3-tc/internal/authkey"
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
 	managerapi "minimax-h3-tc/internal/httpapi/manager"
@@ -89,7 +90,7 @@ func TestAppHandlerKeepsManagerCookieAndV2BearerIsolated(t *testing.T) {
 		Admin: config.AdminConfig{Username: "admin", Password: "password", SessionTTL: time.Hour}, Cache: cache, Store: store,
 		Logger: logger, Now: func() time.Time { return now }, Rand: bytes.NewReader(bytes.Repeat([]byte{1}, 32)),
 	})
-	handler := newAppHandler(v2Handler, managerHandler)
+	handler := newAppHandler(v2Handler, http.NotFoundHandler(), managerHandler)
 
 	login := httptest.NewRequest(http.MethodPost, "/manager/api/session", bytes.NewBufferString(`{"username":"admin","password":"password"}`))
 	login.Header.Set("Content-Type", "application/json")
@@ -137,7 +138,7 @@ func TestAppHandlerServesManagerAndRedirectsLegacyMonitor(t *testing.T) {
 		Admin: config.AdminConfig{Username: "admin", Password: "password", SessionTTL: time.Hour},
 		Cache: monitorcache.NewCache(nil), Store: &appStore{}, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
-	handler := newAppHandler(http.NotFoundHandler(), managerHandler)
+	handler := newAppHandler(http.NotFoundHandler(), http.NotFoundHandler(), managerHandler)
 
 	manager := httptest.NewRecorder()
 	handler.ServeHTTP(manager, httptest.NewRequest(http.MethodGet, "/manager", nil))
@@ -180,6 +181,19 @@ func TestBootstrapLegacyNodesImportsOnceAndThenIgnoresYAML(t *testing.T) {
 	count, err = bootstrapLegacyNodes(ctx, store, []config.LegacyUpstreamConfig{{ID: "broken", BaseURL: "${MISSING_AFTER_IMPORT}"}})
 	if err != nil || count != 0 {
 		t.Fatalf("second bootstrap count=%d err=%v", count, err)
+	}
+}
+
+func TestLegacyAPIKeyInputsHashAndMaskSecrets(t *testing.T) {
+	inputs, err := legacyAPIKeyInputs([]config.APIKeyConfig{{ID: "customer-a", Key: "legacy-secret", Enabled: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inputs) != 1 || inputs[0].ID != "customer-a" || inputs[0].Name != "customer-a" || inputs[0].KeyPrefix != "lega" || inputs[0].KeySuffix != "cret" {
+		t.Fatalf("inputs=%+v", inputs)
+	}
+	if inputs[0].KeyDigest != authkey.Digest("legacy-secret") {
+		t.Fatal("legacy key digest mismatch")
 	}
 }
 

@@ -21,7 +21,32 @@ const elements = {
   formStatus: document.getElementById("node-form-status"),
   deleteNode: document.getElementById("delete-node"),
   testNode: document.getElementById("test-node"),
-  saveNode: document.getElementById("save-node")
+  saveNode: document.getElementById("save-node"),
+  profileDialog: document.getElementById("profile-config-dialog"),
+  profileForm: document.getElementById("profile-form"),
+  profileList: document.getElementById("profile-list"),
+  profileStatus: document.getElementById("profile-form-status"),
+  ratioRows: document.getElementById("ratio-rows"),
+  loraRows: document.getElementById("lora-rows"),
+  deleteProfile: document.getElementById("delete-profile"),
+  cleanupDialog: document.getElementById("cleanup-dialog"),
+  cleanupPreview: document.getElementById("cleanup-preview"),
+  cleanupProgress: document.getElementById("cleanup-progress"),
+  cleanupFormStatus: document.getElementById("cleanup-form-status"),
+  apiKeyDialog: document.getElementById("api-key-dialog"),
+  apiKeyList: document.getElementById("api-key-list"),
+  apiKeyCount: document.getElementById("api-key-count"),
+  apiKeyWarning: document.getElementById("api-key-warning"),
+  apiKeyForm: document.getElementById("api-key-form"),
+  apiKeyName: document.getElementById("api-key-name"),
+  apiKeyStatus: document.getElementById("api-key-status"),
+  apiKeySecretDialog: document.getElementById("api-key-secret-dialog"),
+  apiKeySecret: document.getElementById("api-key-secret"),
+  apiKeyCopyStatus: document.getElementById("api-key-copy-status"),
+  videoPlayerDialog: document.getElementById("video-player-dialog"),
+  videoPlayerTitle: document.getElementById("video-player-title"),
+  videoPlayerStatus: document.getElementById("video-player-status"),
+  videoPlayer: document.getElementById("video-player")
 };
 
 const state = {
@@ -35,9 +60,22 @@ const state = {
   configuredNodes: [],
   editingNode: null,
   formDirty: false,
-  nodeBusy: false
+  nodeBusy: false,
+  profiles: [],
+  profileDetail: null,
+  profileBusy: false,
+  profileFormDirty: false,
+  profileTemplateID: "",
+  cleanupPreview: null,
+  cleanupID: "",
+  cleanupTimer: null,
+  apiKeys: [],
+  apiKeyBusy: false,
+  oneTimeAPIKey: null
 };
 let taskRequestGeneration = 0;
+let apiKeyRequestGeneration = 0;
+const apiKeysPath = "/manager/api/api-keys";
 
 const statusLabels = {
   queued: "排队",
@@ -298,7 +336,7 @@ function renderTasks(response) {
       const play = makeElement("button", "task-action play-action", "播放");
       play.type = "button";
       play.title = "播放生成视频";
-      play.addEventListener("click", () => window.open(item.video_url, "_blank", "noopener,noreferrer"));
+      play.addEventListener("click", () => openVideoPlayer(item));
       actions.append(play);
     }
     if (item.can_cancel) {
@@ -405,6 +443,7 @@ function resetNodeForm() {
   elements.configForm.reset();
   formField("version").value = "";
   formField("id").disabled = false;
+  formField("api_key").required = true;
   elements.deleteNode.hidden = true;
   state.editingNode = null;
   state.formDirty = false;
@@ -413,9 +452,11 @@ function resetNodeForm() {
 
 function fillNodeForm(node) {
   elements.configForm.reset();
-  ["id", "base_url", "jobs_base_url", "public_base_url", "health_path", "submit_api_name", "check_api_name", "poll_interval", "request_timeout", "version"].forEach((name) => {
+  ["id", "service_url", "protocol_version", "poll_interval", "request_timeout", "version"].forEach((name) => {
     formField(name).value = node[name] ?? "";
   });
+  formField("api_key").value = "";
+  formField("api_key").required = false;
   formField("enabled").checked = Boolean(node.enabled);
   formField("id").disabled = true;
   elements.deleteNode.hidden = false;
@@ -461,29 +502,201 @@ async function loadConfiguredNodes(selectedID = "") {
 function nodePayload(includeVersion) {
   const payload = {
     id: formField("id").value.trim(),
-    base_url: formField("base_url").value.trim(),
-    jobs_base_url: formField("jobs_base_url").value.trim(),
-    public_base_url: formField("public_base_url").value.trim(),
-    health_path: formField("health_path").value.trim(),
-    submit_api_name: formField("submit_api_name").value.trim(),
-    check_api_name: formField("check_api_name").value.trim(),
+    service_url: formField("service_url").value.trim(),
+    protocol_version: formField("protocol_version").value,
     poll_interval: formField("poll_interval").value.trim(),
     request_timeout: formField("request_timeout").value.trim(),
     enabled: formField("enabled").checked
   };
+  const apiKey = formField("api_key").value;
+  if (apiKey) payload.api_key = apiKey;
   if (includeVersion) payload.version = Number(formField("version").value);
   return payload;
 }
 
 function validateNodeForm() {
+	const id = formField("id");
+	id.value = id.value.trim();
+	id.setCustomValidity("");
+	if (id.value === "." || id.value === ".." || id.validity.patternMismatch) {
+		id.setCustomValidity("节点 ID 仅支持 1 至 64 位字母、数字、点、下划线或短横线");
+	}
   if (elements.configForm.reportValidity()) return true;
-  setNodeFormStatus("请完整填写节点配置", "error");
+	setNodeFormStatus(id.validationMessage || "请完整填写节点配置", "error");
   return false;
 }
 
+function setVideoPlayerStatus(message, kind = "") {
+  elements.videoPlayerStatus.className = `form-status${kind ? ` ${kind}` : ""}`;
+  elements.videoPlayerStatus.textContent = message;
+}
+
+function resetVideoPlayer() {
+  elements.videoPlayer.pause();
+  elements.videoPlayer.removeAttribute("src");
+  elements.videoPlayer.load();
+  elements.videoPlayerTitle.textContent = "任务视频";
+  setVideoPlayerStatus("");
+}
+
+function closeVideoPlayer() {
+  resetVideoPlayer();
+  if (elements.videoPlayerDialog.open) elements.videoPlayerDialog.close();
+}
+
+function openVideoPlayer(item) {
+  if (!item?.video_url) return;
+  resetVideoPlayer();
+  elements.videoPlayerTitle.textContent = `任务 ${item.id || "--"}`;
+  setVideoPlayerStatus("正在加载视频...");
+  elements.videoPlayer.src = item.video_url;
+  elements.videoPlayerDialog.showModal();
+  elements.videoPlayer.load();
+  elements.videoPlayer.play().catch(() => {});
+}
+
+function apiKeyErrorMessage(error) {
+  const type = error.payload?.error?.type;
+  if (type === "api_key_name_conflict") return "名称已存在";
+  if (type === "api_key_version_conflict") return "配置已变化，已重新加载列表";
+  if (type === "key_in_use") return "该密钥仍有关联任务或幂等记录，请停用后保留";
+  if (type === "cache_refresh_failed") return "服务暂时无法刷新密钥配置，操作未完成";
+  return error.message;
+}
+
+function setAPIKeyStatus(message, kind = "") {
+  elements.apiKeyStatus.className = `form-status${kind ? ` ${kind}` : ""}`;
+  elements.apiKeyStatus.textContent = message;
+}
+
+function setAPIKeyBusy(busy) {
+  state.apiKeyBusy = busy;
+  elements.apiKeyDialog.querySelectorAll("button, input").forEach((control) => { control.disabled = busy; });
+}
+
+function renderAPIKeys(enabledCount = state.apiKeys.filter((item) => item.enabled).length) {
+  elements.apiKeyCount.textContent = `启用 ${enabledCount} 个`;
+  elements.apiKeyWarning.hidden = enabledCount !== 0;
+  if (!state.apiKeys.length) {
+    elements.apiKeyList.replaceChildren(makeElement("p", "inline-state api-key-empty", "暂无对外 API Key"));
+    return;
+  }
+  elements.apiKeyList.replaceChildren(...state.apiKeys.map((item) => {
+    const row = makeElement("div", "api-key-row");
+    const details = makeElement("div", "api-key-details");
+    details.append(makeElement("strong", "api-key-name", item.name), makeElement("code", "api-key-mask", item.masked_key), statusPill(item.enabled ? "healthy" : "idle", item.enabled ? "已启用" : "已停用"));
+    const actions = makeElement("div", "api-key-actions");
+    const copy = makeElement("button", "", "复制"); copy.type = "button"; copy.disabled = !item.key; copy.title = item.key ? "复制完整密钥" : "该历史密钥没有可恢复的明文，请重新创建";
+    const rename = makeElement("button", "", "重命名"); rename.type = "button";
+    const toggle = makeElement("button", "", item.enabled ? "停用" : "启用"); toggle.type = "button";
+    const remove = makeElement("button", "danger-button", "删除"); remove.type = "button";
+    copy.addEventListener("click", () => copyStoredAPIKey(item));
+    rename.addEventListener("click", () => renameAPIKey(item));
+    toggle.addEventListener("click", () => updateAPIKey(item, { name: item.name, enabled: !item.enabled }));
+    remove.addEventListener("click", () => deleteAPIKey(item));
+    actions.append(copy, rename, toggle, remove); row.append(details, actions); return row;
+  }));
+}
+
+async function copyText(value) {
+  try {
+    if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
+    await navigator.clipboard.writeText(value);
+    return true;
+  } catch (_) {
+    const field = document.createElement("textarea"); field.value = value; field.setAttribute("readonly", ""); field.className = "clipboard-fallback"; document.body.append(field); field.select();
+    const copied = document.execCommand("copy"); field.value = ""; field.remove(); return copied;
+  }
+}
+
+async function copyStoredAPIKey(item) {
+  if (!item.key) { setAPIKeyStatus("该历史密钥没有可恢复的明文，请重新创建", "error"); return; }
+  const copied = await copyText(item.key);
+  setAPIKeyStatus(copied ? `已复制 ${item.name}` : "复制失败", copied ? "success" : "error");
+}
+
+async function loadAPIKeys() {
+  const requestGeneration = ++apiKeyRequestGeneration;
+  elements.apiKeyList.replaceChildren(makeElement("p", "inline-state", "正在加载密钥"));
+  setAPIKeyStatus("");
+  try {
+    const response = await requestJSON(apiKeysPath);
+    if (requestGeneration !== apiKeyRequestGeneration) return;
+    state.apiKeys = response.items || [];
+    renderAPIKeys(Number(response.enabled_count) || 0);
+  } catch (error) {
+    if (error.message !== "unauthorized" && requestGeneration === apiKeyRequestGeneration) {
+      elements.apiKeyList.replaceChildren(makeElement("p", "inline-state table-state error", "密钥加载失败"));
+      setAPIKeyStatus(apiKeyErrorMessage(error), "error");
+    }
+  }
+}
+
+async function openAPIKeys() {
+  elements.apiKeyDialog.showModal(); setAPIKeyBusy(true);
+  try { await loadAPIKeys(); } finally { setAPIKeyBusy(false); }
+}
+
+function showCreateAPIKey() {
+  elements.apiKeyForm.hidden = false; elements.apiKeyName.value = ""; setAPIKeyStatus(""); elements.apiKeyName.focus();
+}
+
+async function createAPIKey(event) {
+  event.preventDefault(); if (state.apiKeyBusy || !elements.apiKeyForm.reportValidity()) return;
+  const name = elements.apiKeyName.value.trim(); if (!name) return;
+  setAPIKeyBusy(true); setAPIKeyStatus("正在创建...");
+  try {
+    let created = await requestJSON(apiKeysPath, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+    state.oneTimeAPIKey = created.key;
+    created = null;
+    elements.apiKeySecret.textContent = state.oneTimeAPIKey;
+    elements.apiKeyCopyStatus.textContent = "";
+    elements.apiKeyForm.hidden = true;
+    elements.apiKeySecretDialog.showModal();
+    loadAPIKeys().catch(() => {});
+  } catch (error) { if (error.message !== "unauthorized") setAPIKeyStatus(apiKeyErrorMessage(error), "error"); }
+  finally { setAPIKeyBusy(false); }
+}
+
+async function updateAPIKey(item, changes) {
+  if (state.apiKeyBusy) return; setAPIKeyBusy(true);
+  try {
+    await requestJSON(`${apiKeysPath}/${encodeURIComponent(item.id)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...changes, version: item.version }) });
+    await loadAPIKeys(); setAPIKeyStatus("密钥已更新", "success");
+  } catch (error) { if (error.message !== "unauthorized") { setAPIKeyStatus(apiKeyErrorMessage(error), "error"); if (error.payload?.error?.type === "api_key_version_conflict") await loadAPIKeys(); } }
+  finally { setAPIKeyBusy(false); }
+}
+
+function renameAPIKey(item) {
+  const name = window.prompt("输入新的密钥名称", item.name); if (name === null || !name.trim() || name.trim() === item.name) return;
+  updateAPIKey(item, { name: name.trim(), enabled: item.enabled });
+}
+
+async function deleteAPIKey(item) {
+  if (state.apiKeyBusy || !window.confirm(`确认删除密钥 ${item.name}（${item.masked_key}）？`)) return;
+  setAPIKeyBusy(true);
+  try { await requestJSON(`${apiKeysPath}/${encodeURIComponent(item.id)}?version=${encodeURIComponent(item.version)}`, { method: "DELETE" }); await loadAPIKeys(); setAPIKeyStatus("密钥已删除", "success"); }
+  catch (error) { if (error.message !== "unauthorized") { setAPIKeyStatus(apiKeyErrorMessage(error), "error"); if (error.payload?.error?.type === "api_key_version_conflict") await loadAPIKeys(); } }
+  finally { setAPIKeyBusy(false); }
+}
+
+function clearOneTimeAPIKey() {
+  const selection = window.getSelection(); if (selection) selection.removeAllRanges();
+  elements.apiKeySecret.textContent = "";
+  elements.apiKeyCopyStatus.textContent = "";
+  state.oneTimeAPIKey = null;
+}
+
+function closeOneTimeAPIKey() { clearOneTimeAPIKey(); elements.apiKeySecretDialog.close(); }
+
+async function copyOneTimeAPIKey() {
+  if (!state.oneTimeAPIKey) return;
+  elements.apiKeyCopyStatus.textContent = await copyText(state.oneTimeAPIKey) ? "已复制" : "复制失败，请手动选择密钥";
+}
+
 function renderNodeProbe(checks) {
-  const label = (name, check) => `${name}${check?.ok ? "通过" : `失败（${check?.error_code || "未知错误"}）`}`;
-  return `${label("模型服务：", checks?.gradio)}；${label("任务服务：", checks?.jobs)}`;
+  const entries = Array.isArray(checks?.checks) ? checks.checks : [];
+  return entries.map((item) => `${item.name}：${item.status === "passed" ? "通过" : `失败（${item.error_code || "未知错误"}）`}`).join("；") || "节点未返回检查结果";
 }
 
 async function reloadConflictedNode(id, message) {
@@ -501,8 +714,10 @@ async function testNodeConnection() {
   setNodeBusy(true);
   setNodeFormStatus("正在测试连接...");
   try {
+    const payload = nodePayload(false);
+    if (state.editingNode && !payload.api_key) payload.use_stored_api_key = true;
     const checks = await requestJSON("/manager/api/nodes/test", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(nodePayload(false))
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
     });
     setNodeFormStatus(renderNodeProbe(checks), "success");
   } catch (error) {
@@ -577,6 +792,182 @@ function closeNodeConfiguration() {
   if (state.nodeBusy || !confirmDiscard()) return;
   elements.configDialog.close();
 }
+
+const ratios = ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"];
+const ratioDefaults = {
+  adaptive: [832, 480], "21:9": [1120, 480], "16:9": [832, 480], "4:3": [640, 480],
+  "1:1": [480, 480], "3:4": [480, 640], "9:16": [480, 832]
+};
+function profileField(name) { return elements.profileForm.elements.namedItem(name); }
+function setProfileStatus(message, kind = "") {
+  elements.profileStatus.className = `form-status${kind ? ` ${kind}` : ""}`;
+  elements.profileStatus.textContent = message;
+}
+function setProfileBusy(busy) {
+  state.profileBusy = busy;
+  elements.profileForm.querySelectorAll("input, select, button").forEach((control) => { control.disabled = busy || control.dataset.locked === "true"; });
+  document.getElementById("save-profile").disabled = busy;
+  elements.deleteProfile.disabled = busy;
+  document.getElementById("new-profile").disabled = busy;
+  document.getElementById("close-profile-config").disabled = busy;
+}
+function renderRatioRows(config = null) {
+  document.getElementById("ratio-rule").textContent = "同一配置覆盖文生、图生和全能参考；请维护 adaptive 与六种固定比例。";
+  const scale = profileField("restoration_enabled").checked ? Number(profileField("restoration_scale").value) : 1;
+  const rows = ratios.map((ratio) => {
+    const mapping = config?.ratios?.[ratio] || {};
+    const defaults = ratioDefaults[ratio];
+    const width = Number(mapping.base_width) || defaults[0];
+    const height = Number(mapping.base_height) || defaults[1];
+    const row = makeElement("div", "ratio-row");
+    const label = makeElement("span", "", ratio);
+    const widthInput = document.createElement("input"); widthInput.type = "number"; widthInput.min = "256"; widthInput.max = "4096"; widthInput.step = "32"; widthInput.value = String(width); widthInput.dataset.ratio = ratio; widthInput.dataset.dimension = "width";
+    const heightInput = document.createElement("input"); heightInput.type = "number"; heightInput.min = "256"; heightInput.max = "4096"; heightInput.step = "32"; heightInput.value = String(height); heightInput.dataset.ratio = ratio; heightInput.dataset.dimension = "height";
+    const target = makeElement("span", "ratio-target", `${width * scale} × ${height * scale}`);
+    row.append(label, widthInput, heightInput, target);
+    return row;
+  });
+  elements.ratioRows.replaceChildren(...rows);
+}
+function renderLoRAs(loras = []) {
+  const rows = Array.from({ length: 4 }, (_, index) => {
+    const row = makeElement("div", "lora-row");
+    const name = document.createElement("input"); name.placeholder = `LoRA ${index + 1} 文件名（选填）`; name.value = loras[index]?.name || ""; name.dataset.loraName = String(index);
+    const strength = document.createElement("input"); strength.type = "number"; strength.min = "-2"; strength.max = "2"; strength.step = "0.05"; strength.value = String(loras[index]?.strength ?? 1); strength.dataset.loraStrength = String(index);
+    row.append(name, strength); return row;
+  });
+  elements.loraRows.replaceChildren(...rows);
+}
+function defaultProfileConfig() {
+  return {
+    resolution: "",
+    generation: { model_mode: "high_quality", steps: 8, sage_attention: "auto", cache_mode: "easycache" },
+    ratios: Object.fromEntries(ratios.map((ratio) => [ratio, { base_width: ratioDefaults[ratio][0], base_height: ratioDefaults[ratio][1], target_width: ratioDefaults[ratio][0] * 3, target_height: ratioDefaults[ratio][1] * 3 }])),
+    loras: [], interpolation: { enabled: true, engine: "rife", scale: 2 }, restoration: { enabled: true, engine: "seedvr2", scale: 3 }
+  };
+}
+function cloneProfileConfig(config) { return JSON.parse(JSON.stringify(config)); }
+function profileNameKey(value) { return value.trim().replace(/[A-Z]/g, (letter) => letter.toLowerCase()); }
+function validProfileName(value) {
+  const name = value.trim();
+  return [...name].length >= 1 && [...name].length <= 32 && [...name].every((character) => /[A-Za-z0-9 _-]/.test(character) || /\p{Script=Han}/u.test(character));
+}
+function renderProfileTemplates(selectedID = "") {
+  const field = document.getElementById("profile-template-field");
+  const select = profileField("profile_template");
+  field.hidden = Boolean(state.profileDetail) || !state.profiles.length;
+  select.replaceChildren(...state.profiles.map((profile) => {
+    const option = document.createElement("option"); option.value = profile.id; option.textContent = profile.resolution; return option;
+  }));
+  if (state.profiles.length) select.value = selectedID || state.profileTemplateID || state.profileDetail?.id || state.profiles[0].id;
+}
+function fillProfile(detail = null, template = null) {
+  const config = detail?.config || (template?.config ? cloneProfileConfig(template.config) : defaultProfileConfig());
+  elements.profileForm.reset();
+  profileField("profile_id").value = detail?.id || "";
+  profileField("row_version").value = detail?.row_version || "";
+  profileField("resolution").value = detail ? config.resolution : "";
+  ["model_mode", "steps", "sage_attention", "cache_mode"].forEach((name) => { profileField(name).value = config.generation[name] ?? ""; });
+  profileField("interpolation_enabled").checked = Boolean(config.interpolation.enabled);
+  profileField("restoration_enabled").checked = Boolean(config.restoration.enabled);
+  profileField("restoration_engine").value = config.restoration.engine || "seedvr2";
+  profileField("restoration_scale").value = config.restoration.scale || 1;
+  renderRatioRows(config); renderLoRAs(config.loras || []);
+  state.profileDetail = detail;
+  profileField("resolution").disabled = Boolean(detail);
+  profileField("resolution").dataset.locked = detail ? "true" : "false";
+  elements.deleteProfile.hidden = !detail;
+  state.profileTemplateID = template?.id || "";
+  renderProfileTemplates(template?.id || "");
+  state.profileFormDirty = false;
+  setProfileStatus("");
+}
+function confirmDiscardProfileChanges() {
+  return !state.profileFormDirty || window.confirm("当前模型请求参数尚未保存，确认放弃修改？");
+}
+function profileConfigPayload() {
+  const scale = profileField("restoration_enabled").checked ? Number(profileField("restoration_scale").value) : 1;
+  const mappings = {};
+  ratios.forEach((ratio) => {
+    const width = Number(elements.ratioRows.querySelector(`[data-ratio="${ratio}"][data-dimension="width"]`).value);
+    const height = Number(elements.ratioRows.querySelector(`[data-ratio="${ratio}"][data-dimension="height"]`).value);
+    mappings[ratio] = { base_width: width, base_height: height, target_width: width * scale, target_height: height * scale };
+  });
+  const loras = [...elements.loraRows.querySelectorAll("[data-lora-name]")].map((input, index) => ({ name: input.value.trim(), strength: Number(elements.loraRows.querySelector(`[data-lora-strength="${index}"]`).value) })).filter((item) => item.name);
+  return {
+    resolution: profileField("resolution").value,
+    generation: { model_mode: profileField("model_mode").value, steps: Number(profileField("steps").value), sage_attention: profileField("sage_attention").value, cache_mode: profileField("cache_mode").value },
+    ratios: mappings, loras,
+    interpolation: { enabled: profileField("interpolation_enabled").checked, engine: "rife", scale: 2 },
+    restoration: { enabled: profileField("restoration_enabled").checked, engine: profileField("restoration_engine").value, scale: Number(profileField("restoration_scale").value) }
+  };
+}
+function renderProfileList() {
+  if (!state.profiles.length) { elements.profileList.replaceChildren(makeElement("p", "inline-state", "暂无配置")); return; }
+  elements.profileList.replaceChildren(...state.profiles.map((profile) => {
+    const button = makeElement("button", `config-node-button${state.profileDetail?.id === profile.id ? " active" : ""}`);
+    button.type = "button"; button.append(makeElement("strong", "", profile.resolution), makeElement("span", "muted", "修改后立即生效"));
+    button.addEventListener("click", () => { if (confirmDiscardProfileChanges()) loadProfileDetail(profile.id); }); return button;
+  }));
+}
+async function loadProfiles(selectedID = "") {
+  const response = await requestJSON("/manager/api/request-profiles");
+  state.profiles = response.items || []; renderProfileList();
+  const selected = selectedID || state.profiles[0]?.id;
+  if (selected) await loadProfileDetail(selected); else fillProfile();
+}
+async function loadProfileDetail(id) { const detail = await requestJSON(`/manager/api/request-profiles/${encodeURIComponent(id)}`); fillProfile(detail); renderProfileList(); }
+async function saveProfile(event) {
+  event.preventDefault(); if (state.profileBusy || !elements.profileForm.reportValidity()) return;
+  const name = profileField("resolution").value;
+  if (!validProfileName(name)) { setProfileStatus("逻辑分辨率名称应为 1-32 个中文、英文字母、数字、空格、- 或 _", "error"); profileField("resolution").focus(); return; }
+  if (!profileField("profile_id").value && state.profiles.some((item) => profileNameKey(item.resolution) === profileNameKey(name))) { setProfileStatus("逻辑分辨率名称已存在", "error"); return; }
+  setProfileBusy(true); setProfileStatus("正在保存...");
+  try { const id = profileField("profile_id").value; const payload = profileConfigPayload(); if (id) payload.row_version = Number(profileField("row_version").value); const saved = await requestJSON(id ? `/manager/api/request-profiles/${encodeURIComponent(id)}` : "/manager/api/request-profiles", { method: id ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }); state.profileFormDirty = false; await loadProfiles(saved.id); setProfileStatus("配置已保存并立即生效", "success"); } catch (error) { if (error.message !== "unauthorized") setProfileStatus(error.message, "error"); } finally { setProfileBusy(false); }
+}
+async function deleteProfile() { if (!state.profileDetail || !window.confirm(`确认删除 ${state.profileDetail.resolution} 配置？`)) return; setProfileBusy(true); try { await requestJSON(`/manager/api/request-profiles/${encodeURIComponent(state.profileDetail.id)}`, { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ row_version: state.profileDetail.row_version }) }); state.profileDetail = null; await loadProfiles(); setProfileStatus("配置已删除", "success"); } catch (error) { if (error.message !== "unauthorized") setProfileStatus(error.message, "error"); } finally { setProfileBusy(false); } }
+async function openProfileConfiguration() { elements.profileDialog.showModal(); setProfileBusy(true); try { await loadProfiles(); } catch (error) { if (error.message !== "unauthorized") setProfileStatus("配置加载失败", "error"); } finally { setProfileBusy(false); } }
+
+function bytesLabel(value) { const units = ["B", "KiB", "MiB", "GiB", "TiB"]; let size = Number(value) || 0; let index = 0; while (size >= 1024 && index < units.length - 1) { size /= 1024; index += 1; } return `${size.toFixed(index ? 1 : 0)} ${units[index]}`; }
+function setCleanupStatus(message, kind = "") { elements.cleanupFormStatus.className = `form-status${kind ? ` ${kind}` : ""}`; elements.cleanupFormStatus.textContent = message; }
+async function previewCleanup(event) { event.preventDefault(); setCleanupStatus("正在计算候选文件..."); try { const preview = await requestJSON("/manager/api/artifact-cleanups/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ older_than_days: Number(document.getElementById("cleanup-days").value) }) }); state.cleanupPreview = preview; elements.cleanupPreview.hidden = false; elements.cleanupProgress.hidden = true; document.getElementById("cleanup-count").textContent = String(preview.candidate_count); document.getElementById("cleanup-bytes").textContent = bytesLabel(preview.candidate_bytes); document.getElementById("cleanup-cutoff").textContent = new Date(preview.cutoff_at).toLocaleString("zh-CN", { hour12: false }); document.getElementById("cleanup-node-summary").textContent = (preview.by_node || []).map((item) => `${item.node_id}: ${item.count} 个 / ${bytesLabel(item.bytes)}`).join("；") || "没有候选文件"; document.getElementById("cleanup-confirmation").placeholder = `DELETE ${preview.candidate_count} ARTIFACTS`; setCleanupStatus(preview.candidate_count ? "预览不会删除文件，请核对后确认" : "没有符合条件的视频", "success"); } catch (error) { if (error.message !== "unauthorized") setCleanupStatus(error.message, "error"); } }
+async function confirmCleanup() { const preview = state.cleanupPreview; if (!preview) return; const confirmation = document.getElementById("cleanup-confirmation").value.trim(); if (confirmation !== `DELETE ${preview.candidate_count} ARTIFACTS`) { setCleanupStatus("确认文本不匹配", "error"); return; } if (!window.confirm(`确认删除 ${preview.candidate_count} 个物理文件？此操作不可恢复。`)) return; try { const job = await requestJSON("/manager/api/artifact-cleanups", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ preview_token: preview.preview_token, confirmation }) }); state.cleanupID = job.cleanup_id; elements.cleanupPreview.hidden = true; elements.cleanupProgress.hidden = false; setCleanupStatus("清理作业已创建", "success"); await loadCleanupProgress(); } catch (error) { if (error.message !== "unauthorized") setCleanupStatus(error.message, "error"); } }
+async function loadCleanupProgress() { if (!state.cleanupID) return; try { const job = await requestJSON(`/manager/api/artifact-cleanups/${encodeURIComponent(state.cleanupID)}`); const completed = Number(job.succeeded_count) + Number(job.failed_count) + Number(job.skipped_count); const percent = job.total_count ? Math.min(100, completed / job.total_count * 100) : 100; document.getElementById("cleanup-status").textContent = job.status; document.getElementById("cleanup-status").className = `status-pill status-${job.status === "succeeded" ? "succeeded" : job.failed_count ? "failed" : "running"}`; document.getElementById("cleanup-progress-bar").style.width = `${percent}%`; document.getElementById("cleanup-progress-summary").textContent = `完成 ${job.succeeded_count}/${job.total_count} · 失败 ${job.failed_count} · 已释放 ${bytesLabel(job.deleted_bytes)}`; document.getElementById("retry-cleanup").hidden = !job.failed_count; const response = await requestJSON(`/manager/api/artifact-cleanups/${encodeURIComponent(state.cleanupID)}/items?limit=100`); document.getElementById("cleanup-items").replaceChildren(...(response.items || []).map((item) => makeElement("div", "cleanup-item", `${item.node_id} · ${item.status} · ${item.artifact_id}${item.last_error_code ? ` · ${item.last_error_code}` : ""}`))); if (!["succeeded", "failed", "partial_failed"].includes(job.status)) { window.clearTimeout(state.cleanupTimer); state.cleanupTimer = window.setTimeout(loadCleanupProgress, 2000); } } catch (error) { if (error.message !== "unauthorized") setCleanupStatus("清理进度加载失败", "error"); } }
+async function retryCleanup() { try { await requestJSON(`/manager/api/artifact-cleanups/${encodeURIComponent(state.cleanupID)}/retry`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }); await loadCleanupProgress(); } catch (error) { if (error.message !== "unauthorized") setCleanupStatus(error.message, "error"); } }
+
+document.getElementById("open-profile-config").addEventListener("click", openProfileConfiguration);
+document.getElementById("close-profile-config").addEventListener("click", () => { if (!state.profileBusy && confirmDiscardProfileChanges()) elements.profileDialog.close(); });
+elements.profileDialog.addEventListener("cancel", (event) => { event.preventDefault(); if (!state.profileBusy && confirmDiscardProfileChanges()) elements.profileDialog.close(); });
+document.getElementById("new-profile").addEventListener("click", () => { if (confirmDiscardProfileChanges()) fillProfile(null, state.profileDetail || state.profiles[0] || null); });
+profileField("profile_template").addEventListener("change", () => {
+  if (!confirmDiscardProfileChanges()) { renderProfileTemplates(state.profileTemplateID); return; }
+  const template = state.profiles.find((item) => item.id === profileField("profile_template").value);
+  const currentName = profileField("resolution").value;
+  if (template) { fillProfile(null, template); profileField("resolution").value = currentName; }
+});
+elements.profileForm.addEventListener("input", (event) => { if (event.target.name !== "profile_template") state.profileFormDirty = true; });
+profileField("restoration_enabled").addEventListener("change", () => renderRatioRows(profileConfigPayload()));
+profileField("restoration_scale").addEventListener("change", () => renderRatioRows(profileConfigPayload()));
+elements.profileForm.addEventListener("submit", saveProfile); elements.deleteProfile.addEventListener("click", deleteProfile);
+document.getElementById("open-cleanup").addEventListener("click", () => elements.cleanupDialog.showModal());
+document.getElementById("close-cleanup").addEventListener("click", () => { window.clearTimeout(state.cleanupTimer); elements.cleanupDialog.close(); });
+document.getElementById("cleanup-preview-form").addEventListener("submit", previewCleanup); document.getElementById("confirm-cleanup").addEventListener("click", confirmCleanup); document.getElementById("retry-cleanup").addEventListener("click", retryCleanup);
+document.getElementById("open-api-keys").addEventListener("click", openAPIKeys);
+document.getElementById("close-api-keys").addEventListener("click", () => { if (!state.apiKeyBusy) elements.apiKeyDialog.close(); });
+document.getElementById("new-api-key").addEventListener("click", showCreateAPIKey);
+document.getElementById("cancel-api-key").addEventListener("click", () => { elements.apiKeyForm.hidden = true; elements.apiKeyName.value = ""; setAPIKeyStatus(""); });
+elements.apiKeyForm.addEventListener("submit", createAPIKey);
+document.getElementById("copy-api-key").addEventListener("click", copyOneTimeAPIKey);
+document.getElementById("close-api-key-secret").addEventListener("click", closeOneTimeAPIKey);
+document.getElementById("confirm-api-key-saved").addEventListener("click", closeOneTimeAPIKey);
+elements.apiKeySecretDialog.addEventListener("cancel", (event) => { event.preventDefault(); closeOneTimeAPIKey(); });
+elements.apiKeySecretDialog.addEventListener("close", clearOneTimeAPIKey);
+document.getElementById("close-video-player").addEventListener("click", () => closeVideoPlayer());
+elements.videoPlayerDialog.addEventListener("cancel", (event) => { event.preventDefault(); closeVideoPlayer(); });
+elements.videoPlayerDialog.addEventListener("close", resetVideoPlayer);
+elements.videoPlayer.addEventListener("loadstart", () => setVideoPlayerStatus("正在加载视频..."));
+elements.videoPlayer.addEventListener("canplay", () => setVideoPlayerStatus(""));
+elements.videoPlayer.addEventListener("error", () => setVideoPlayerStatus("视频加载失败，请关闭后重试", "error"));
 
 async function poll() {
   if (state.polling) return;

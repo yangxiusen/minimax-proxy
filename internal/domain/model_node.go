@@ -16,6 +16,13 @@ var (
 )
 
 type ModelNodeInput struct {
+	ServiceURL        string
+	ProtocolVersion   string
+	APIKeyCiphertext  []byte
+	APIKeyNonce       []byte
+	APIKeyFingerprint string
+
+	// Legacy 字段只用于读取和运行升级前的 gradio-v1 节点。
 	ID             string
 	BaseURL        string
 	JobsBaseURL    string
@@ -26,6 +33,10 @@ type ModelNodeInput struct {
 	PollInterval   time.Duration
 	RequestTimeout time.Duration
 	Enabled        bool
+}
+
+func (input ModelNodeInput) UsesNodeAPI() bool {
+	return input.ProtocolVersion == "h3-node-v1"
 }
 
 type ModelNode struct {

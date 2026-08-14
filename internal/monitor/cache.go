@@ -60,6 +60,7 @@ type NodeSnapshot struct {
 	Disabled           bool                  `json:"-"`
 	Applying           bool                  `json:"-"`
 	SchedulingBlocked  bool                  `json:"-"`
+	Capabilities       map[string]any        `json:"-"`
 }
 
 type Cache struct {
@@ -147,6 +148,9 @@ func (c *Cache) AvailableFresh(now time.Time, maxAge time.Duration) bool {
 }
 
 func cloneNode(node NodeSnapshot) NodeSnapshot {
+	if node.Capabilities != nil {
+		node.Capabilities = cloneMap(node.Capabilities)
+	}
 	if node.PrivateQueue != nil {
 		value := *node.PrivateQueue
 		node.PrivateQueue = &value
@@ -182,6 +186,25 @@ func cloneNode(node NodeSnapshot) NodeSnapshot {
 	return node
 }
 
+func cloneMap(source map[string]any) map[string]any {
+	result := make(map[string]any, len(source))
+	for key, value := range source {
+		switch typed := value.(type) {
+		case map[string]any:
+			result[key] = cloneMap(typed)
+		case []any:
+			result[key] = append([]any(nil), typed...)
+		case []string:
+			result[key] = append([]string(nil), typed...)
+		case []int:
+			result[key] = append([]int(nil), typed...)
+		default:
+			result[key] = value
+		}
+	}
+	return result
+}
+
 func normalizeNode(node NodeSnapshot) NodeSnapshot {
 	if node.Health == "" {
 		node.Health = HealthUnknown
@@ -207,6 +230,8 @@ func sanitizeError(code string) *ErrorSnapshot {
 		return &ErrorSnapshot{Code: code, Summary: "私有任务服务连接失败"}
 	case "upstream_cancel_unconfirmed":
 		return &ErrorSnapshot{Code: code, Summary: "私有任务中止状态待确认"}
+	case "node_api_unhealthy":
+		return &ErrorSnapshot{Code: code, Summary: "模型节点 API 健康检查失败"}
 	default:
 		return &ErrorSnapshot{Code: "upstream_error", Summary: "私有服务异常"}
 	}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -16,46 +17,51 @@ import (
 	"minimax-h3-tc/internal/domain"
 )
 
-const nodeRequestBodyLimit = 32 << 10
+const nodeRequestBodyLimit = 64 << 10
 
 type nodeRequest struct {
-	ID             string `json:"id"`
-	BaseURL        string `json:"base_url"`
-	JobsBaseURL    string `json:"jobs_base_url"`
-	PublicBaseURL  string `json:"public_base_url"`
-	HealthPath     string `json:"health_path"`
-	SubmitAPIName  string `json:"submit_api_name"`
-	CheckAPIName   string `json:"check_api_name"`
-	PollInterval   string `json:"poll_interval"`
-	RequestTimeout string `json:"request_timeout"`
-	Enabled        *bool  `json:"enabled"`
-	Version        *int64 `json:"version"`
+	ID              string  `json:"id"`
+	ServiceURL      string  `json:"service_url"`
+	ProtocolVersion string  `json:"protocol_version"`
+	APIKey          *string `json:"api_key,omitempty"`
+	UseStoredAPIKey bool    `json:"use_stored_api_key,omitempty"`
+	PollInterval    string  `json:"poll_interval"`
+	RequestTimeout  string  `json:"request_timeout"`
+	Enabled         *bool   `json:"enabled"`
+	Version         *int64  `json:"version"`
 }
 
 type nodeDTO struct {
-	ID             string `json:"id"`
-	BaseURL        string `json:"base_url"`
-	JobsBaseURL    string `json:"jobs_base_url"`
-	PublicBaseURL  string `json:"public_base_url"`
-	HealthPath     string `json:"health_path"`
-	SubmitAPIName  string `json:"submit_api_name"`
-	CheckAPIName   string `json:"check_api_name"`
-	PollInterval   string `json:"poll_interval"`
-	RequestTimeout string `json:"request_timeout"`
-	Enabled        bool   `json:"enabled"`
-	Version        int64  `json:"version"`
-	CreatedAt      int64  `json:"created_at"`
-	UpdatedAt      int64  `json:"updated_at"`
+	ID                string `json:"id"`
+	ServiceURL        string `json:"service_url"`
+	ProtocolVersion   string `json:"protocol_version"`
+	APIKeyFingerprint string `json:"api_key_fingerprint,omitempty"`
+	APIKeyConfigured  bool   `json:"api_key_configured"`
+	PollInterval      string `json:"poll_interval"`
+	RequestTimeout    string `json:"request_timeout"`
+	Enabled           bool   `json:"enabled"`
+	Version           int64  `json:"version"`
+	CreatedAt         int64  `json:"created_at"`
+	UpdatedAt         int64  `json:"updated_at"`
 }
 
 type NodeCheck struct {
-	OK        bool   `json:"ok"`
+	Name      string `json:"name"`
+	Status    string `json:"status"`
 	ErrorCode string `json:"error_code,omitempty"`
 }
 
+type NodeProbeInput struct {
+	Node   domain.ModelNodeInput
+	APIKey string
+}
+
 type NodeProbeResult struct {
-	Gradio NodeCheck `json:"gradio"`
-	Jobs   NodeCheck `json:"jobs"`
+	Reachable       bool           `json:"reachable"`
+	Authenticated   bool           `json:"authenticated"`
+	ProtocolVersion string         `json:"protocol_version,omitempty"`
+	Checks          []NodeCheck    `json:"checks"`
+	Capabilities    map[string]any `json:"capabilities,omitempty"`
 }
 
 func (h *handler) listNodes(w http.ResponseWriter, r *http.Request) {
@@ -80,12 +86,12 @@ func (h *handler) createNode(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if request.Version != nil {
-		h.writeError(w, http.StatusBadRequest, "bad_request_error", "创建节点不能包含 version")
+	if request.Version != nil || request.UseStoredAPIKey {
+		h.writeError(w, http.StatusBadRequest, "bad_request_error", "创建节点不能包含 version 或 use_stored_api_key")
 		return
 	}
 	input, ok := h.normalizeNodeRequest(w, request, true)
-	if !ok {
+	if !ok || !h.encryptNodeKey(w, r, request.APIKey, &input) {
 		return
 	}
 	if h.nodes == nil {
@@ -98,7 +104,7 @@ func (h *handler) createNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.wakeRegistry()
-	h.logger.InfoContext(r.Context(), "管理员已新增模型服务节点", "node_id", node.ID, "stage", "node_create")
+	h.logger.InfoContext(r.Context(), "管理员已新增模型服务节点", "node_id", node.ID, "key_fingerprint", node.APIKeyFingerprint, "stage", "node_create")
 	w.Header().Set("Location", "/manager/api/nodes/"+node.ID)
 	h.writeJSON(w, http.StatusCreated, makeNodeDTO(node))
 }
@@ -109,8 +115,8 @@ func (h *handler) updateNode(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if request.ID != "" {
-		h.writeError(w, http.StatusBadRequest, "bad_request_error", "更新节点不能包含 id")
+	if request.ID != "" || request.UseStoredAPIKey {
+		h.writeError(w, http.StatusBadRequest, "bad_request_error", "更新节点不能包含 id 或 use_stored_api_key")
 		return
 	}
 	if request.Version == nil || *request.Version < 1 {
@@ -118,13 +124,31 @@ func (h *handler) updateNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	request.ID = id
-	input, ok := h.normalizeNodeRequest(w, request, true)
+	input, ok := h.normalizeNodeRequest(w, request, false)
 	if !ok {
 		return
 	}
-	if h.nodes == nil {
-		h.internalError(w, r, errors.New("manager node store is nil"))
-		return
+	if request.APIKey != nil && *request.APIKey != "" {
+		if !h.encryptNodeKey(w, r, request.APIKey, &input) {
+			return
+		}
+	} else {
+		if h.nodes == nil {
+			h.internalError(w, r, errors.New("manager node store is nil"))
+			return
+		}
+		current, err := h.nodes.GetModelNode(r.Context(), id)
+		if err != nil {
+			h.writeNodeError(w, r, err)
+			return
+		}
+		if len(current.APIKeyCiphertext) == 0 || len(current.APIKeyNonce) == 0 {
+			h.writeError(w, http.StatusBadRequest, "bad_request_error", "升级为 H3 节点时必须提供 api_key")
+			return
+		}
+		input.APIKeyCiphertext = append([]byte(nil), current.APIKeyCiphertext...)
+		input.APIKeyNonce = append([]byte(nil), current.APIKeyNonce...)
+		input.APIKeyFingerprint = current.APIKeyFingerprint
 	}
 	node, err := h.nodes.UpdateModelNode(r.Context(), id, *request.Version, input)
 	if err != nil {
@@ -132,7 +156,7 @@ func (h *handler) updateNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.wakeRegistry()
-	h.logger.InfoContext(r.Context(), "管理员已更新模型服务节点", "node_id", node.ID, "stage", "node_update")
+	h.logger.InfoContext(r.Context(), "管理员已更新模型服务节点", "node_id", node.ID, "key_fingerprint", node.APIKeyFingerprint, "stage", "node_update")
 	h.writeJSON(w, http.StatusOK, makeNodeDTO(node))
 }
 
@@ -174,7 +198,11 @@ func (h *handler) testNode(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusBadRequest, "bad_request_error", "连接测试不能包含 version")
 		return
 	}
-	input, ok := h.normalizeNodeRequest(w, request, true)
+	input, ok := h.normalizeNodeRequest(w, request, request.UseStoredAPIKey)
+	if !ok {
+		return
+	}
+	apiKey, ok := h.resolveProbeKey(w, r, request, &input)
 	if !ok {
 		return
 	}
@@ -184,8 +212,8 @@ func (h *handler) testNode(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), input.RequestTimeout)
 	defer cancel()
-	checks := h.probeNode(ctx, input)
-	if checks.Gradio.OK && checks.Jobs.OK {
+	checks := h.probeNode(ctx, NodeProbeInput{Node: input, APIKey: apiKey})
+	if checks.Reachable && checks.Authenticated && checks.ProtocolVersion == "h3-node-v1" {
 		h.writeJSON(w, http.StatusOK, checks)
 		return
 	}
@@ -193,10 +221,67 @@ func (h *handler) testNode(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusBadGateway)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error":  map[string]string{"type": "node_probe_failed", "message": "模型服务连接测试未全部通过"},
+		"error":  map[string]string{"type": "node_probe_failed", "message": "模型服务连接测试未通过"},
 		"checks": checks,
 	})
 }
+
+func (h *handler) resolveProbeKey(w http.ResponseWriter, r *http.Request, request nodeRequest, input *domain.ModelNodeInput) (string, bool) {
+	if !request.UseStoredAPIKey {
+		if request.APIKey == nil || !validNodeAPIKey(*request.APIKey) {
+			h.writeError(w, http.StatusBadRequest, "bad_request_error", "api_key 必须是 32 位字母或数字")
+			return "", false
+		}
+		return *request.APIKey, true
+	}
+	if request.APIKey != nil || h.nodes == nil {
+		h.writeError(w, http.StatusBadRequest, "bad_request_error", "使用已保存密钥时不能传 api_key")
+		return "", false
+	}
+	current, err := h.nodes.GetModelNode(r.Context(), input.ID)
+	if err != nil {
+		h.writeNodeError(w, r, err)
+		return "", false
+	}
+	if len(current.APIKeyCiphertext) == 0 || len(current.APIKeyNonce) == 0 {
+		h.writeError(w, http.StatusBadRequest, "bad_request_error", "节点没有已保存的 API Key，请填写 api_key")
+		return "", false
+	}
+	if h.nodeSecrets == nil {
+		h.writeError(w, http.StatusServiceUnavailable, "master_key_missing", "节点密钥主密钥未配置")
+		return "", false
+	}
+	apiKey, err := h.nodeSecrets.Open(current.APIKeyNonce, current.APIKeyCiphertext)
+	if err != nil {
+		h.internalError(w, r, errors.New("节点 API Key 解密失败"))
+		return "", false
+	}
+	return apiKey, true
+}
+
+func (h *handler) encryptNodeKey(w http.ResponseWriter, r *http.Request, apiKey *string, input *domain.ModelNodeInput) bool {
+	if apiKey == nil || !validNodeAPIKey(*apiKey) {
+		h.writeError(w, http.StatusBadRequest, "bad_request_error", "api_key 必须是 32 位字母或数字")
+		return false
+	}
+	if h.nodeSecrets == nil {
+		h.writeError(w, http.StatusServiceUnavailable, "master_key_missing", "节点密钥主密钥未配置")
+		return false
+	}
+	nonce, ciphertext, fingerprint, err := h.nodeSecrets.Seal(*apiKey)
+	if err != nil {
+		h.internalError(w, r, errors.New("节点 API Key 加密失败"))
+		return false
+	}
+	input.APIKeyNonce = nonce
+	input.APIKeyCiphertext = ciphertext
+	input.APIKeyFingerprint = fingerprint
+	return true
+}
+
+var nodeAPIKeyPattern = regexp.MustCompile(`^[A-Za-z0-9]{32}$`)
+
+func validNodeAPIKey(value string) bool { return nodeAPIKeyPattern.MatchString(value) }
 
 func (h *handler) readNodeRequest(w http.ResponseWriter, r *http.Request) (nodeRequest, bool) {
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -214,11 +299,6 @@ func (h *handler) readNodeRequest(w http.ResponseWriter, r *http.Request) (nodeR
 	decoder.DisallowUnknownFields()
 	var request nodeRequest
 	if err := decoder.Decode(&request); err != nil {
-		h.writeError(w, http.StatusBadRequest, "bad_request_error", "请求 JSON 无效")
-		return nodeRequest{}, false
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		h.writeError(w, http.StatusBadRequest, "bad_request_error", "请求 JSON 无效")
 		return nodeRequest{}, false
 	}
@@ -254,8 +334,8 @@ func validUniqueNodeObject(body []byte) bool {
 	return errors.Is(decoder.Decode(&extra), io.EOF)
 }
 
-func (h *handler) normalizeNodeRequest(w http.ResponseWriter, request nodeRequest, requireEnabled bool) (domain.ModelNodeInput, bool) {
-	if requireEnabled && request.Enabled == nil {
+func (h *handler) normalizeNodeRequest(w http.ResponseWriter, request nodeRequest, allowMissingEnabled bool) (domain.ModelNodeInput, bool) {
+	if !allowMissingEnabled && request.Enabled == nil {
 		h.writeError(w, http.StatusBadRequest, "bad_request_error", "enabled 为必填字段")
 		return domain.ModelNodeInput{}, false
 	}
@@ -270,8 +350,7 @@ func (h *handler) normalizeNodeRequest(w http.ResponseWriter, request nodeReques
 		return domain.ModelNodeInput{}, false
 	}
 	input := domain.ModelNodeInput{
-		ID: strings.TrimSpace(request.ID), BaseURL: request.BaseURL, JobsBaseURL: request.JobsBaseURL, PublicBaseURL: request.PublicBaseURL,
-		HealthPath: request.HealthPath, SubmitAPIName: request.SubmitAPIName, CheckAPIName: request.CheckAPIName,
+		ID: strings.TrimSpace(request.ID), ServiceURL: request.ServiceURL, ProtocolVersion: request.ProtocolVersion,
 		PollInterval: pollInterval, RequestTimeout: requestTimeout, Enabled: request.Enabled != nil && *request.Enabled,
 	}
 	normalized, _, err := config.NormalizeModelNode(input)
@@ -306,9 +385,17 @@ func (h *handler) wakeRegistry() {
 }
 
 func makeNodeDTO(node domain.ModelNode) nodeDTO {
+	serviceURL := node.ServiceURL
+	if serviceURL == "" {
+		serviceURL = node.BaseURL
+	}
+	protocol := node.ProtocolVersion
+	if protocol == "" {
+		protocol = "legacy-gradio-v1"
+	}
 	return nodeDTO{
-		ID: node.ID, BaseURL: node.BaseURL, JobsBaseURL: node.JobsBaseURL, PublicBaseURL: node.PublicBaseURL,
-		HealthPath: node.HealthPath, SubmitAPIName: node.SubmitAPIName, CheckAPIName: node.CheckAPIName,
+		ID: node.ID, ServiceURL: serviceURL, ProtocolVersion: protocol,
+		APIKeyFingerprint: node.APIKeyFingerprint, APIKeyConfigured: len(node.APIKeyCiphertext) > 0,
 		PollInterval: node.PollInterval.String(), RequestTimeout: node.RequestTimeout.String(), Enabled: node.Enabled,
 		Version: node.Version, CreatedAt: unixTime(node.CreatedAt), UpdatedAt: unixTime(node.UpdatedAt),
 	}

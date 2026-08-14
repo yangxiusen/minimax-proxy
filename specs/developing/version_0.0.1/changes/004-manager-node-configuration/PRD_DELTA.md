@@ -1,5 +1,7 @@
 # 管理后台与模型节点配置需求增量
 
+> 模型节点凭据需求以 `006-node-single-key-conf` 为准：管理端只配置一个 32 位字母数字 API Key；本文中的 Key ID、scope 和复合 Token 描述已失效。
+
 ## 1. 页面定位变化
 
 现有“MiniMax H3 运行监控”升级为“MiniMax H3 管理后台”，主路径从 `/monitor` 迁移到 `/manager`。任务列表、任务中止/删除/播放和私有服务监控能力全部保留。
@@ -48,3 +50,68 @@
 - 节点 ID 仅允许字母、数字、点、下划线和连字符，长度 1 至 64，创建后永久保留且不可复用。
 - 管理接口不得返回数据库内部主键、软删除记录或原始上游错误。
 - 日志只记录节点 ID、动作、阶段和稳定错误码，不记录节点 URL 或请求体。
+
+## 7. H3 Node API 契约修订需求
+
+### 7.1 节点协议升级
+
+- `legacy-gradio-v1` 节点在列表和编辑区必须显示真实协议，不能被下拉框静默改写为 `h3-node-v1`。
+- 旧节点的普通保存仅允许修改启停状态；转换协议使用独立“升级到 H3 Node API”命令，并要求重新确认服务地址、Key ID 和 Secret。
+- H3 节点编辑时，只有数据库已存在完整加密密钥时才能选择“沿用已保存密钥”；旧节点或密钥记录不完整时必须输入新 Secret。
+- 保存失败必须保留输入，并返回字段级稳定错误。`node_api_key_required` 表示缺少升级凭据，不能返回 `server_error`。
+
+### 7.2 凭据与授权
+
+- 管理员填写的 Key ID 对应 MiniMax-H3 `H3_API_KEYS[].key_id`；Secret 是生成 Argon2id 摘要前的原始随机值。
+- Key ID 必须与 Node 规则一致：1 至 64 位，正则 `^[A-Za-z0-9_-]+$`，不得包含点号；Secret 继续采用 Proxy 的 32 至 512 位安全下限。
+- Proxy 只加密存储 Secret，Key ID 明文存储用于标识；出站请求统一组装 `Bearer <key_id>.<secret>`，任何日志和响应都不得包含完整 Token 或 Secret。
+- 节点连接测试除健康、协议和能力外，还要验证当前凭据至少拥有 `health`、`execute`、`artifact:read`、`artifact:write`、`artifact:delete`。缺少权限返回明确检查结果，不允许以“健康”掩盖后续执行必然失败。
+
+### 7.3 取消与不确定结果恢复
+
+- 管理员或公共 API 对已提交的 H3 任务发起取消后，Proxy 必须调用 Node 的执行取消接口，并持续查询至 `cancelled` 或其他明确终态。
+- 取消中的任务不得被标记为成功；若节点已经成功，则按已完成任务的现有删除语义处理，不能伪造取消。
+- 创建执行请求超时或连接中断时，Proxy 必须使用同一 `operation_id` 重试，利用 Node 幂等语义找回原执行，不能新建 attempt 导致重复生成。
+- 查询执行状态短暂失败时保留原 `execution_id` 和 attempt，继续查询同一执行；只有收到明确不可重试错误或超过恢复预算才结束 attempt。
+- 配置测试任务超时或由管理员取消时，也应尽力调用 Node 取消，避免测试执行在后台长期运行。
+
+### 7.4 接口和配置能力边界
+
+- MiniMax-H3 发布的 `h3-node-v1` 共 12 条路由必须保持完整；Proxy v0.0.1 有意消费其中 9 条。
+- `/maintenance/cleanup/preview`、`/maintenance/cleanup`、`/maintenance/cleanup/{operation_id}` 由 Node 提供，但 Proxy 不消费，因为 Proxy 已按逻辑任务和制品位置管理清理。
+- Node 的请求校验、认证、业务错误都必须返回统一 `error.code/message/retryable/request_id/details` 包；Proxy 按 HTTP 状态和 `retryable` 判定重试。
+- 当前 H3 Node 生成参数不支持 `cfg`。管理页面移除 CFG 输入，Proxy 新配置不再保存或冻结该字段；历史快照中的 CFG 只读兼容并忽略，不影响旧任务恢复。
+
+## 8. 任务顺序、播放与结果地址需求
+
+### 8.1 整任务 FIFO
+
+- 单节点正常执行时，先创建任务的全部必需阶段应连续优先于后创建任务的首阶段。
+- 任务内阶段仍严格按 `stage_order` 串行，前序阶段未成功或跳过时不得领取后序阶段。
+- 多节点环境允许不同任务并行；“FIFO”约束的是每个节点下一次领取时选择最早的可执行任务，不保证耗时不同的任务按创建顺序完成。
+- 最早任务的下一阶段因 `preferred_node_id` 不匹配、`next_attempt_at` 未到或前序阶段未结束而不可执行时，不阻塞其他节点领取其可执行任务。
+- 重启恢复中的活动阶段继续限定到原 `current_node_id`，不得为了 FIFO 新建 execution 或迁移未知执行。
+
+### 8.2 Manager 视频播放
+
+- 已成功且存在可访问最终制品的任务在“操作”列显示“播放”；其他状态不显示。
+- 点击“播放”在管理后台内打开视频弹窗，提供浏览器原生播放、暂停、进度和音量控件。
+- 弹窗加载失败时显示稳定错误提示，不展示 Node 地址或内部错误。
+- 关闭弹窗必须暂停播放、移除 `src` 并释放媒体资源；任务列表自动刷新不能中断已打开的播放。
+- `video_url` 使用与公共 API 相同的 Proxy 签名文件地址；历史任务只有合法 `result_public_url` 时允许兼容播放。
+
+### 8.3 公共结果绝对 URL
+
+- `GET /v2/query/video_generation/{task_id}` 和 `GET /v2/query/video_generation` 的成功任务必须返回绝对 `content.url`。
+- 新制品地址格式为 `{server.public_base_url}/v2/files/{artifact_id}/content?expires=...&signature=...`。
+- `server.public_base_url` 必须是调用方可访问的 HTTP/HTTPS Proxy 根地址，不得包含凭据、查询、片段或非根路径。
+- 本机部署可配置为 `http://127.0.0.1:18081`；跨机器调用必须配置反向代理域名或调用方可达地址。
+- `http://127.0.0.1:7860` 是 Node API 地址，其受 Node Key 保护且不提供 `/v2/files`，不得用于公共 `content.url`。
+- 服务不从请求 `Host`、`Forwarded` 或 `X-Forwarded-*` 推导公开地址，防止主机头注入并确保回调、单查和列表返回一致。
+
+### 8.4 兼容性
+
+- `server.public_base_url` 在本修订发布后为必填启动配置；示例、Docker 和正式配置须同步。
+- `content.url` 从相对路径变为绝对路径，字段名、签名参数和文件接口不变。
+- 已保存 `result_artifact_id` 的历史成功任务查询时即时生成新签名 URL，无需数据库迁移。
+- 仅有历史 `result_public_url` 的旧任务继续返回已校验的原地址，不尝试拼接 Node URL。

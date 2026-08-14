@@ -10,7 +10,7 @@ import (
 	"minimax-h3-tc/internal/domain"
 )
 
-const modelNodeSelect = `SELECT id,base_url,jobs_base_url,public_base_url,health_path,submit_api_name,check_api_name,poll_interval_ms,request_timeout_ms,enabled,version,created_at,updated_at FROM model_service_nodes`
+const modelNodeSelect = `SELECT id,service_url,protocol_version,COALESCE(api_key_ciphertext,X''),COALESCE(api_key_nonce,X''),COALESCE(api_key_fingerprint,''),COALESCE(api_key_id,''),base_url,jobs_base_url,public_base_url,health_path,submit_api_name,check_api_name,poll_interval_ms,request_timeout_ms,enabled,version,created_at,updated_at FROM model_service_nodes`
 
 func (s *Store) ListModelNodes(ctx context.Context) ([]domain.ModelNode, error) {
 	rows, err := s.db.QueryContext(ctx, modelNodeSelect+` WHERE deleted_at IS NULL ORDER BY id`)
@@ -51,8 +51,10 @@ func (s *Store) CreateModelNode(ctx context.Context, input domain.ModelNodeInput
 		return domain.ModelNode{}, domain.ErrNodeIDConflict
 	}
 	now := s.nowUnix()
-	if _, err := conn.ExecContext(ctx, `INSERT INTO model_service_nodes(id,base_url,jobs_base_url,public_base_url,health_path,submit_api_name,check_api_name,poll_interval_ms,request_timeout_ms,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-		input.ID, input.BaseURL, input.JobsBaseURL, input.PublicBaseURL, input.HealthPath, input.SubmitAPIName, input.CheckAPIName,
+	values := nodePersistenceValues(input)
+	if _, err := conn.ExecContext(ctx, `INSERT INTO model_service_nodes(id,service_url,protocol_version,api_key_ciphertext,api_key_nonce,api_key_fingerprint,api_key_id,base_url,jobs_base_url,public_base_url,health_path,submit_api_name,check_api_name,poll_interval_ms,request_timeout_ms,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		input.ID, values.serviceURL, values.protocolVersion, values.ciphertext, values.nonce, values.fingerprint, values.apiKeyID,
+		values.baseURL, values.jobsBaseURL, values.publicBaseURL, values.healthPath, values.submitAPIName, values.checkAPIName,
 		input.PollInterval.Milliseconds(), input.RequestTimeout.Milliseconds(), boolInt(input.Enabled), now, now); err != nil {
 		return domain.ModelNode{}, err
 	}
@@ -83,8 +85,10 @@ func (s *Store) UpdateModelNode(ctx context.Context, id string, expectedVersion 
 		return domain.ModelNode{}, domain.ErrNodeHasActiveTask
 	}
 	now := s.nowUnix()
-	result, err := conn.ExecContext(ctx, `UPDATE model_service_nodes SET base_url=?,jobs_base_url=?,public_base_url=?,health_path=?,submit_api_name=?,check_api_name=?,poll_interval_ms=?,request_timeout_ms=?,enabled=?,version=version+1,updated_at=? WHERE id=? AND version=? AND deleted_at IS NULL`,
-		input.BaseURL, input.JobsBaseURL, input.PublicBaseURL, input.HealthPath, input.SubmitAPIName, input.CheckAPIName,
+	values := nodePersistenceValues(input)
+	result, err := conn.ExecContext(ctx, `UPDATE model_service_nodes SET service_url=?,protocol_version=?,api_key_ciphertext=?,api_key_nonce=?,api_key_fingerprint=?,api_key_id=?,base_url=?,jobs_base_url=?,public_base_url=?,health_path=?,submit_api_name=?,check_api_name=?,poll_interval_ms=?,request_timeout_ms=?,enabled=?,version=version+1,updated_at=? WHERE id=? AND version=? AND deleted_at IS NULL`,
+		values.serviceURL, values.protocolVersion, values.ciphertext, values.nonce, values.fingerprint, values.apiKeyID,
+		values.baseURL, values.jobsBaseURL, values.publicBaseURL, values.healthPath, values.submitAPIName, values.checkAPIName,
 		input.PollInterval.Milliseconds(), input.RequestTimeout.Milliseconds(), boolInt(input.Enabled), now, id, expectedVersion)
 	if err := oneRow(result, err); err != nil {
 		if errors.Is(err, domain.ErrStateConflict) {
@@ -161,8 +165,10 @@ func (s *Store) ImportLegacyNodes(ctx context.Context, inputs []domain.ModelNode
 		sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
 		now := s.nowUnix()
 		for _, input := range sorted {
-			if _, err := conn.ExecContext(ctx, `INSERT INTO model_service_nodes(id,base_url,jobs_base_url,public_base_url,health_path,submit_api_name,check_api_name,poll_interval_ms,request_timeout_ms,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-				input.ID, input.BaseURL, input.JobsBaseURL, input.PublicBaseURL, input.HealthPath, input.SubmitAPIName, input.CheckAPIName,
+			values := nodePersistenceValues(input)
+			if _, err := conn.ExecContext(ctx, `INSERT INTO model_service_nodes(id,service_url,protocol_version,api_key_ciphertext,api_key_nonce,api_key_fingerprint,api_key_id,base_url,jobs_base_url,public_base_url,health_path,submit_api_name,check_api_name,poll_interval_ms,request_timeout_ms,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				input.ID, values.serviceURL, values.protocolVersion, values.ciphertext, values.nonce, values.fingerprint, values.apiKeyID,
+				values.baseURL, values.jobsBaseURL, values.publicBaseURL, values.healthPath, values.submitAPIName, values.checkAPIName,
 				input.PollInterval.Milliseconds(), input.RequestTimeout.Milliseconds(), boolInt(input.Enabled), now, now); err != nil {
 				return 0, false, err
 			}
@@ -182,15 +188,23 @@ func activeTaskCount(ctx context.Context, query rowQuerier, nodeID string) (int,
 }
 
 func sameNodeConnection(left, right domain.ModelNodeInput) bool {
-	return left.BaseURL == right.BaseURL && left.JobsBaseURL == right.JobsBaseURL && left.PublicBaseURL == right.PublicBaseURL &&
+	if !left.UsesNodeAPI() && !right.UsesNodeAPI() {
+		return left.BaseURL == right.BaseURL && left.JobsBaseURL == right.JobsBaseURL && left.PublicBaseURL == right.PublicBaseURL &&
+			left.HealthPath == right.HealthPath && left.SubmitAPIName == right.SubmitAPIName && left.CheckAPIName == right.CheckAPIName &&
+			left.PollInterval == right.PollInterval && left.RequestTimeout == right.RequestTimeout
+	}
+	return left.ServiceURL == right.ServiceURL && left.ProtocolVersion == right.ProtocolVersion &&
+		left.APIKeyFingerprint == right.APIKeyFingerprint && left.BaseURL == right.BaseURL && left.JobsBaseURL == right.JobsBaseURL && left.PublicBaseURL == right.PublicBaseURL &&
 		left.HealthPath == right.HealthPath && left.SubmitAPIName == right.SubmitAPIName && left.CheckAPIName == right.CheckAPIName &&
 		left.PollInterval == right.PollInterval && left.RequestTimeout == right.RequestTimeout
 }
 
 func scanModelNode(scanner rowScanner) (domain.ModelNode, error) {
 	var node domain.ModelNode
+	var compatibilityAPIKeyID string
 	var pollMS, timeoutMS, enabled, created, updated int64
-	err := scanner.Scan(&node.ID, &node.BaseURL, &node.JobsBaseURL, &node.PublicBaseURL, &node.HealthPath, &node.SubmitAPIName, &node.CheckAPIName,
+	err := scanner.Scan(&node.ID, &node.ServiceURL, &node.ProtocolVersion, &node.APIKeyCiphertext, &node.APIKeyNonce, &node.APIKeyFingerprint, &compatibilityAPIKeyID,
+		&node.BaseURL, &node.JobsBaseURL, &node.PublicBaseURL, &node.HealthPath, &node.SubmitAPIName, &node.CheckAPIName,
 		&pollMS, &timeoutMS, &enabled, &node.Version, &created, &updated)
 	if err != nil {
 		return domain.ModelNode{}, err
@@ -201,6 +215,29 @@ func scanModelNode(scanner rowScanner) (domain.ModelNode, error) {
 	node.CreatedAt = unix(created)
 	node.UpdatedAt = unix(updated)
 	return node, nil
+}
+
+type persistedNodeValues struct {
+	serviceURL, protocolVersion                     string
+	baseURL, jobsBaseURL, publicBaseURL, healthPath string
+	submitAPIName, checkAPIName                     string
+	ciphertext, nonce, fingerprint, apiKeyID        any
+}
+
+func nodePersistenceValues(input domain.ModelNodeInput) persistedNodeValues {
+	if input.UsesNodeAPI() {
+		return persistedNodeValues{
+			serviceURL: input.ServiceURL, protocolVersion: input.ProtocolVersion,
+			ciphertext: input.APIKeyCiphertext, nonce: input.APIKeyNonce, fingerprint: input.APIKeyFingerprint, apiKeyID: "",
+			baseURL: input.ServiceURL, jobsBaseURL: input.ServiceURL, publicBaseURL: input.ServiceURL,
+			healthPath: "/internal/v1/health", submitAPIName: "node_v1", checkAPIName: "node_v1",
+		}
+	}
+	return persistedNodeValues{
+		serviceURL: input.BaseURL, protocolVersion: "legacy-gradio-v1",
+		ciphertext: nil, nonce: nil, baseURL: input.BaseURL, jobsBaseURL: input.JobsBaseURL, publicBaseURL: input.PublicBaseURL,
+		healthPath: input.HealthPath, submitAPIName: input.SubmitAPIName, checkAPIName: input.CheckAPIName,
+	}
 }
 
 func boolInt(value bool) int {

@@ -3,6 +3,8 @@ package registry
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -24,6 +26,32 @@ func TestNodeProberChecksGradioAndJobsIndependently(t *testing.T) {
 	}
 	if client.healthPath != "/health" || !client.jobsCalled {
 		t.Fatalf("health_path=%q jobs_called=%v", client.healthPath, client.jobsCalled)
+	}
+}
+
+func TestNodeProberUsesSingleAuthenticatedNodeAPIEndpoint(t *testing.T) {
+	const apiKey = "Abcdefghijklmnopqrstuvwx12345678"
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+apiKey {
+			http.Error(w, `{"error":{"code":"unauthorized","message":"bad key"}}`, http.StatusUnauthorized)
+			return
+		}
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/internal/v1/health" {
+			_, _ = w.Write([]byte(`{"status":"healthy","protocol_version":"h3-node-v1","node_time":1,"components":{},"comfyui_exposure":"loopback_only"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"protocol_version":"h3-node-v1","capabilities_revision":"rev-1","stages":["generation"],"scenarios":["t2v"],"ratios":["16:9"]}`))
+	}))
+	defer server.Close()
+	result := (NodeProber{}).ProbeNodeAPI(context.Background(), domain.ModelNodeInput{
+		ID: "node-1", ServiceURL: server.URL, ProtocolVersion: "h3-node-v1",
+		PollInterval: time.Second, RequestTimeout: time.Second, Enabled: true,
+	}, apiKey)
+	if !result.Reachable || !result.Authenticated || result.ProtocolVersion != "h3-node-v1" || len(paths) != 2 {
+		t.Fatalf("result=%+v paths=%v", result, paths)
 	}
 }
 

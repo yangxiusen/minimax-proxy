@@ -37,6 +37,9 @@ func BuildArguments(request v2.ValidatedRequest, profile config.GenerationProfil
 	if customModelHigh == "" {
 		customModelHigh = "__follow_model_mode__"
 	}
+	if profile.FPS != 0 && profile.FPS != 24 {
+		return nil, fmt.Errorf("legacy Gradio upstream only supports 24 fps; use the node API for %d fps", profile.FPS)
+	}
 	args := make([]any, 32)
 	args[0], args[1], args[2], args[3], args[4] = mode, request.Prompt, "批量单图视频", nil, ""
 	args[7], args[8], args[9], args[10], args[11] = "match", profile.ModelMode, customModel, customModelHigh, profile.EasyCache

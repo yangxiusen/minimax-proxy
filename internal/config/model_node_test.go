@@ -57,3 +57,26 @@ func TestNormalizeModelNodeRejectsInvalidFields(t *testing.T) {
 		})
 	}
 }
+
+func TestValidModelNodeIDMatchesDocumentedCharacterSet(t *testing.T) {
+	for _, id := range []string{"gpu-1", ".gpu-1", "_gpu-1", "-gpu-1", strings.Repeat("a", 64)} {
+		if !ValidModelNodeID(id) {
+			t.Errorf("ValidModelNodeID(%q) = false, want true", id)
+		}
+	}
+	for _, id := range []string{"", ".", "..", "bad id", "bad/id", "节点-1", strings.Repeat("a", 65)} {
+		if ValidModelNodeID(id) {
+			t.Errorf("ValidModelNodeID(%q) = true, want false", id)
+		}
+	}
+}
+
+func TestNormalizeNodeAPIModelNodeRejectsUIPageAsServiceRoot(t *testing.T) {
+	input := domain.ModelNodeInput{
+		ID: "gpu-1", ServiceURL: "http://127.0.0.1:7860/ui", ProtocolVersion: "h3-node-v1",
+		PollInterval: 3 * time.Second, RequestTimeout: 30 * time.Second, Enabled: true,
+	}
+	if _, _, err := NormalizeModelNode(input); err == nil || !strings.Contains(err.Error(), "/ui") {
+		t.Fatalf("NormalizeModelNode() error = %v, want /ui validation error", err)
+	}
+}

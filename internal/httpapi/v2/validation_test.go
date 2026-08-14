@@ -46,6 +46,26 @@ func TestValidateCreateRejectsPromptOver14000Characters(t *testing.T) {
 	}
 }
 
+func TestValidateCreateRejectsEmptyPrompt(t *testing.T) {
+	tests := []struct {
+		name    string
+		content []ContentItem
+	}{
+		{name: "missing text", content: []ContentItem{{Type: "text"}}},
+		{name: "empty text", content: []ContentItem{{Type: "text", Text: ""}}},
+		{name: "whitespace text", content: []ContentItem{{Type: "text", Text: " \t\r\n"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := CreateRequest{Model: "MiniMax-H3", Content: tt.content, Resolution: "2K", Duration: 5, Ratio: "16:9"}
+			_, err := ValidateCreate(request, profiles())
+			if err == nil || !strings.Contains(err.Error(), "非空") {
+				t.Fatalf("ValidateCreate() error = %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateCreateNormalizesI2VARatio(t *testing.T) {
 	request := CreateRequest{Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: "动起来"}, image("https://media.example.com/a.png", "")}, Resolution: "768P", Duration: 4, Ratio: "16:9"}
 	got, err := ValidateCreate(request, profiles())
@@ -180,15 +200,11 @@ func TestValidateCreateRejectsNonURLAudioAndVideo(t *testing.T) {
 }
 
 func TestValidateCreateRejectsUnsupportedAndInvalidInputs(t *testing.T) {
-	callback := "https://callback.example.com"
-	watermark := true
 	tests := []struct {
 		name string
 		req  CreateRequest
 		want string
 	}{
-		{name: "callback", req: CreateRequest{Model: "MiniMax-H3", Content: text(), Resolution: "2K", Duration: 5, Ratio: "16:9", CallbackURL: &callback}, want: "callback_url"},
-		{name: "watermark", req: CreateRequest{Model: "MiniMax-H3", Content: text(), Resolution: "2K", Duration: 5, Ratio: "16:9", AIGCWatermark: &watermark}, want: "aigc_watermark"},
 		{name: "adaptive t2va", req: CreateRequest{Model: "MiniMax-H3", Content: text(), Resolution: "2K", Duration: 5, Ratio: "adaptive"}, want: "ratio"},
 		{name: "mm file", req: CreateRequest{Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: "x"}, image("mm_file://123", "first_frame")}, Resolution: "2K", Duration: 5}, want: "媒体来源"},
 		{name: "mixed roles", req: CreateRequest{Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: "x"}, image("https://a.example/x.png", "first_frame"), image("https://a.example/y.png", "reference_image")}, Resolution: "2K", Duration: 5}, want: "互斥"},
@@ -200,6 +216,30 @@ func TestValidateCreateRejectsUnsupportedAndInvalidInputs(t *testing.T) {
 				t.Fatalf("error = %v, want contains %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestValidateCreatePreservesOptionalWatermark(t *testing.T) {
+	callback := "https://callback.example.com/events"
+	watermark := true
+	validated, err := ValidateCreate(CreateRequest{
+		Model: "MiniMax-H3", Content: text(), Resolution: "2K", Duration: 5, Ratio: "16:9",
+		CallbackURL: &callback, AIGCWatermark: &watermark,
+	}, profiles())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if validated.CallbackURL == nil || *validated.CallbackURL != callback || validated.AIGCWatermark == nil || !*validated.AIGCWatermark {
+		t.Fatalf("validated=%+v", validated)
+	}
+	withoutFlag, err := ValidateCreate(CreateRequest{Model: "MiniMax-H3", Content: text(), Resolution: "2K", Duration: 5, Ratio: "16:9"}, profiles())
+	if err != nil || withoutFlag.AIGCWatermark != nil {
+		t.Fatalf("watermark default=%+v err=%v", withoutFlag.AIGCWatermark, err)
+	}
+	disabled := false
+	withFalse, err := ValidateCreate(CreateRequest{Model: "MiniMax-H3", Content: text(), Resolution: "2K", Duration: 5, Ratio: "16:9", AIGCWatermark: &disabled}, profiles())
+	if err != nil || withFalse.AIGCWatermark == nil || *withFalse.AIGCWatermark {
+		t.Fatalf("watermark false=%+v err=%v", withFalse.AIGCWatermark, err)
 	}
 }
 

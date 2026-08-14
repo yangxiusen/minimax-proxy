@@ -10,7 +10,7 @@
 <body>
   <header class="topbar">
     <strong class="brand">MiniMax H3 管理后台</strong>
-    <div class="session-info"><span id="freshness" class="freshness loading">正在加载</span><span>管理员</span><button id="open-node-config" type="button">节点配置</button><button id="logout" class="link-button" type="button">退出</button></div>
+    <div class="session-info"><span id="freshness" class="freshness loading">正在加载</span><span>管理员</span><button id="open-api-keys" type="button">密钥管理</button><button id="open-profile-config" type="button">模型请求参数</button><button id="open-cleanup" type="button">视频清理</button><button id="open-node-config" type="button">节点配置</button><button id="logout" class="link-button" type="button">退出</button></div>
   </header>
   <main class="console">
     <p class="section-label">全部任务</p>
@@ -51,6 +51,20 @@
       </div>
     </section>
   </main>
+
+  <dialog id="video-player-dialog" class="config-dialog video-player-dialog">
+    <div class="dialog-shell">
+      <header class="dialog-head">
+        <h2 id="video-player-title">任务视频</h2>
+        <button id="close-video-player" class="icon-button" type="button" title="关闭" aria-label="关闭">×</button>
+      </header>
+      <div class="video-player-body">
+        <p id="video-player-status" class="form-status" aria-live="polite">正在加载视频...</p>
+        <video id="video-player" class="video-player" controls playsinline preload="metadata"></video>
+      </div>
+    </div>
+  </dialog>
+
   <dialog id="node-config-dialog" class="config-dialog">
     <div class="dialog-shell">
       <header class="dialog-head">
@@ -64,17 +78,14 @@
         </aside>
         <form id="node-config-form" class="node-config-form" novalidate>
           <input name="version" type="hidden">
-          <label><span>节点 ID</span><input name="id" maxlength="64" autocomplete="off" required></label>
-          <label><span>模型服务地址</span><input name="base_url" type="url" placeholder="http://host:8200" autocomplete="off" required></label>
-          <label><span>任务服务地址</span><input name="jobs_base_url" type="url" placeholder="http://host:8188" autocomplete="off" required></label>
-          <label><span>视频公开地址</span><input name="public_base_url" type="url" placeholder="https://video.example.com" autocomplete="off" required></label>
+          <label><span>节点 ID</span><input name="id" maxlength="64" pattern="[A-Za-z0-9._\-]{1,64}" title="节点 ID 仅支持 1 至 64 位字母、数字、点、下划线或短横线" placeholder="gpu-1" autocomplete="off" required></label>
+          <label><span>模型服务地址</span><input name="service_url" type="url" placeholder="https://model.example.com:7860" autocomplete="off" required></label>
           <div class="form-grid">
-            <label><span>健康检查路径</span><input name="health_path" value="/" required></label>
+            <label><span>协议版本</span><select name="protocol_version"><option value="h3-node-v1">h3-node-v1</option></select></label>
             <label><span>轮询间隔</span><input name="poll_interval" value="3s" required></label>
-            <label><span>提交 API 名称</span><input name="submit_api_name" value="submit_minimax_from_slots" required></label>
             <label><span>请求超时</span><input name="request_timeout" value="30s" required></label>
           </div>
-          <label><span>结果查询 API 名称</span><input name="check_api_name" value="check_and_get_video" required></label>
+          <label><span>API Key</span><input name="api_key" type="password" minlength="32" maxlength="32" pattern="[A-Za-z0-9]{32}" autocomplete="new-password" placeholder="编辑时留空表示沿用已保存 Key" required></label>
           <label class="toggle-control"><input name="enabled" type="checkbox" checked><span>启用节点</span></label>
           <p id="node-form-status" class="form-status" aria-live="polite"></p>
           <footer class="form-actions">
@@ -84,6 +95,72 @@
             <button id="save-node" class="primary-button" type="submit">保存</button>
           </footer>
         </form>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="api-key-dialog" class="config-dialog api-key-dialog">
+    <div class="dialog-shell">
+      <header class="dialog-head"><div><h2>密钥管理</h2><span id="api-key-count" class="muted">启用 0 个</span></div><button id="close-api-keys" class="icon-button" type="button" title="关闭" aria-label="关闭">×</button></header>
+      <div class="api-key-body">
+        <div class="api-key-toolbar"><p id="api-key-warning" class="api-key-warning" hidden>当前无可用对外密钥，所有 V2 Bearer 请求将被拒绝</p><button id="new-api-key" class="primary-button" type="button">创建密钥</button></div>
+        <form id="api-key-form" class="api-key-form" hidden><label><span>密钥名称</span><input id="api-key-name" name="name" maxlength="128" autocomplete="off" required></label><div><button id="cancel-api-key" type="button">取消</button><button id="save-api-key" class="primary-button" type="submit">创建</button></div></form>
+        <p id="api-key-status" class="form-status" aria-live="polite"></p>
+        <div id="api-key-list" class="api-key-list" aria-live="polite"><p class="inline-state">正在加载密钥</p><p class="api-key-empty" hidden>暂无对外 API Key</p></div>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="api-key-secret-dialog" class="config-dialog api-key-secret-dialog">
+    <div class="dialog-shell">
+      <header class="dialog-head"><h2>保存新密钥</h2><button id="close-api-key-secret" class="icon-button" type="button" title="关闭" aria-label="关闭">×</button></header>
+      <div class="api-key-secret-body"><p>完整密钥已保存，可随时在密钥列表中复制。</p><div class="api-key-secret-wrap"><code id="api-key-secret" class="api-key-secret"></code></div><p id="api-key-copy-status" class="form-status" aria-live="polite"></p><footer class="form-actions"><button id="copy-api-key" type="button">复制</button><span class="action-spacer"></span><button id="confirm-api-key-saved" class="primary-button" type="button">完成</button></footer></div>
+    </div>
+  </dialog>
+
+  <dialog id="profile-config-dialog" class="config-dialog wide-dialog">
+    <div class="dialog-shell">
+      <header class="dialog-head"><h2>模型请求参数</h2><button id="close-profile-config" class="icon-button" type="button" title="关闭" aria-label="关闭">×</button></header>
+      <div class="config-layout profile-layout">
+        <aside class="config-node-sidebar">
+          <div class="config-list-head"><strong>逻辑分辨率</strong><button id="new-profile" type="button">新增</button></div>
+          <div id="profile-list" class="config-node-list"><p class="inline-state">正在加载配置...</p></div>
+        </aside>
+        <form id="profile-form" class="node-config-form profile-form" novalidate>
+          <input name="profile_id" type="hidden"><input name="row_version" type="hidden">
+          <div class="form-grid three-columns">
+            <label><span>逻辑分辨率名称</span><input name="resolution" type="text" maxlength="32" required placeholder="例如 1080P、4K-UHD、高清档"><small>公开 API 使用此名称匹配配置；实际宽高由比例映射决定。</small></label>
+            <label id="profile-template-field"><span>复制自</span><select name="profile_template"></select></label>
+          </div>
+          <fieldset><legend>基础生成</legend><div class="form-grid three-columns">
+            <label><span>模型模式</span><select name="model_mode"><option value="high_quality">高质量</option><option value="low_vram">低显存</option></select></label>
+            <label><span>采样步数</span><input name="steps" type="number" min="1" max="100" value="8"></label>
+            <label><span>SageAttention</span><select name="sage_attention"><option value="auto">自动</option><option value="on">开启</option><option value="off">关闭</option></select></label>
+            <label><span>缓存加速</span><select name="cache_mode"><option value="easycache">EasyCache</option><option value="te_speed">TE-Speed</option><option value="off">关闭</option></select></label>
+          </div></fieldset>
+          <fieldset><legend>比例分辨率</legend><p id="ratio-rule" class="muted"></p><div class="ratio-table"><div class="ratio-row ratio-head"><span>比例</span><span>基础宽度</span><span>基础高度</span><span>目标像素</span></div><div id="ratio-rows"></div></div></fieldset>
+          <fieldset><legend>LoRA</legend><div id="lora-rows" class="lora-rows"></div></fieldset>
+          <fieldset><legend>后处理</legend><div class="form-grid three-columns">
+            <label class="toggle-control"><input name="interpolation_enabled" type="checkbox" checked><span>RIFE 2x 补帧</span></label>
+            <label class="toggle-control"><input name="restoration_enabled" type="checkbox" checked><span>高清修复</span></label>
+            <label><span>修复引擎</span><select name="restoration_engine"><option value="seedvr2">SeedVR2</option><option value="flashvsr">FlashVSR</option></select></label>
+            <label><span>放大倍率</span><select name="restoration_scale"><option>1</option><option>2</option><option selected>3</option><option>4</option></select></label>
+          </div></fieldset>
+          <p id="profile-form-status" class="form-status" aria-live="polite"></p>
+          <footer class="form-actions"><button id="delete-profile" class="danger-button" type="button" hidden>删除</button><span class="action-spacer"></span><button id="save-profile" class="primary-button" type="submit">保存并生效</button></footer>
+        </form>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="cleanup-dialog" class="config-dialog cleanup-dialog">
+    <div class="dialog-shell">
+      <header class="dialog-head"><h2>视频文件清理</h2><button id="close-cleanup" class="icon-button" type="button" title="关闭" aria-label="关闭">×</button></header>
+      <div class="cleanup-body">
+        <form id="cleanup-preview-form" class="cleanup-controls"><label><span>清理多少天前的视频</span><input id="cleanup-days" type="number" min="1" max="3650" value="2" required></label><button id="preview-cleanup" class="primary-button" type="submit">预览</button></form>
+        <section id="cleanup-preview" class="cleanup-preview" hidden><div class="cleanup-stats"><div><span>候选文件</span><strong id="cleanup-count">0</strong></div><div><span>预计释放</span><strong id="cleanup-bytes">0 B</strong></div><div><span>截止时间</span><strong id="cleanup-cutoff">--</strong></div></div><p id="cleanup-node-summary" class="muted"></p><label class="confirmation-control"><span>输入确认文本</span><input id="cleanup-confirmation" autocomplete="off"></label><button id="confirm-cleanup" class="danger-button" type="button">确认删除</button></section>
+        <section id="cleanup-progress" class="cleanup-progress" hidden><div class="section-head"><div><strong>清理进度</strong><span id="cleanup-status" class="status-pill status-queued">等待执行</span></div><button id="retry-cleanup" type="button" hidden>重试失败项</button></div><div class="progress"><span id="cleanup-progress-bar"></span></div><p id="cleanup-progress-summary" class="muted"></p><div id="cleanup-items" class="cleanup-items"></div></section>
+        <p id="cleanup-form-status" class="form-status" aria-live="polite"></p>
       </div>
     </div>
   </dialog>

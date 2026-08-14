@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,9 +43,10 @@ type AdminConfig struct {
 }
 
 type ServerConfig struct {
-	Address      string
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
+	Address       string
+	PublicBaseURL *url.URL
+	ReadTimeout   time.Duration
+	WriteTimeout  time.Duration
 }
 
 type DatabaseConfig struct {
@@ -64,21 +66,44 @@ type TaskConfig struct {
 }
 
 type APIKeyConfig struct {
-	ID      string
-	Key     string
-	Enabled bool
+	ID         string `yaml:"id"`
+	Key        string `yaml:"key"`
+	Enabled    bool   `yaml:"-"`
+	EnabledRaw string `yaml:"-"`
+}
+
+func (key *APIKeyConfig) UnmarshalYAML(node *yaml.Node) error {
+	var raw struct {
+		ID      string    `yaml:"id"`
+		Key     string    `yaml:"key"`
+		Enabled yaml.Node `yaml:"enabled"`
+	}
+	if err := node.Decode(&raw); err != nil {
+		return err
+	}
+	key.ID, key.Key, key.EnabledRaw = raw.ID, raw.Key, raw.Enabled.Value
+	if raw.Enabled.Tag == "!!bool" {
+		value, err := strconv.ParseBool(raw.Enabled.Value)
+		if err != nil {
+			return err
+		}
+		key.Enabled = value
+	}
+	return nil
 }
 
 type UpstreamConfig struct {
-	ID             string
-	BaseURL        *url.URL
-	JobsBaseURL    *url.URL
-	PublicBaseURL  *url.URL
-	HealthPath     string
-	SubmitAPIName  string
-	CheckAPIName   string
-	PollInterval   time.Duration
-	RequestTimeout time.Duration
+	ID              string
+	ServiceURL      *url.URL
+	ProtocolVersion string
+	BaseURL         *url.URL
+	JobsBaseURL     *url.URL
+	PublicBaseURL   *url.URL
+	HealthPath      string
+	SubmitAPIName   string
+	CheckAPIName    string
+	PollInterval    time.Duration
+	RequestTimeout  time.Duration
 }
 
 type LegacyUpstreamConfig struct {
@@ -97,6 +122,7 @@ type GenerationProfile struct {
 	ModelMode       string               `yaml:"model_mode"`
 	CustomModel     string               `yaml:"custom_model"`
 	CustomModelHigh string               `yaml:"custom_model_high"`
+	FPS             int                  `yaml:"fps"`
 	EasyCache       bool                 `yaml:"easy_cache"`
 	Steps           int                  `yaml:"steps"`
 	Dimensions      map[string]Dimension `yaml:"dimensions"`
@@ -109,9 +135,10 @@ type Dimension struct {
 
 type rawConfig struct {
 	Server struct {
-		Address      string `yaml:"address"`
-		ReadTimeout  string `yaml:"read_timeout"`
-		WriteTimeout string `yaml:"write_timeout"`
+		Address       string `yaml:"address"`
+		PublicBaseURL string `yaml:"public_base_url"`
+		ReadTimeout   string `yaml:"read_timeout"`
+		WriteTimeout  string `yaml:"write_timeout"`
 	} `yaml:"server"`
 	Admin struct {
 		Username        *string `yaml:"username"`
@@ -145,6 +172,10 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	mainYAML, legacyAPIKeys, err := splitLegacyAPIKeys([]byte(mainYAML))
+	if err != nil {
+		return Config{}, err
+	}
 	expanded, err := expandEnvironment(mainYAML)
 	if err != nil {
 		return Config{}, err
@@ -154,6 +185,7 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	raw.Upstreams = legacyUpstreams
+	raw.APIKeys = legacyAPIKeys
 
 	cfg, err := normalize(raw)
 	if err != nil {
@@ -163,6 +195,78 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func splitLegacyAPIKeys(data []byte) (string, []APIKeyConfig, error) {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	var document yaml.Node
+	if err := decoder.Decode(&document); err != nil {
+		return "", nil, fmt.Errorf("解析 YAML 配置: %w", err)
+	}
+	if len(document.Content) != 1 || document.Content[0].Kind != yaml.MappingNode {
+		return "", nil, errors.New("配置文件必须是 YAML 对象")
+	}
+	root := document.Content[0]
+	var legacy []APIKeyConfig
+	for index := 0; index < len(root.Content); index += 2 {
+		if root.Content[index].Value != "api_keys" {
+			continue
+		}
+		keyData, err := yaml.Marshal(root.Content[index+1])
+		if err != nil {
+			return "", nil, fmt.Errorf("解析旧 API Key 配置: %w", err)
+		}
+		keyDecoder := yaml.NewDecoder(bytes.NewReader(keyData))
+		keyDecoder.KnownFields(true)
+		if err := keyDecoder.Decode(&legacy); err != nil {
+			return "", nil, fmt.Errorf("解析旧 API Key 配置: %w", err)
+		}
+		root.Content = append(root.Content[:index], root.Content[index+2:]...)
+		break
+	}
+	mainData, err := yaml.Marshal(&document)
+	if err != nil {
+		return "", nil, fmt.Errorf("规范化 YAML 配置: %w", err)
+	}
+	return string(mainData), legacy, nil
+}
+
+func ParseLegacyAPIKeys(items []APIKeyConfig) ([]APIKeyConfig, error) {
+	result := make([]APIKeyConfig, 0, len(items))
+	ids, keys := make(map[string]struct{}, len(items)), make(map[string]struct{}, len(items))
+	for _, item := range items {
+		id, err := expandEnvironment(item.ID)
+		if err != nil {
+			return nil, err
+		}
+		key, err := expandEnvironment(item.Key)
+		if err != nil {
+			return nil, err
+		}
+		item.ID, item.Key = strings.TrimSpace(id), key
+		if item.EnabledRaw != "" {
+			enabled, err := expandEnvironment(item.EnabledRaw)
+			if err != nil {
+				return nil, err
+			}
+			item.Enabled, err = strconv.ParseBool(enabled)
+			if err != nil {
+				return nil, errors.New("API Key enabled 必须是布尔值")
+			}
+		}
+		if item.ID == "" || item.Key == "" {
+			return nil, errors.New("API Key 的 id 和 key 不能为空")
+		}
+		if _, exists := ids[strings.ToLower(item.ID)]; exists {
+			return nil, fmt.Errorf("API Key id %q 重复", item.ID)
+		}
+		if _, exists := keys[item.Key]; exists {
+			return nil, errors.New("API Key 值重复")
+		}
+		ids[strings.ToLower(item.ID)], keys[item.Key] = struct{}{}, struct{}{}
+		result = append(result, item)
+	}
+	return result, nil
 }
 
 func splitLegacyUpstreams(data []byte) (string, []LegacyUpstreamConfig, error) {
@@ -252,6 +356,10 @@ func normalize(raw rawConfig) (Config, error) {
 	if raw.Server.Address != "" {
 		cfg.Server.Address = raw.Server.Address
 	}
+	var err error
+	if cfg.Server.PublicBaseURL, err = parsePublicBaseURL(raw.Server.PublicBaseURL); err != nil {
+		return Config{}, err
+	}
 	if raw.Admin.Username != nil {
 		cfg.Admin.Username = *raw.Admin.Username
 	}
@@ -261,7 +369,6 @@ func normalize(raw rawConfig) (Config, error) {
 	if raw.Admin.SecureCookie != nil {
 		cfg.Admin.SecureCookie = *raw.Admin.SecureCookie
 	}
-	var err error
 	if cfg.Server.ReadTimeout, err = parseDuration(raw.Server.ReadTimeout, cfg.Server.ReadTimeout, "server.read_timeout"); err != nil {
 		return Config{}, err
 	}
@@ -353,6 +460,12 @@ func expandLegacyUpstream(item LegacyUpstreamConfig) (LegacyUpstreamConfig, erro
 }
 
 func migrateLegacyGenerationProfiles(profiles map[string]GenerationProfile) {
+	for resolution, profile := range profiles {
+		if profile.FPS == 0 {
+			profile.FPS = 24
+			profiles[resolution] = profile
+		}
+	}
 	// 兼容升级前示例配置中的旧尺寸，其他非 32 倍数仍由校验拒绝。
 	if profile, ok := profiles["768P"]; ok {
 		if dimension, exists := profile.Dimensions["21:9"]; exists && dimension == (Dimension{Width: 1104, Height: 480}) {
@@ -448,6 +561,20 @@ func parseURL(value string) (*url.URL, error) {
 	return u, nil
 }
 
+func parsePublicBaseURL(value string) (*url.URL, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, errors.New("server.public_base_url 不能为空")
+	}
+	u, err := parseURL(strings.TrimSpace(value))
+	if err != nil {
+		return nil, fmt.Errorf("server.public_base_url %w", err)
+	}
+	if u.Path != "" {
+		return nil, errors.New("server.public_base_url 必须是根地址，不得包含子路径")
+	}
+	return u, nil
+}
+
 func validate(cfg Config) error {
 	if strings.TrimSpace(cfg.Admin.Username) == "" {
 		return errors.New("admin.username 不能为空")
@@ -467,11 +594,7 @@ func validate(cfg Config) error {
 	if cfg.Queue.PerKeyUnfinishedLimit > cfg.Queue.GlobalUnfinishedLimit {
 		return errors.New("每 Key 上限不得超过全局上限")
 	}
-	if len(cfg.APIKeys) == 0 {
-		return errors.New("至少配置一个 API Key")
-	}
 	ids, keys := map[string]struct{}{}, map[string]struct{}{}
-	enabledKeys := 0
 	for _, key := range cfg.APIKeys {
 		if key.ID == "" || key.Key == "" {
 			return errors.New("API Key 的 id 和 key 不能为空")
@@ -483,12 +606,6 @@ func validate(cfg Config) error {
 			return errors.New("API Key 值重复")
 		}
 		ids[key.ID], keys[key.Key] = struct{}{}, struct{}{}
-		if key.Enabled {
-			enabledKeys++
-		}
-	}
-	if enabledKeys == 0 {
-		return errors.New("至少配置一个启用的 API Key")
 	}
 	for _, resolution := range requiredResolutions {
 		profile, ok := cfg.GenerationProfiles[resolution]
@@ -497,6 +614,9 @@ func validate(cfg Config) error {
 		}
 		if profile.ModelMode == "" || profile.Steps <= 0 {
 			return fmt.Errorf("generation_profiles.%s 的 model_mode/steps 无效", resolution)
+		}
+		if profile.FPS < 10 || profile.FPS > 60 {
+			return fmt.Errorf("generation_profiles.%s 的 fps 必须为 10 到 60", resolution)
 		}
 		for _, ratio := range requiredRatios {
 			dimension, ok := profile.Dimensions[ratio]

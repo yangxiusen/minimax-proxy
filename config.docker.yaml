@@ -1,5 +1,6 @@
 server:
   address: ":18080"
+  public_base_url: "${MINIMAX_PUBLIC_BASE_URL}"
   read_timeout: 15s
   write_timeout: 15s
 
@@ -23,10 +24,8 @@ task:
   idempotency_ttl: 24h
   execution_timeout: 10m
 
-api_keys:
-  - id: customer-1
-    key: "${MINIMAX_API_KEY_CUSTOMER_1}"
-    enabled: true
+# 对外 API Key 在 /manager 的“密钥管理”中创建和维护。
+# 升级时，旧版 api_keys 会在首次启动后一次性导入 SQLite。
 
 # 模型服务节点在 /manager 的“节点配置”中维护，并存储于 SQLite。
 # 升级时若数据库尚无节点，旧版 upstreams 会在首次启动时自动导入一次。

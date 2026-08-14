@@ -1,5 +1,7 @@
 # MiniMax-H3 Node Single-Key Configuration Implementation Plan
 
+> 本计划已由正式 `/s-change` 变更包 `specs/developing/version_0.0.1/changes/006-node-single-key-conf/task.md` 取代。后续开发以 006 变更包及其验收文档为唯一执行入口，本文件仅保留为设计过程记录。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make MiniMax-H3 create and exclusively use a root `conf.yml` containing one 32-character API Key and generated WebUI credentials, while simplifying MiniMax-H3-Proxy node management to one API Key field.

@@ -1,83 +1,190 @@
-# 一、接口列表集合
+# 管理节点与 H3 Node API 接口增量
 
-## 1 管理后台基础接口迁移
+> 鉴权和 Manager 凭据字段以 `006-node-single-key-conf/API_DELTA.md` 为现行契约；本文涉及 Key ID、scope、`key_id.secret` 的内容仅为已废弃历史记录。
 
-原有管理会话、监控快照和任务管理接口只变更路径前缀，请求和响应契约保持不变。
+## 1. Manager 接口集合
 
-| 接口名称 | 方法 | 新 URL | 原 URL | 变化 |
-| --- | --- | --- | --- | --- |
-| 管理员登录 | POST | `/manager/api/session` | `/monitor/api/session` | Cookie 改为 `manager_session`，Path 改为 `/manager` |
-| 管理员退出 | DELETE | `/manager/api/session` | `/monitor/api/session` | 路径迁移 |
-| 管理快照 | GET | `/manager/api/snapshot` | `/monitor/api/snapshot` | 节点项新增 `enabled`、`applying` |
-| 管理任务列表 | GET | `/manager/api/tasks` | `/monitor/api/tasks` | 路径迁移 |
-| 中止任务 | POST | `/manager/api/tasks/{task_id}/cancel` | `/monitor/api/tasks/{task_id}/cancel` | 路径迁移 |
-| 删除任务 | DELETE | `/manager/api/tasks/{task_id}` | `/monitor/api/tasks/{task_id}` | 路径迁移 |
-
-旧 `/monitor/api/*` 不提供接口别名。页面入口 `GET /monitor`、`GET /monitor/`、`GET /monitor/login` 使用 308 跳转到对应 `/manager` 页面。
-
-## 2 模型服务节点配置
-
-模块说明：管理员持久化并运行时应用模型服务节点配置。
-
-| 接口名称 | 方法 | URL | 简要说明 |
+| 接口名称 | 方法 | URL | 修订重点 |
 | --- | --- | --- | --- |
-| 查询节点配置 | GET | `/manager/api/nodes` | 返回全部未删除节点配置 |
-| 新增节点 | POST | `/manager/api/nodes` | 创建节点期望配置 |
-| 更新节点 | PUT | `/manager/api/nodes/{node_id}` | 使用版本号全量更新节点 |
-| 删除节点 | DELETE | `/manager/api/nodes/{node_id}` | 软删除已停用且无活动任务的节点 |
-| 测试草稿连接 | POST | `/manager/api/nodes/test` | 检查当前表单中的 Gradio 与 Jobs 服务 |
+| 查询节点 | GET | `/manager/api/nodes` | 返回真实协议和密钥配置状态，不返回 Secret |
+| 新增 H3 节点 | POST | `/manager/api/nodes` | Key ID + Secret 必填 |
+| 更新/升级节点 | PUT | `/manager/api/nodes/{node_id}` | Legacy 转 H3 要求 `upgrade_protocol=true` 和新 Secret |
+| 删除节点 | DELETE | `/manager/api/nodes/{node_id}` | 规则不变：已停用且无活动任务 |
+| 测试节点 | POST | `/manager/api/nodes/test` | 验证认证、协议、能力和必需 scopes |
 
-# 二、模块功能说明
+Manager 会话、快照和任务接口继续位于 `/manager/api/*`；公共 `/v2` 路径和响应不因本修订变化。
 
-## 1 管理后台基础接口迁移
+## 2. Manager 通用契约
 
-页面和 Cookie 作用域迁移到 `/manager`，防止继续把已具备写能力的页面误称为只读监控。升级后旧会话不复用，管理员重新登录。公共 `/v2` 接口不受影响。
+- JSON 请求限制 64 KiB，严格拒绝未知、重复和尾随字段。
+- 所有节点响应使用 `Cache-Control: no-store`。
+- `api_key` 表示 MiniMax-H3 配置中生成摘要前的原始 Secret，不接受已经拼接的 `key_id.secret`。
+- `api_key_id` 使用 `^[A-Za-z0-9_-]+$`，长度 1 至 64；`api_key` 长度 32 至 512 且前后无空白。
+- 响应只返回 `api_key_configured` 和脱敏指纹，不返回 Secret、密文、Nonce 或完整 Bearer Token。
+- 详细字段、示例和流程见 `api-modules/manager-nodes.md`。
 
-## 2 模型服务节点配置
+### 2.1 稳定错误
 
-1. 节点配置写入 `model_service_nodes` 后唤醒运行时 Registry。
-2. Registry 异步协调配置，节点只有启用且健康新鲜时才可调度。
-3. 更新使用 `version` 乐观锁；活动任务存在时只允许停用，不允许改变连接参数。
-4. 删除要求节点已停用且无活动任务，并使用软删除保留历史 ID。
-5. 连接测试使用草稿配置且不写数据库，分别检查 Gradio 健康入口和 Jobs `/api/jobs`。
+| HTTP | `error.type` | 场景 |
+| --- | --- | --- |
+| 400 | `bad_request_error` | JSON、URL、时长或普通字段无效 |
+| 400 | `node_api_key_id_invalid` | Key ID 不符合 Node 规则 |
+| 400 | `node_api_key_required` | 创建或 Legacy 升级缺少新 Secret；H3 记录无可复用密钥 |
+| 400 | `node_protocol_upgrade_required` | Legacy 节点被普通 PUT 隐式改为 H3 |
+| 400 | `node_protocol_downgrade_forbidden` | H3 节点请求降级到 Legacy |
+| 401 | `authentication_error` | Manager 未登录或会话失效 |
+| 404 | `node_not_found` | 节点不存在或已删除 |
+| 409 | `node_id_conflict` | 节点 ID 已使用，包括软删除记录 |
+| 409 | `node_version_conflict` | 乐观锁版本冲突 |
+| 409 | `node_has_active_task` | 活动任务阻止连接修改或删除 |
+| 409 | `node_must_be_disabled` | 删除启用节点 |
+| 502 | `node_probe_failed` | 节点不可达、认证、协议、能力或 scope 检查失败 |
+| 503 | `master_key_missing` | Proxy 未配置节点密钥主密钥 |
+| 500 | `server_error` | 非预期内部错误；不得用于上述确定性输入问题 |
 
-核心实体：`model_service_nodes`、`node_config_bootstrap`、`video_tasks`。
-
-依赖关系：管理会话、SQLite Store、Node Registry、Gradio/Jobs 客户端、Monitor Cache。
-
-权限边界：所有接口必须具有有效管理会话；不接受公共 API Key 替代登录。
-
-# 三、通用契约
-
-- JSON 请求只接受 `Content-Type: application/json`，限制为 32 KiB，拒绝未知或重复字段及尾随内容。
-- 所有响应设置 `Cache-Control: no-store`。
-- 时间字段使用 Unix 秒；轮询和超时字段在管理 API 中使用 Go duration 字符串，如 `3s`、`30s`。
-- URL 规范化后去掉尾部 `/`，但保留根路径；不得包含凭据、查询参数或片段。
-- 错误响应沿用现有格式：
+错误响应保持现有 Manager 结构：
 
 ```json
 {
   "error": {
-    "type": "node_version_conflict",
-    "message": "配置已被更新，请刷新后重试"
+    "type": "node_api_key_required",
+    "message": "升级到 H3 Node API 时必须填写新密钥"
   }
 }
 ```
 
-| HTTP 状态 | `type` | 使用场景 |
+## 3. MiniMax-H3 Node API 消费集合
+
+| 方法 | 路径 | Scope | Proxy 消费方 |
+| --- | --- | --- | --- |
+| GET | `/internal/v1/health` | `health` | Registry、Manager 测试 |
+| GET | `/internal/v1/capabilities` | `health` | Registry、Manager 测试 |
+| POST | `/internal/v1/executions` | `execute` | Orchestrator、Profile Test |
+| GET | `/internal/v1/executions/{execution_id}` | `execute` | Orchestrator、Profile Test |
+| POST | `/internal/v1/executions/{execution_id}/cancel` | `execute` | Orchestrator、Profile Test |
+| POST | `/internal/v1/artifacts/import` | `artifact:write` | Input Materializer/Migrator |
+| GET | `/internal/v1/artifacts/{artifact_id}` | `artifact:read` | Orchestrator |
+| GET | `/internal/v1/artifacts/{artifact_id}/content` | `artifact:read` | Artifact Service/Migrator |
+| POST | `/internal/v1/artifacts/delete` | `artifact:delete` | Cleanup Worker |
+
+请求统一携带：
+
+```http
+Authorization: Bearer <key_id>.<secret>
+X-Request-Id: <proxy_request_id>
+Idempotency-Key: <operation_id>
+```
+
+`Idempotency-Key` 仅用于 Node 定义为幂等写入的接口，并必须与请求体 `operation_id` 一致。
+
+### 3.1 Node 统一错误包
+
+认证、业务和 Pydantic 请求校验错误统一为：
+
+```json
+{
+  "error": {
+    "code": "request_validation_failed",
+    "message": "请求参数无效",
+    "retryable": false,
+    "request_id": "req_xxx",
+    "details": {"fields": ["parameters.duration_seconds"]}
+  }
+}
+```
+
+Proxy 保留 `code/retryable/request_id` 用于分类与关联；`details` 不进入用户响应或普通日志。未返回统一包的 4xx 默认不可重试，429 和 5xx按受限兜底规则处理。
+
+### 3.2 Capabilities 授权扩展
+
+Node 的 `GET /internal/v1/capabilities` 增加：
+
+```json
+{
+  "protocol_version": "h3-node-v1",
+  "authorization": {
+    "key_id": "proxy-primary",
+    "scopes": ["artifact:delete", "artifact:read", "artifact:write", "execute", "health"]
+  }
+}
+```
+
+Manager 测试必须确认所需五类 scope 全部存在；`maintenance` 不属于 Proxy 必需权限。
+
+## 4. 有意不消费的 Node 接口
+
+`POST /maintenance/cleanup/preview`、`POST /maintenance/cleanup` 和 `GET /maintenance/cleanup/{operation_id}` 保留在 Node 发布契约中，但 Proxy v0.0.1 不调用。Proxy 使用自己的 `artifact_deletion_jobs/items` 确定候选集，再调用 `/artifacts/delete` 删除明确位置，避免绕过任务归属与审计。
+
+## 5. 文档索引
+
+| 模块 | 文档 | 说明 |
 | --- | --- | --- |
-| 400 | `bad_request_error` | JSON、字段、URL、时长或路径无效 |
-| 401 | `authentication_error` | 未登录或会话过期 |
-| 404 | `node_not_found` | 节点不存在或已删除 |
-| 409 | `node_id_conflict` | 节点 ID 已使用，包括软删除记录 |
-| 409 | `node_version_conflict` | 更新版本不匹配 |
-| 409 | `node_has_active_task` | 活动任务阻止修改或删除 |
-| 409 | `node_must_be_disabled` | 删除启用节点 |
-| 502 | `node_probe_failed` | 草稿配置连接测试未全部通过 |
-| 500 | `server_error` | 未预期内部错误 |
+| Manager 节点配置 | `api-modules/manager-nodes.md` | CRUD、显式升级、连接测试 |
+| Node 跨项目契约 | `api-modules/h3-node-integration.md` | 认证、执行、取消、错误和幂等 |
+| 审计结果 | `NODE_API_CONTRACT_AUDIT.md` | 12 路由覆盖与问题清单 |
 
-# 四、接口文档索引
+## 6. Node 健康运行数据扩展
 
-| 模块 | 文档路径 | 接口数量 | 说明 |
-| --- | --- | ---: | --- |
-| 模型服务节点配置 | `api-modules/manager-nodes.md` | 5 | 节点查询、创建、更新、删除和连接测试 |
+`GET /internal/v1/health` 增加向前兼容的可选字段：
+
+```json
+{
+  "runtime": {
+    "queue_running": 0,
+    "queue_pending": 0,
+    "memory_total_bytes": 100555894784,
+    "memory_free_bytes": 10751811584,
+    "vram_total_bytes": 17170956288,
+    "vram_free_bytes": 10241762248,
+    "cpu_percent": null,
+    "gpu_percent": null
+  }
+}
+```
+
+- 队列来自 ComfyUI `/queue`；容量来自 `/system_stats`。
+- CPU/GPU 百分比只有真实采集到时才返回，不能用内存/显存占用率代替。
+- Proxy 对缺失 `runtime` 的旧 Node 保持兼容；字段缺失时 Manager 显示未知。
+- H3 `service_url` 必须指向 Node API 根地址，路径为空或 `/`；`/ui` 是页面路径，作为 API 根地址时返回 400。
+
+## 7. 任务结果与播放接口修订
+
+详细契约见 `api-modules/task-delivery.md`。
+
+| 接口名称 | 方法 | URL | 修订重点 |
+| --- | --- | --- | --- |
+| 查询单个生成任务 | GET | `/v2/query/video_generation/{task_id}` | 成功任务 `content.url` 改为绝对 Proxy 签名 URL |
+| 查询生成任务列表 | GET | `/v2/query/video_generation` | 每个成功任务返回相同格式的绝对 URL |
+| Manager 任务列表 | GET | `/manager/api/tasks` | 新 H3 artifact 任务返回 `video_url`，供播放按钮使用 |
+| 获取视频内容 | GET | `/v2/files/{artifact_id}/content` | 路径与鉴权不变，浏览器播放继续支持 Range |
+
+### 7.1 URL 来源
+
+成功响应示例：
+
+```json
+{
+  "task": {
+    "id": "272076440301631191",
+    "status": "succeeded",
+    "content": {
+      "url": "http://127.0.0.1:18081/v2/files/art_d6263610cd6a8a48cc6d306465aa7190/content?expires=1786618995&signature=..."
+    }
+  }
+}
+```
+
+`http://127.0.0.1:18081` 来自可信配置 `server.public_base_url`。`http://127.0.0.1:7860` 是 Node API 内部地址；该服务没有 `/v2/files` 路由，且访问内部 artifact 需要 Node Key，因此禁止将相对路径拼到 7860。
+
+### 7.2 兼容与错误
+
+- 字段名、查询路径、Bearer 鉴权、签名参数和文件访问错误结构不变。
+- 缺少或非法 `server.public_base_url` 属于启动配置错误，不允许服务带病启动。
+- 单次签名失败时查询返回现有 500 `server_error`，日志只记录 request/task/artifact ID 和稳定错误类型，不记录 URL 签名或节点地址。
+- Manager `video_url` 仅对 `succeeded` 且可签发/兼容访问的任务非空。
+
+## 8. 文档索引补充
+
+| 模块 | 文档 | 说明 |
+| --- | --- | --- |
+| 任务交付与播放 | `api-modules/task-delivery.md` | FIFO 相关读取边界、绝对结果 URL、Manager 播放和文件内容接口 |

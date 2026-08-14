@@ -40,7 +40,7 @@ func (c Cleaner) Run(ctx context.Context) {
 				continue
 			}
 			if tasks > 0 || keys > 0 {
-				c.Logger.InfoContext(ctx, "过期任务逻辑清理完成", "stage", "cleanup", "task_count", tasks, "idempotency_count", keys)
+				c.Logger.InfoContext(ctx, "过期任务已建立物理清理作业", "stage", "cleanup", "task_count", tasks, "idempotency_count", keys)
 			}
 		}
 	}

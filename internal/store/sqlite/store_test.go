@@ -207,6 +207,28 @@ func TestAdminCancelQueuedAndRejectsDeletingActiveTask(t *testing.T) {
 	}
 }
 
+func TestQueuedCancellationPersistsCallbackInSameTransition(t *testing.T) {
+	store := newStore(t, Options{PerKeyLimit: 10, GlobalLimit: 100})
+	ctx := context.Background()
+	created, err := store.Create(ctx, task("callback-cancel", "owner"), "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE video_tasks SET callback_url_ciphertext=X'01',callback_url_nonce=X'02' WHERE task_id=?`, created.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	if action, err := store.CancelOrDelete(ctx, "owner", created.TaskID); err != nil || action != domain.ActionCancelled {
+		t.Fatalf("cancel action=%q err=%v", action, err)
+	}
+	var status string
+	if err := store.db.QueryRowContext(ctx, `SELECT external_status FROM callback_deliveries WHERE task_id=? ORDER BY created_at DESC LIMIT 1`, created.TaskID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "cancelled" {
+		t.Fatalf("callback status=%q", status)
+	}
+}
+
 func TestCreateProtectsQueueAndClaimsFIFO(t *testing.T) {
 	store := newStore(t, Options{ProtectedSlots: 3, PerKeyLimit: 10, GlobalLimit: 100})
 	ctx := context.Background()
@@ -382,11 +404,17 @@ func TestListFiltersOwnerStatusAndPaginates(t *testing.T) {
 	}
 }
 
-func TestCleanupLogicallyDeletesExpiredTasksAndIdempotency(t *testing.T) {
+func TestCleanupCreatesRetentionDeletionOnlyForTerminalExpiredTasks(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0).UTC()
 	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 100, Now: func() time.Time { return now }, Retention: 7 * 24 * time.Hour, IdempotencyTTL: 24 * time.Hour})
 	ctx := context.Background()
 	if _, err := store.Create(ctx, task("old", "owner-a"), "idem", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE video_tasks SET status='succeeded',finished_at=? WHERE task_id='old'`, now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(ctx, task("active-old", "owner-a"), "active-idem", nil); err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(8 * 24 * time.Hour)
@@ -399,6 +427,15 @@ func TestCleanupLogicallyDeletesExpiredTasksAndIdempotency(t *testing.T) {
 	}
 	if _, err := store.Get(ctx, "owner-a", "old"); !errors.Is(err, domain.ErrTaskNotFound) {
 		t.Fatalf("get expired error = %v", err)
+	}
+	var activeDeleted sql.NullInt64
+	var activeStatus domain.InternalStatus
+	if err := store.db.QueryRowContext(ctx, `SELECT status,deleted_at FROM video_tasks WHERE task_id='active-old'`).Scan(&activeStatus, &activeDeleted); err != nil || activeStatus != domain.StatusQueuedOpen || activeDeleted.Valid {
+		t.Fatalf("active expired task was cleaned: status=%s deleted=%v err=%v", activeStatus, activeDeleted, err)
+	}
+	var reason string
+	if err := store.db.QueryRowContext(ctx, `SELECT reason FROM artifact_deletion_jobs WHERE requested_by='retention-worker'`).Scan(&reason); err != nil || reason != "retention" {
+		t.Fatalf("retention job reason=%q err=%v", reason, err)
 	}
 	newTask := task("new", "owner-a")
 	newTask.RequestHash = "hash-old"

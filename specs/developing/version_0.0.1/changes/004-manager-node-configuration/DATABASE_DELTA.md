@@ -1,11 +1,13 @@
 # 管理后台节点配置数据库增量
 
+> `006-node-single-key-conf` 保留 `api_key_id` 列作为非空兼容占位，但应用层不再读取、写入或返回其业务语义；本文旧 Key ID 语义已失效。
+
 ## 1. 概述
 
 - 设计范围：模型服务节点期望配置、软删除、乐观锁和旧 YAML 一次性导入标记。
 - 支撑模块：SQLite Store、节点 Registry、Manager API。
 - 数据库类型：现有 SQLite。
-- 迁移版本：`004_model_service_nodes.sql`，`schema_migrations.version=4`。
+- 迁移版本：历史节点表为 `004_model_service_nodes.sql`；本次 H3 恢复增量为 `009_h3_stage_attempt_cancellation.sql`。
 - 关键约束：节点 ID 永不复用；节点配置不与 `video_tasks` 建物理外键；首次导入原子且不可重复。
 
 ## 2. 关系图
@@ -129,7 +131,7 @@ erDiagram
 ## 7. 安全与数据保护
 
 - URL 不允许包含用户凭据、查询参数或片段；应用层写入前使用结构化 URL 解析。
-- 当前字段不包含认证密钥，不引入应用层加密；SQLite 文件和挂载卷必须限制为服务账户访问。
+- v4 初始字段不包含认证密钥；v7 已增加 Key ID 和应用层加密 Secret 字段，主密钥与 SQLite 文件都必须限制为服务账户访问。
 - 管理接口可以向已认证管理员返回完整配置以支持编辑，但日志、错误和监控快照只返回节点 ID或主机显示值，不记录完整 URL。
 - 不保存连接测试响应体、私有任务列表或模型服务页面内容。
 
@@ -150,3 +152,116 @@ erDiagram
 ## 10. 待确认项
 
 暂无影响实现的数据库决策待确认。真实生产数据库升级前需按现有发布流程备份 SQLite 文件，该动作保留为人工发布检查。
+
+## 11. 2026-08-13 H3 执行恢复增量
+
+### 11.1 迁移信息
+
+| 项目 | 内容 |
+| --- | --- |
+| 迁移文件 | `009_h3_stage_attempt_cancellation.sql` |
+| 来源版本 | v8 |
+| 目标版本 | v9 |
+| 变更表 | `stage_attempts` |
+| 目的 | 允许持久化 H3 执行的取消中和已取消状态 |
+
+`005-api-key-management` 尚未实施，其原计划 v9 顺延为 v10，避免迁移编号冲突。
+
+### 11.2 状态约束
+
+`stage_attempts.status` 从：
+
+```text
+dispatching, running, validating, succeeded, failed, unknown
+```
+
+扩展为：
+
+```text
+dispatching, running, validating, cancelling, succeeded, failed, cancelled, unknown
+```
+
+SQLite 无法直接修改 CHECK，迁移以 `stage_attempts_v9` 重建表：复制全部字段和数据，保持主键、外键、`operation_id` 唯一、`UNIQUE(stage_id,attempt_no)` 与 `uq_stage_attempt_execution`，校验行数一致后替换旧表。迁移期间启用 `PRAGMA defer_foreign_keys=ON`，并由迁移事务保证失败回滚。
+
+### 11.3 Store 状态操作
+
+| 操作 | 条件 | 原子更新 |
+| --- | --- | --- |
+| `MarkStageUnknown` | 当前 attempt 为 dispatching/running/validating/unknown | attempt=unknown，保留 operation/execution，更新 heartbeat 和 next attempt |
+| `MarkStageCancelling` | task 已请求取消且 attempt 非终态 | attempt=cancelling，stage 保持活动，task 保持 cancelling |
+| `CompleteStageCancelled` | Node 返回 cancelled | attempt/stage/task 同事务进入 cancelled，写 finished_at，生成一次 callback |
+| `CompleteStageAfterCancelRace` | Node 在取消竞争中返回 succeeded | 按正常产物事务完成，再由任务层执行已完成记录删除语义 |
+
+`unknown` 和 `cancelling` 都不增加 `attempt_count`，也不创建新 `operation_id`。重启 Claim 必须优先恢复同一 attempt；只有明确终态失败才能按现有最大重试次数创建下一 attempt。
+
+### 11.4 迁移与回滚
+
+- v9 前向迁移不丢弃任何现有列或行；迁移测试必须覆盖空库、v8 升级、已有 unknown attempt 和外键完整性。
+- 旧二进制的代码和 SQL 不识别新增状态，产生 `cancelling/cancelled` 后不能直接应用回滚。发布前备份数据库，回滚必须先停机并由人工确认没有这些状态。
+- 不为 Profile CFG 增加迁移；该配置位于 JSON，应用层在新版本规范化时删除，历史快照只读兼容。
+
+## 12. 任务 FIFO 与播放查询增量
+
+### 12.1 迁移结论
+
+| 项目 | 结论 |
+| --- | --- |
+| 是否需要 DDL | 否 |
+| 是否需要数据回填 | 否 |
+| 是否新增持久化 URL | 否 |
+| 复用字段 | `video_tasks.queue_seq`、`result_artifact_id`、`result_public_url`；`task_stages.task_id/stage_order` |
+
+绝对签名 URL 包含短期 `expires/signature`，必须查询时动态生成，禁止保存到 SQLite。历史成功任务已有 `result_artifact_id` 时可以直接签发，无需回填。
+
+### 12.2 Claim 查询关系
+
+```mermaid
+erDiagram
+    VIDEO_TASKS ||--o{ TASK_STAGES : "task_id"
+    VIDEO_TASKS {
+        integer queue_seq PK "任务 FIFO 顺序"
+        text task_id UK
+        text status
+        text result_artifact_id
+        text result_public_url
+    }
+    TASK_STAGES {
+        text id PK
+        text task_id FK
+        integer stage_order "任务内顺序"
+        text status
+        integer next_attempt_at
+        integer lease_expires_at
+    }
+```
+
+领取查询必须 `JOIN video_tasks t ON t.task_id=task_stages.task_id`，在现有可领取条件之后使用：
+
+```sql
+ORDER BY t.queue_seq ASC, task_stages.stage_order ASC, task_stages.id ASC
+```
+
+不再使用全局 `ORDER BY task_stages.stage_order, task_stages.created_at`。`queue_seq` 是任务表自增主键，任务内阶段使用 `UNIQUE(task_id,stage_order)` 保证顺序唯一。
+
+### 12.3 Manager 任务摘要
+
+`adminTaskSelect` 增加读取 `COALESCE(result_artifact_id,'')`，`AdminTaskSummary` 增加对应字段。该查询仍只读 `video_tasks`，不联表读取节点密钥或 artifact 物理位置。Handler 将 artifact ID 交给 Artifact Service 签名，Store 不构造 URL。
+
+### 12.4 事务与并发
+
+- `ClaimStage` 继续在 immediate 事务中完成候选读取和条件更新，保证多个节点不会领取同一阶段。
+- FIFO 排序只改变候选优先级，不改变 lease、row version、attempt 或父任务状态事务。
+- 已运行/未知/取消中的恢复阶段继续按 `current_node_id` 限定；排序不得突破该约束。
+- Manager 列表、V2 单查/列表和 URL 签发均为只读，不需要新增事务。
+
+### 12.5 索引与性能
+
+- 保留 `idx_stages_claim(status,next_attempt_at,lease_expires_at,stage_order)`、`idx_stages_task(task_id,stage_order)` 和 `video_tasks` 的 `queue_seq` 主键。
+- 当前全局未完成任务上限为 100，本次不新增索引；实施时运行 `EXPLAIN QUERY PLAN`，确认没有对视频 JSON/制品表扫描。
+- 若未来把全局任务上限提高到高数量级，再依据真实查询计划设计 `(status,next_attempt_at,lease_expires_at,task_id)` 等复合索引，不在本修订预优化。
+
+### 12.6 兼容与回滚
+
+- 新旧数据均可被新查询读取；没有 `result_artifact_id` 的历史任务使用合法 `result_public_url` 兼容播放。
+- 无 DDL，代码回滚不需要数据库回滚。
+- 不把 `server.public_base_url` 保存到任务表，部署地址变化后新查询立即生成新域名下的签名 URL。

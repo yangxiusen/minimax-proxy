@@ -83,33 +83,45 @@ const (
 )
 
 type NewTask struct {
-	TaskID, APIKeyID, Model, Scenario string
-	RequestJSON, RequestHash          string
-	Resolution, Ratio                 string
-	Duration, InputImageCount         int
+	TaskID, APIKeyID, Model, Scenario                                string
+	RequestJSON, RequestHash                                         string
+	Resolution, Ratio                                                string
+	Duration, InputImageCount                                        int
+	CallbackURLCiphertext, CallbackURLNonce                          []byte
+	CallbackDeliveryID, CallbackRequestBody, CallbackRequestBodyHash string
+	ProfileID, ConfigSnapshotJSON, ConfigHash                        string
+	ProfileVersion                                                   int64
+	Stages                                                           []NewTaskStage
+}
+
+type NewTaskStage struct {
+	ID, StageType, ConfigSnapshotJSON string
+	StageOrder, MaxAttempts           int
 }
 
 type Task struct {
-	QueueSeq                                 int64
-	TaskID, APIKeyID, Model, Scenario        string
-	RequestJSON, RequestHash                 string
-	Status                                   InternalStatus
-	CancelLocked                             bool
-	UpstreamID, GradioEventID, UpstreamJobID string
-	UpstreamJobsBeforeJSON                   string
-	RetryCount                               int
-	AttemptStartedAt, CancelRequestedAt      time.Time
-	GalleryBeforeJSON                        string
-	ResultInternalURL, ResultPublicURL       string
-	Resolution, RatioRequested, RatioActual  string
-	Duration                                 int
-	UsageTotalSeconds, UsageInputSeconds     int
-	UsageOutputSeconds, UsageInputImageCount int
-	ErrorCode, ErrorMessage                  string
-	CreatedAt, UpdatedAt                     time.Time
-	StartedAt, FinishedAt, ExpiresAt         time.Time
-	DeletedAt                                *time.Time
-	Version                                  int64
+	QueueSeq                                                                   int64
+	TaskID, APIKeyID, Model, Scenario                                          string
+	RequestJSON, RequestHash                                                   string
+	Status                                                                     InternalStatus
+	CancelLocked                                                               bool
+	UpstreamID, GradioEventID, UpstreamJobID                                   string
+	UpstreamJobsBeforeJSON                                                     string
+	RetryCount                                                                 int
+	AttemptStartedAt, CancelRequestedAt                                        time.Time
+	GalleryBeforeJSON                                                          string
+	ResultInternalURL, ResultPublicURL                                         string
+	Resolution, RatioRequested, RatioActual                                    string
+	Duration                                                                   int
+	UsageTotalSeconds, UsageInputSeconds                                       int
+	UsageOutputSeconds, UsageInputImageCount                                   int
+	ErrorCode, ErrorMessage                                                    string
+	CreatedAt, UpdatedAt                                                       time.Time
+	StartedAt, FinishedAt, ExpiresAt                                           time.Time
+	DeletedAt                                                                  *time.Time
+	Version                                                                    int64
+	ProfileID, ConfigSnapshotJSON, ConfigHash, ActiveStageID, ResultArtifactID string
+	ProfileVersion                                                             int64
 }
 
 type TaskFilter struct {
@@ -128,12 +140,12 @@ type AdminTaskFilter struct {
 }
 
 type AdminTaskSummary struct {
-	TaskID, APIKeyID, UpstreamID     string
-	Scenario, Resolution             string
-	Status                           V2Status
-	InternalStatus                   InternalStatus
-	RetryCount                       int
-	ResultPublicURL                  string
-	Duration                         int
-	CreatedAt, StartedAt, FinishedAt time.Time
+	TaskID, APIKeyID, UpstreamID      string
+	Scenario, Resolution              string
+	Status                            V2Status
+	InternalStatus                    InternalStatus
+	RetryCount                        int
+	ResultPublicURL, ResultArtifactID string
+	Duration                          int
+	CreatedAt, StartedAt, FinishedAt  time.Time
 }

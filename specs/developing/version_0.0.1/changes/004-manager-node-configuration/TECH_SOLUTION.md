@@ -1,5 +1,7 @@
 # 管理后台与动态节点技术实现方案
 
+> Node 凭据技术方案已被 `006-node-single-key-conf` 取代：Proxy 解密单 Key 后直接发送 `Authorization: Bearer <key>`，不再组装 Key ID 或检查 scope。
+
 | 项目 | 内容 |
 | --- | --- |
 | 项目名称 | `minimax-h3-tc` |
@@ -20,7 +22,7 @@
 - 现有 YAML 节点一次性无损导入，之后不再成为运行配置源。
 - 服务允许零节点启动，保证管理员始终可以进入后台恢复配置。
 
-不在本次范围：多进程协调、细粒度 RBAC、通用配置中心、私有服务改造。
+不在本次范围：多进程协调、细粒度 RBAC、通用配置中心和私有模型工作流改造；Node 侧仅做统一错误、授权能力和契约快照兼容修复。
 
 ## 2. 核心概念
 
@@ -209,3 +211,226 @@ Scheduler 由固定切片改为线程安全的动态槽集合。每个槽仍保�
 | 假设 | 单前置服务进程独占 SQLite | 无需跨进程通知和租约 | 继续按当前部署模型实现 |
 | 人工确认 | 真实节点新增、修改、停用和重新启用 | 验证热更新与私有服务兼容 | 测试/运维在 Docker 环境执行 |
 | 人工确认 | 有运行任务时停用并重启前置服务 | 验证任务继续闭环 | 测试/运维执行故障演练 |
+
+## 14. 2026-08-13 H3 Node API 契约修订
+
+### 14.1 设计原则
+
+1. Key ID 与 Secret 在领域模型中保持分离，只有 `nodeapi.Client.newRequest` 可以拼接完整 Bearer Token。
+2. 协议转换是显式状态迁移，不由普通全量 PUT 或浏览器 select 默认值隐式触发。
+3. Node 提交的 `operation_id` 是端到端幂等标识；结果未知时不得生成新 operation 或 attempt。
+4. HTTP 失败是否重试优先依据统一错误包的 `retryable`，再由安全的状态码兜底；确定性 4xx 不重试。
+5. Proxy 只消费自己需要的 Node 路由，不用“客户端方法数量等于发布路由数量”冒充完整性。
+
+### 14.2 凭据模型
+
+新增只存在于内存的 `nodeapi.Credentials{KeyID, Secret}`。`NewClient` 接收该结构并在构造时校验 Key ID 非空、Secret 非空；请求边界生成 `Bearer ` + KeyID + `.` + Secret。所有 Registry、Prober、Artifact、Cleanup、Profile Test 和 Orchestrator 工厂都必须传两段值，测试不得再传预拼接 Token。
+
+数据库继续明文保存 `api_key_id`，加密保存 Secret，不存完整 Token。Key ID 使用专用正则 `^[A-Za-z0-9_-]+$` 和 64 位上限；点号是协议分隔符，禁止作为 ID 内容。Secret 维持 32 至 512 位策略，前后空白非法。
+
+```mermaid
+sequenceDiagram
+    participant DB as SQLite
+    participant Registry
+    participant Client as Node Client
+    participant Node as MiniMax-H3
+    DB-->>Registry: api_key_id + encrypted_secret
+    Registry->>Registry: 解密 Secret
+    Registry->>Client: Credentials(KeyID, Secret)
+    Client->>Node: Authorization: Bearer key_id.secret
+    Node-->>Client: h3-node-v1 response
+```
+
+### 14.3 旧节点升级与保存校验
+
+`GET /manager/api/nodes` 继续返回真实 `protocol_version`。普通更新规则如下：
+
+| 当前协议 | 请求协议 | Secret | 结果 |
+| --- | --- | --- | --- |
+| H3 | H3 | 省略 | 已有完整密文时复用，否则 400 `node_api_key_required` |
+| H3 | H3 | 提供 | 重新加密并更新指纹 |
+| Legacy | Legacy | 不允许 | 仅允许启停；连接字段不可修改 |
+| Legacy | H3 | 提供 | 显式升级成功 |
+| Legacy | H3 | 省略 | 400 `node_api_key_required` |
+| H3 | Legacy | 任意 | 400 `node_protocol_downgrade_forbidden` |
+
+实现时在 Handler 读取当前记录后构造“当前 + 请求”的状态迁移，调用领域校验器；只有校验成功才进入 Store。Store 仍保留 SQLite CHECK 作为最后防线，但约束异常不能作为正常业务分支。未知 SQLite 错误继续返回 500，并记录脱敏错误码与请求 ID。
+
+连接测试使用同一凭据结构。Node 的 capabilities 响应新增 `authorization.key_id` 与 `authorization.scopes`；Proxy 校验必需 scope 集合，缓存 capabilities 时不得保存 Secret。该字段只返回给已通过认证的调用方。
+
+### 14.4 取消闭环
+
+Orchestrator 的 `NodeClient` 增加 `CancelExecution`。Stage Store 增加原子读取取消请求和以下动作：`MarkStageCancelling`、`CompleteStageCancelled`、`KeepStageUnknown`。v9 扩展 `stage_attempts.status` 为 `dispatching/running/validating/cancelling/succeeded/failed/cancelled/unknown`。
+
+```mermaid
+stateDiagram-v2
+    [*] --> dispatching
+    dispatching --> running: bind execution_id
+    dispatching --> unknown: submit result unknown
+    running --> unknown: poll temporarily unavailable
+    running --> cancelling: task cancel requested
+    unknown --> running: same operation/execution recovered
+    unknown --> cancelling: cancel requested
+    cancelling --> cancelled: node terminal cancelled
+    cancelling --> succeeded: node completed first
+    running --> succeeded
+    running --> failed
+```
+
+取消 operation ID 必须确定性生成，例如 `cancel:<stage_attempt_id>`，重复调用保持相同值。进程重启后 Claim 可重新取得 `cancelling/unknown` attempt，并继续取消或查询。若 Node 已返回 succeeded，则按真实结果完成阶段，再由任务层执行既有成功任务删除语义；不能把已产生的结果伪装成取消。
+
+### 14.5 不确定结果与重试分类
+
+- `CreateExecution` 在没有收到 HTTP 响应时，将当前 attempt 标为 `unknown`，保留相同 operation，下一次恢复调用同一 Create 接口。Node 根据 operation 幂等返回原 execution。
+- 已有 `execution_id` 的 `GetExecution` 网络/5xx 错误只更新心跳和下次查询时间，不结束 attempt，不占用新的业务重试次数。
+- 统一 `HTTPError` 保存 `StatusCode`、`Code`、`Message`、`Retryable` 和 `RequestID`。`details` 仅可用于内存分类，不进入普通日志或用户响应。
+- 401、403、404、409 和普通 422 默认为确定性错误；429、5xx 和 `retryable=true` 为暂时错误。Node 明确 `retryable=false` 时不重试。
+- 恢复预算到期后，以稳定错误码失败；日志记录 task/stage/attempt/node/request ID，不记录凭据、请求体和 Node details。
+
+### 14.6 Node 侧错误包和契约源
+
+MiniMax-H3 `create_app` 注册 `RequestValidationError` handler，把 Pydantic/FastAPI 校验失败转换为 HTTP 422、`request_validation_failed`、`retryable=false` 的统一错误包。路径、字段名和约束可放入脱敏 details，不返回 Python 异常或本地路径。
+
+Node 从运行时 OpenAPI 生成归一化 `h3-node-v1` 契约快照，包含 12 条路由的请求/响应 schema、认证和错误结构。Proxy vendoring 或 CI 校验所消费的 9 条路由；原 `node_v1_contract.json` 保留为快速路由摘要，不再作为唯一完整性证明。
+
+### 14.7 配置字段对齐
+
+H3 Node generation schema 没有 CFG，且当前工作流使用 `BasicGuider`。Proxy 从新 Profile DTO、页面、校验和冻结快照中移除 `generation.cfg`；历史 JSON 中该字段允许读取但不再传播到新版本。该调整不需要独立列迁移，因为 Profile 配置保存在 JSON 中。
+
+### 14.8 发布顺序
+
+1. 先发布兼容旧 Proxy 的 Node：统一 422 错误包、capabilities 授权范围、OpenAPI 契约，不移除任何旧字段。
+2. 发布 Proxy：结构化凭据、保存校验、取消/未知态恢复、CFG 清理和 v9 迁移。
+3. 在 Manager 中用真实 Key ID + Secret 测试并升级 Legacy 节点。
+4. 完成认证、生成、取消、网络中断和制品删除人工联调后再启用生产调度。
+
+回滚 Proxy 时 v9 表结构由旧二进制忽略新增状态的前提并不成立，因此发布前必须备份 SQLite；若数据库已产生 `cancelling/cancelled` attempt，不允许直接回滚到不识别这些状态的二进制。
+
+## 15. 任务 FIFO、视频播放与绝对结果 URL 设计
+
+### 15.1 设计结论
+
+| 问题 | 根因 | 设计处置 |
+| --- | --- | --- |
+| 后任务先整体成功 | `ClaimStage` 全局按 `stage_order` 优先 | 关联 `video_tasks`，按父任务 `queue_seq`、任务内 `stage_order` 排序 |
+| Manager 成功任务没有播放入口 | H3 新链路只有 `result_artifact_id`，管理摘要未读取/签名 | 管理摘要增加 artifact ID，并复用 `ArtifactURLSigner` 返回 `video_url` |
+| V2 `content.url` 是相对路径 | Artifact Service 的 `URLPrefix` 固定为 `/v2/files` | 增加可信 `server.public_base_url`，签发绝对 Proxy URL |
+| 建议拼接 7860 | 混淆 Proxy 文件路由和 Node 内部制品路由 | 明确禁止；7860 仅供 Proxy 认证访问 Node API |
+
+### 15.2 架构与数据流
+
+```mermaid
+flowchart LR
+    C["API 调用方"] -->|"Bearer 查询任务"| V2["Proxy V2 API :18081"]
+    M["管理员"] -->|"Manager 会话"| UI["Proxy Manager :18081"]
+    V2 --> S["Artifact URL Signer"]
+    UI --> S
+    S -->|"绝对签名 URL"| F["Proxy /v2/files/*"]
+    F -->|"Node Key + artifact ID"| N["H3 Node API :7860"]
+    N --> J["ComfyUI :8188"]
+```
+
+边界说明：
+
+1. 调用方和浏览器只访问 Proxy 的公开地址。
+2. Proxy 文件处理器验证签名/所有权后，用内部凭据向 Node 拉取视频并流式返回。
+3. Node `service_url`、Node Key 和物理 artifact ID 不进入公共或 Manager 响应。
+
+### 15.3 阶段领取算法
+
+`ClaimStage` 继续使用 SQLite immediate 事务和当前条件更新，不改变租约与幂等边界。候选查询从单表读取改为：
+
+```sql
+SELECT s.<stage_columns>
+FROM task_stages AS s
+JOIN video_tasks AS t ON t.task_id = s.task_id
+WHERE <现有可领取、节点匹配、租约和前序阶段条件>
+  AND t.deleted_at IS NULL
+ORDER BY t.queue_seq ASC, s.stage_order ASC, s.id ASC
+LIMIT 1;
+```
+
+关键语义：
+
+- `queue_seq` 是任务创建事务生成的单调主键，比阶段 `created_at` 更稳定地表达全局入队顺序。
+- `stage_order` 只在同一任务内排序，不再跨任务比较。
+- 查询仍先过滤 `preferred_node_id`、恢复阶段 `current_node_id`、`next_attempt_at` 和未完成前序阶段。因此某节点无法执行最早任务时，可领取对该节点最早的可执行任务。
+- 多个节点仍通过 immediate 写事务和 `row_version/lease_token` 竞争，单个阶段最多一个领取者。
+- 单节点且阶段均可执行时，`generation -> interpolation -> restoration -> watermark` 完成后才轮到下一任务。
+
+```mermaid
+sequenceDiagram
+    participant O as Orchestrator
+    participant DB as SQLite
+    participant N as Node
+    O->>DB: ClaimStage(node_id)
+    DB->>DB: 过滤可执行阶段
+    DB->>DB: ORDER BY task.queue_seq, stage.stage_order
+    DB-->>O: 最早任务的下一阶段 + lease
+    O->>N: 创建/恢复 execution
+    N-->>O: succeeded + artifact
+    O->>DB: 原子完成阶段
+    O->>DB: 再次 ClaimStage(node_id)
+    DB-->>O: 同一任务下一阶段优先
+```
+
+### 15.4 绝对 URL 配置与签发
+
+`config.ServerConfig` 增加 `PublicBaseURL *url.URL`（配置键 `server.public_base_url`）。规范化规则：
+
+- 只接受 `http` 或 `https`，必须有 host；禁止 userinfo、query、fragment。
+- path 仅允许空或 `/`，保存时移除尾部 `/`。
+- 不允许从监听地址 `:18081` 猜测，因为它没有调用方可达主机信息。
+- 不读取请求 `Host`、`Forwarded` 或 `X-Forwarded-*`，避免不可信头改变签名链接来源。
+
+启动装配将 Artifact Service 的 `URLPrefix` 设置为：
+
+```text
+{server.public_base_url}/v2/files
+```
+
+签名消息仍只绑定 `method/artifact_id/owner_id/expires`，URL 绝对化不改变校验算法和数据库。正式本机配置示例：
+
+```yaml
+server:
+  address: ":18081"
+  public_base_url: "http://127.0.0.1:18081"
+```
+
+### 15.5 Manager 播放链路
+
+1. `AdminTaskSummary` 和 `adminTaskSelect` 增加 `result_artifact_id`。
+2. Manager Handler 注入同一个 `ArtifactURLSigner`。
+3. 成功任务有 artifact ID 时按其 `api_key_id` 签发 URL；没有 artifact ID 但有合法历史 `result_public_url` 时兼容返回；否则 `video_url=null`。
+4. 页面只在 `video_url` 非空时渲染“播放”。点击后设置 `<video src>` 并打开 `dialog`。
+5. `loadedmetadata/canplay/error` 驱动加载与错误状态；关闭时执行 `pause()`、`removeAttribute("src")`、`load()`。
+6. 列表的 5 秒轮询只重绘列表，不修改播放弹窗当前 URL。
+
+### 15.6 安全、性能与可靠性
+
+- 签名 URL 继续使用短 TTL、HMAC、所有者绑定和固定 GET 方法；不得把 API Key 放入 URL。
+- 文件处理器继续支持单 Range，浏览器可拖动播放进度；不缓存视频正文。
+- Manager 返回的绝对签名 URL 可被同源弹窗直接使用，无需把管理 Cookie转发给 Node。
+- 任务上限当前为 100，候选领取排序可接受；现有 `task_stages` claim 索引与 `video_tasks.queue_seq` 主键参与过滤/关联。本次先不新增索引，以 `EXPLAIN QUERY PLAN` 和并发测试作为验证门禁。
+- 配置缺少/非法 `public_base_url` 时启动失败，避免成功任务返回不可访问或可被请求头污染的 URL。
+
+### 15.7 变更文件与回滚
+
+预计修改：
+
+- `internal/store/sqlite/stage_store.go`、`stage_store_test.go`
+- `internal/config/config.go`、`config_test.go`、三份 YAML 示例/正式配置
+- `internal/artifact/service.go`、`service_test.go`
+- `internal/domain/task.go`、`internal/store/sqlite/store.go`、相关 Store 测试
+- `internal/httpapi/v2/handler.go`、`handler_test.go`
+- `internal/httpapi/manager/handler.go`、`handler_test.go`
+- `internal/httpapi/manager/web/manager.html`、`manager.js`、`styles.css`
+- `cmd/server/main.go`、`main_test.go`、`README.md`
+
+回滚不涉及数据库 DDL。若回滚二进制，删除 `server.public_base_url` 配置键即可恢复旧配置解析；新二进制发布前必须先补齐该配置。
+
+### 15.8 人工确认项
+
+- 使用实际对外域名或调用方可达 IP 配置 `server.public_base_url`，确认非 Proxy 主机也能播放和下载。
+- 在真实多节点环境确认并行吞吐保持不变；不同耗时任务允许完成顺序不同。
+- 用大文件和 Range 拖动验证浏览器播放体验；属于真实环境人工验收，不在自动化完成声明中。

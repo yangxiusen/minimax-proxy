@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	artifactservice "minimax-h3-tc/internal/artifact"
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
 	monitorcache "minimax-h3-tc/internal/monitor"
@@ -39,23 +40,39 @@ type TaskStore interface {
 	AdminDelete(context.Context, string) error
 }
 
+type ArtifactURLSigner interface {
+	SignURL(artifactID, ownerID string) (string, error)
+}
+
 type NodeStore interface {
 	ListModelNodes(context.Context) ([]domain.ModelNode, error)
+	GetModelNode(context.Context, string) (domain.ModelNode, error)
 	CreateModelNode(context.Context, domain.ModelNodeInput) (domain.ModelNode, error)
 	UpdateModelNode(context.Context, string, int64, domain.ModelNodeInput) (domain.ModelNode, error)
 	DeleteModelNode(context.Context, string, int64) error
 }
 
+type NodeSecretCodec interface {
+	Seal(string) ([]byte, []byte, string, error)
+	Open([]byte, []byte) (string, error)
+}
+
 type Dependencies struct {
-	Admin     config.AdminConfig
-	Cache     *monitorcache.Cache
-	Store     TaskStore
-	Nodes     NodeStore
-	Logger    *slog.Logger
-	Now       func() time.Time
-	Rand      io.Reader
-	Wake      func()
-	ProbeNode func(context.Context, domain.ModelNodeInput) NodeProbeResult
+	Admin          config.AdminConfig
+	Cache          *monitorcache.Cache
+	Store          TaskStore
+	Nodes          NodeStore
+	Logger         *slog.Logger
+	Now            func() time.Time
+	Rand           io.Reader
+	Wake           func()
+	ProbeNode      func(context.Context, NodeProbeInput) NodeProbeResult
+	NodeSecrets    NodeSecretCodec
+	ProfileService ProfileService
+	Cleanups       CleanupStore
+	WakeCleanup    func()
+	APIKeyService  APIKeyService
+	ArtifactURLs   ArtifactURLSigner
 }
 
 type handler struct {
@@ -72,7 +89,9 @@ type handler struct {
 	secureCookie    bool
 	monitorInterval time.Duration
 	wake            func()
-	probeNode       func(context.Context, domain.ModelNodeInput) NodeProbeResult
+	probeNode       func(context.Context, NodeProbeInput) NodeProbeResult
+	nodeSecrets     NodeSecretCodec
+	artifactURLs    ArtifactURLSigner
 
 	sessionMu          sync.Mutex
 	sessions           map[[sha256.Size]byte]time.Time
@@ -123,6 +142,8 @@ func NewHandler(dependencies Dependencies) http.Handler {
 		monitorInterval: monitorInterval,
 		wake:            dependencies.Wake,
 		probeNode:       dependencies.ProbeNode,
+		nodeSecrets:     dependencies.NodeSecrets,
+		artifactURLs:    dependencies.ArtifactURLs,
 		sessions:        make(map[[sha256.Size]byte]time.Time),
 		failures:        make(map[string]loginFailure),
 	}
@@ -139,6 +160,9 @@ func NewHandler(dependencies Dependencies) http.Handler {
 	mux.Handle("PUT /manager/api/nodes/{node_id}", h.authenticate(http.HandlerFunc(h.updateNode)))
 	mux.Handle("DELETE /manager/api/nodes/{node_id}", h.authenticate(http.HandlerFunc(h.deleteNode)))
 	mux.Handle("POST /manager/api/nodes/test", h.authenticate(http.HandlerFunc(h.testNode)))
+	RegisterProfileRoutes(mux, h.authenticate, dependencies.ProfileService, dependencies.Admin.Username, logger)
+	registerCleanupRoutes(mux, h.authenticate, dependencies.Cleanups, dependencies.Admin.Username, dependencies.WakeCleanup, now, h.writeJSON, h.writeError)
+	registerAPIKeyRoutes(mux, h.authenticate, dependencies.APIKeyService, logger)
 	h.registerWebRoutes(mux)
 	h.root = h.noStore(mux)
 	return h
@@ -502,7 +526,12 @@ func (h *handler) tasks(w http.ResponseWriter, r *http.Request) {
 	response := tasksResponse{Items: make([]taskDTO, 0, len(items)), Total: total, PageNum: pageNum, PageSize: pageSize}
 	now := h.now()
 	for _, item := range items {
-		response.Items = append(response.Items, taskDTO{ID: item.TaskID, APIKeyID: item.APIKeyID, Status: item.Status, UpstreamID: item.UpstreamID, Scenario: item.Scenario, Resolution: item.Resolution, DurationSeconds: taskDurationSeconds(item, now), CreatedAt: unixTime(item.CreatedAt), Phase: taskPhase(item), RetryCount: item.RetryCount, CanCancel: item.InternalStatus.AdminCanCancel(), CanDelete: item.InternalStatus.AdminCanDelete(), VideoURL: publicVideoURL(item)})
+		videoURL, err := h.publicVideoURL(item)
+		if err != nil {
+			h.internalError(w, r, err)
+			return
+		}
+		response.Items = append(response.Items, taskDTO{ID: item.TaskID, APIKeyID: item.APIKeyID, Status: item.Status, UpstreamID: item.UpstreamID, Scenario: item.Scenario, Resolution: item.Resolution, DurationSeconds: taskDurationSeconds(item, now), CreatedAt: unixTime(item.CreatedAt), Phase: taskPhase(item), RetryCount: item.RetryCount, CanCancel: item.InternalStatus.AdminCanCancel(), CanDelete: item.InternalStatus.AdminCanDelete(), VideoURL: videoURL})
 	}
 	h.writeJSON(w, http.StatusOK, response)
 }
@@ -571,12 +600,25 @@ func taskPhase(item domain.AdminTaskSummary) string {
 	}
 }
 
-func publicVideoURL(item domain.AdminTaskSummary) *string {
-	if item.Status != domain.V2Succeeded || item.ResultPublicURL == "" {
-		return nil
+func (h *handler) publicVideoURL(item domain.AdminTaskSummary) (*string, error) {
+	if item.Status != domain.V2Succeeded {
+		return nil, nil
 	}
-	value := item.ResultPublicURL
-	return &value
+	if item.ResultArtifactID != "" {
+		if h.artifactURLs == nil {
+			return nil, errors.New("artifact URL signer is not configured")
+		}
+		value, err := h.artifactURLs.SignURL(item.ResultArtifactID, item.APIKeyID)
+		if err != nil {
+			return nil, err
+		}
+		return &value, nil
+	}
+	value, ok := artifactservice.LegacyPublicURL(item.ResultPublicURL)
+	if !ok {
+		return nil, nil
+	}
+	return &value, nil
 }
 
 func validTaskID(taskID string) bool { return len(taskID) >= 1 && len(taskID) <= 64 }

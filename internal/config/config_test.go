@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +21,9 @@ func TestLoadExpandsEnvironmentAndAppliesDefaults(t *testing.T) {
 	if cfg.Server.Address != ":8080" {
 		t.Fatalf("Server.Address = %q", cfg.Server.Address)
 	}
+	if cfg.Server.PublicBaseURL == nil || cfg.Server.PublicBaseURL.String() != "http://127.0.0.1:8080" {
+		t.Fatalf("Server.PublicBaseURL = %v", cfg.Server.PublicBaseURL)
+	}
 	if cfg.Queue.ProtectedSlots != 3 || cfg.Queue.PerKeyUnfinishedLimit != 10 {
 		t.Fatalf("Queue defaults = %+v", cfg.Queue)
 	}
@@ -32,8 +36,9 @@ func TestLoadExpandsEnvironmentAndAppliesDefaults(t *testing.T) {
 	if cfg.Admin.SessionTTL != 12*time.Hour || cfg.Admin.MonitorInterval != 5*time.Second {
 		t.Fatalf("Admin duration defaults = %+v", cfg.Admin)
 	}
-	if got := cfg.APIKeys[0].Key; got != "secret-a" {
-		t.Fatalf("expanded key = %q", got)
+	legacyKeys, err := ParseLegacyAPIKeys(cfg.APIKeys)
+	if err != nil || legacyKeys[0].Key != "secret-a" {
+		t.Fatalf("expanded legacy keys = %+v error=%v", legacyKeys, err)
 	}
 	upstreams, err := ParseLegacyUpstreams(cfg.LegacyUpstreams)
 	if err != nil {
@@ -47,6 +52,80 @@ func TestLoadExpandsEnvironmentAndAppliesDefaults(t *testing.T) {
 	}
 	if upstreams[0].SubmitAPIName != "submit_minimax_from_slots" {
 		t.Fatalf("SubmitAPIName = %q", upstreams[0].SubmitAPIName)
+	}
+	if cfg.GenerationProfiles["480P"].FPS != 24 {
+		t.Fatalf("default generation fps = %d, want 24", cfg.GenerationProfiles["480P"].FPS)
+	}
+}
+
+func TestLoadRequiresProxyPublicBaseURL(t *testing.T) {
+	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
+	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
+	yaml := strings.Replace(validYAML(t), "  public_base_url: http://127.0.0.1:8080\n", "", 1)
+	if _, err := Load(writeConfig(t, yaml)); err == nil || !strings.Contains(err.Error(), "server.public_base_url") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestLoadValidatesProxyPublicBaseURL(t *testing.T) {
+	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
+	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "unsupported scheme", value: "ftp://proxy.example"},
+		{name: "missing host", value: "http:///proxy"},
+		{name: "userinfo", value: "https://user:pass@proxy.example"},
+		{name: "query", value: "https://proxy.example?tenant=one"},
+		{name: "fragment", value: "https://proxy.example#fragment"},
+		{name: "subpath", value: "https://proxy.example/ui"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			yaml := strings.Replace(validYAML(t), "http://127.0.0.1:8080", test.value, 1)
+			if _, err := Load(writeConfig(t, yaml)); err == nil || !strings.Contains(err.Error(), "server.public_base_url") {
+				t.Fatalf("Load() error = %v", err)
+			}
+		})
+	}
+
+	yaml := strings.Replace(validYAML(t), "http://127.0.0.1:8080", "https://proxy.example/", 1)
+	cfg, err := Load(writeConfig(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Server.PublicBaseURL.String(); got != "https://proxy.example" {
+		t.Fatalf("Server.PublicBaseURL = %q", got)
+	}
+}
+
+func TestLoadAllowsNoLegacyAPIKeys(t *testing.T) {
+	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
+	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
+	yaml := strings.Replace(validYAML(t), "api_keys:\n  - id: customer-a\n    key: ${TEST_MINIMAX_KEY}\n    enabled: true\n", "", 1)
+	cfg, err := Load(writeConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.APIKeys) != 0 {
+		t.Fatalf("APIKeys = %+v", cfg.APIKeys)
+	}
+}
+
+func TestLoadValidatesLegacyGenerationProfileFPS(t *testing.T) {
+	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
+	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
+	for _, fps := range []int{9, 61} {
+		yaml := strings.Replace(validYAML(t), "  480P:\n    model_mode: high_quality\n", "  480P:\n    model_mode: high_quality\n    fps: "+strconv.Itoa(fps)+"\n", 1)
+		if _, err := Load(writeConfig(t, yaml)); err == nil || !strings.Contains(err.Error(), "generation_profiles.480P") {
+			t.Fatalf("fps %d error = %v", fps, err)
+		}
+	}
+	yaml := strings.Replace(validYAML(t), "  480P:\n    model_mode: high_quality\n", "  480P:\n    model_mode: high_quality\n    fps: 15\n", 1)
+	cfg, err := Load(writeConfig(t, yaml))
+	if err != nil || cfg.GenerationProfiles["480P"].FPS != 15 {
+		t.Fatalf("explicit fps load = %d, error = %v", cfg.GenerationProfiles["480P"].FPS, err)
 	}
 }
 
@@ -110,7 +189,8 @@ func TestLoadExpandsEnvironmentBeforeParsingBooleanAndIntegerFields(t *testing.T
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.Queue.ProtectedSlots != 2 || !cfg.APIKeys[0].Enabled || !cfg.GenerationProfiles["480P"].EasyCache {
+	legacyKeys, keyErr := ParseLegacyAPIKeys(cfg.APIKeys)
+	if cfg.Queue.ProtectedSlots != 2 || keyErr != nil || !legacyKeys[0].Enabled || !cfg.GenerationProfiles["480P"].EasyCache {
 		t.Fatalf("expanded config = %+v api=%+v profile=%+v", cfg.Queue, cfg.APIKeys[0], cfg.GenerationProfiles["480P"])
 	}
 }
@@ -134,7 +214,10 @@ func TestLoadRejectsNonPositiveTaskExecutionTimeout(t *testing.T) {
 	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
 	yaml := "task:\n  execution_timeout: 0s\n" + validYAML(t)
 
-	_, err := Load(writeConfig(t, yaml))
+	cfg, err := Load(writeConfig(t, yaml))
+	if err == nil {
+		_, err = ParseLegacyAPIKeys(cfg.APIKeys)
+	}
 	if err == nil || !strings.Contains(err.Error(), "task.execution_timeout") {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -201,7 +284,10 @@ func TestLoadRejectsInvalidAdminConfig(t *testing.T) {
 func TestLoadRejectsMissingEnvironmentVariable(t *testing.T) {
 	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
 	yaml := strings.ReplaceAll(validYAML(t), "${TEST_MINIMAX_KEY}", "${MISSING_TEST_KEY}")
-	_, err := Load(writeConfig(t, yaml))
+	cfg, err := Load(writeConfig(t, yaml))
+	if err == nil {
+		_, err = ParseLegacyAPIKeys(cfg.APIKeys)
+	}
 	if err == nil || !strings.Contains(err.Error(), "MISSING_TEST_KEY") {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -211,7 +297,10 @@ func TestLoadRejectsDuplicateAPIKey(t *testing.T) {
 	t.Setenv("TEST_MINIMAX_KEY", "same-secret")
 	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
 	yaml := strings.Replace(validYAML(t), "upstreams:\n", "  - id: customer-b\n    key: same-secret\n    enabled: true\nupstreams:\n", 1)
-	_, err := Load(writeConfig(t, yaml))
+	cfg, err := Load(writeConfig(t, yaml))
+	if err == nil {
+		_, err = ParseLegacyAPIKeys(cfg.APIKeys)
+	}
 	if err == nil || !strings.Contains(err.Error(), "API Key") {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -270,13 +359,16 @@ func TestLoadRejectsGenerationProfilesWithout480P(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsConfigWithoutEnabledAPIKey(t *testing.T) {
+func TestLoadAllowsLegacyConfigWithoutEnabledAPIKey(t *testing.T) {
 	t.Setenv("TEST_MINIMAX_KEY", "secret-a")
 	t.Setenv("TEST_UPSTREAM_URL", "http://127.0.0.1:7860")
 	yaml := strings.Replace(validYAML(t), "enabled: true", "enabled: false", 1)
-	_, err := Load(writeConfig(t, yaml))
-	if err == nil || !strings.Contains(err.Error(), "启用") {
+	cfg, err := Load(writeConfig(t, yaml))
+	if err != nil {
 		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.APIKeys) != 1 || cfg.APIKeys[0].Enabled {
+		t.Fatalf("APIKeys = %+v", cfg.APIKeys)
 	}
 }
 
@@ -334,6 +426,7 @@ func validYAML(t *testing.T) string {
 	dbPath := filepath.ToSlash(filepath.Join(t.TempDir(), "minimax.db"))
 	return `server:
   address: ":8080"
+  public_base_url: http://127.0.0.1:8080
 database:
   path: "` + dbPath + `"
 api_keys:

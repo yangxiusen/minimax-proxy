@@ -203,7 +203,7 @@ generation_profiles:
 | 26-28 | 参考视频 | `reference_video` 按 content 顺序 |
 | 29-31 | 参考音频 | `reference_audio` 按 content 顺序 |
 
-HTTP/HTTPS 媒体 URL 生成 `{path:url,meta:{_type:"gradio.FileData"}}`。图片 Base64 Data URI 生成图片 `FileData.url`；WAV/MP3 音频 Base64 Data URI 在提交前通过 `/gradio_api/upload` 换取私有缓存路径，再写入音频 `FileData.path`。视频 Data URI、裸 Base64 和 `mm_file://` 返回 400；`callback_url` 和 `aigc_watermark=true` 继续返回不支持错误，不得静默忽略。
+HTTP/HTTPS 媒体 URL 生成 `{path:url,meta:{_type:"gradio.FileData"}}`。图片 Base64 Data URI 生成图片 `FileData.url`；WAV/MP3 音频 Base64 Data URI 在提交前通过 `/gradio_api/upload` 换取私有缓存路径，再写入音频 `FileData.path`。视频 Data URI、裸 Base64 和 `mm_file://` 返回 400。`aigc_watermark` 省略或 false 时不追加水印阶段，true 时追加一个水印阶段。
 
 ## 8. 创建、领取与取消事务
 
@@ -319,7 +319,7 @@ SQLite 使用 WAL、`foreign_keys=ON`、`busy_timeout`，并限制连接数避�
 | V2 能力 | 首版处理 | 原因 |
 | --- | --- | --- |
 | `callback_url` | 400 拒绝 | 产品明确只允许主动查询 |
-| `aigc_watermark=true` | 400 拒绝 | 私有接口无已验证水印能力 |
+| `aigc_watermark=true` | 追加水印阶段 | 单次请求显式控制，默认不加水印 |
 | `mm_file://` | 400 拒绝 | 无官方文件存储/解析能力 |
 | Data URI | 400 拒绝 | 远程私有实例无法读取中转容器临时文件 |
 | `/v2/h3_context_ir` | 不注册路由 | 私有服务没有等价闭源能力 |

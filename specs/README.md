@@ -18,7 +18,10 @@
 - [测试与验收](developing/version_0.0.1/TEST_ACCEPTANCE.md)：自动化范围与真实上游联调清单。
 - [开发任务](developing/version_0.0.1/task.md)：按依赖排序的实施步骤和验证命令。
 - [任务生命周期闭环变更](developing/version_0.0.1/changes/002-task-lifecycle-closure/CHANGE_SPEC.md)：模型任务对账、一次重试、管理中止/删除和视频访问。
-- [管理后台与节点配置变更](developing/version_0.0.1/changes/004-manager-node-configuration/CHANGE_SPEC.md)：`/manager` 管理后台、模型节点 SQLite 配置与动态运行时。
+- [管理后台与节点配置变更](developing/version_0.0.1/changes/004-manager-node-configuration/CHANGE_SPEC.md)：`/manager`、节点 SQLite 配置、H3 Node API 契约、整任务 FIFO、视频播放与绝对结果 URL 修复。
+- [对外 API Key 管理变更](developing/version_0.0.1/changes/005-api-key-management/CHANGE_SPEC.md)：后台创建、启停和受保护删除，SQLite 摘要存储与旧 YAML 一次性导入；数据库迁移为 v10。
+- [Node 单 Key 与 conf.yml 凭据变更](developing/version_0.0.1/changes/006-node-single-key-conf/CHANGE_SPEC.md)：Node 首次启动生成单 Key 和 WebUI 凭据，Proxy 节点配置移除 Key ID，并保留旧数据库列作为兼容占位。
+- [模型请求配置简化与参数收敛](developing/version_0.0.1/changes/007-request-profile-simplification/CHANGE_SPEC.md)：每个请求分辨率一份即时生效配置，支持删除，移除版本发布链、场景配置和无效/固定参数。
 - [归档](archive/)：已完成版本与历史资料。
 
 `docs/` 是外部参考资料，只用于分析，不得被运行时代码直接引用或依赖。

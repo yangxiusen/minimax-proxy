@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	artifactservice "minimax-h3-tc/internal/artifact"
+	"minimax-h3-tc/internal/callback"
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
 )
@@ -28,22 +30,44 @@ type TaskStore interface {
 	CancelOrDelete(context.Context, string, string) (domain.Action, error)
 }
 
+type ActiveProfileStore interface {
+	GetProfileByResolution(context.Context, string) (domain.ModelRequestProfile, error)
+}
+
+type ArtifactURLSigner interface {
+	SignURL(artifactID, ownerID string) (string, error)
+}
+
+type BearerAuthenticator interface {
+	Authenticate(token string) (ownerID string, ok bool)
+}
+
 type Dependencies struct {
-	Store     TaskStore
-	APIKeys   []config.APIKeyConfig
-	Profiles  map[string]config.GenerationProfile
-	Logger    *slog.Logger
-	Wake      func()
-	Available func() bool
+	Store           TaskStore
+	APIKeys         []config.APIKeyConfig
+	Authenticator   BearerAuthenticator
+	Profiles        map[string]config.GenerationProfile
+	Logger          *slog.Logger
+	Wake            func()
+	Available       func() bool
+	CallbackService *callback.Service
+	CallbackCipher  callback.URLCipher
+	ActiveProfiles  ActiveProfileStore
+	ArtifactURLs    ArtifactURLSigner
 }
 
 type handler struct {
-	store     TaskStore
-	keys      []authKey
-	profiles  map[string]config.GenerationProfile
-	logger    *slog.Logger
-	wake      func()
-	available func() bool
+	store           TaskStore
+	keys            []authKey
+	authenticator   BearerAuthenticator
+	profiles        map[string]config.GenerationProfile
+	logger          *slog.Logger
+	wake            func()
+	available       func() bool
+	callbackService *callback.Service
+	callbackCipher  callback.URLCipher
+	activeProfiles  ActiveProfileStore
+	artifactURLs    ArtifactURLSigner
 }
 
 type authKey struct {
@@ -55,7 +79,7 @@ type contextKey string
 const ownerKey contextKey = "api_key_id"
 
 func NewHandler(dependencies Dependencies) http.Handler {
-	h := &handler{store: dependencies.Store, profiles: dependencies.Profiles, logger: dependencies.Logger, wake: dependencies.Wake, available: dependencies.Available}
+	h := &handler{store: dependencies.Store, authenticator: dependencies.Authenticator, profiles: dependencies.Profiles, logger: dependencies.Logger, wake: dependencies.Wake, available: dependencies.Available, callbackService: dependencies.CallbackService, callbackCipher: dependencies.CallbackCipher, activeProfiles: dependencies.ActiveProfiles, artifactURLs: dependencies.ArtifactURLs}
 	if h.logger == nil {
 		h.logger = slog.Default()
 	}
@@ -129,10 +153,51 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, http.StatusBadRequest, "bad_request_error", "请求只能包含一个 JSON 对象 (2013)")
 		return
 	}
-	validated, err := ValidateCreate(request, h.profiles)
+	validationProfiles := h.profiles
+	if h.activeProfiles != nil {
+		validationProfiles = nil
+	}
+	validated, err := ValidateCreate(request, validationProfiles)
 	if err != nil {
 		h.writeError(w, r, http.StatusBadRequest, "bad_request_error", err.Error()+" (2013)")
 		return
+	}
+	var activeProfile domain.ModelRequestProfile
+	if h.activeProfiles != nil {
+		activeProfile, err = h.activeProfiles.GetProfileByResolution(r.Context(), validated.Resolution)
+		if errors.Is(err, domain.ErrProfileNotFound) || errors.Is(err, domain.ErrInvalidProfileConfig) {
+			h.writeError(w, r, http.StatusBadRequest, "bad_request_error", "请求分辨率不存在或未配置 (2013)")
+			return
+		}
+		if err != nil {
+			h.writeError(w, r, http.StatusServiceUnavailable, "profile_unavailable_error", "模型参数配置暂不可用")
+			return
+		}
+		var profileConfig domain.ProfileConfig
+		if err := json.Unmarshal([]byte(activeProfile.ConfigJSON), &profileConfig); err != nil {
+			h.writeError(w, r, http.StatusServiceUnavailable, "profile_unavailable_error", "模型参数配置暂不可用")
+			return
+		}
+		dimension, ok := profileConfig.Ratios[validated.Ratio]
+		if !ok {
+			h.writeError(w, r, http.StatusBadRequest, "bad_request_error", "ratio 未配置尺寸映射 (2013)")
+			return
+		}
+		validated.Resolution = activeProfile.Resolution
+		validated.CreateRequest.Resolution = activeProfile.Resolution
+		validated.Width, validated.Height = dimension.BaseWidth, dimension.BaseHeight
+	}
+	var callbackTarget *callback.PreparedTarget
+	if validated.CallbackURL != nil {
+		if h.callbackService == nil || h.callbackCipher == nil {
+			h.writeError(w, r, http.StatusServiceUnavailable, "callback_unavailable_error", "callback 服务未配置")
+			return
+		}
+		callbackTarget, err = h.callbackService.PrepareTarget(r.Context(), validated.CallbackURL, h.callbackCipher)
+		if err != nil {
+			h.writeError(w, r, http.StatusBadRequest, "callback_url_error", "callback URL challenge 失败")
+			return
+		}
 	}
 	canonical, err := json.Marshal(validated.CreateRequest)
 	if err != nil {
@@ -140,6 +205,13 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	requestHash := sha256.Sum256(canonical)
+	persistedRequest := validated.CreateRequest
+	persistedRequest.CallbackURL = nil
+	persistedJSON, err := json.Marshal(persistedRequest)
+	if err != nil {
+		h.internalError(w, r, err)
+		return
+	}
 	idempotencyHash := ""
 	if idempotency := r.Header.Get("Idempotency-Key"); idempotency != "" {
 		if !validIdempotencyKey(idempotency) {
@@ -154,7 +226,29 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 		h.internalError(w, r, err)
 		return
 	}
-	task, err := h.store.Create(r.Context(), domain.NewTask{TaskID: taskID, APIKeyID: owner(r.Context()), Model: validated.Model, Scenario: validated.Scenario, RequestJSON: string(canonical), RequestHash: hex.EncodeToString(requestHash[:]), Resolution: validated.Resolution, Duration: validated.Duration, Ratio: validated.Ratio, InputImageCount: validated.InputImageCount}, idempotencyHash, h.available)
+	newTask := domain.NewTask{TaskID: taskID, APIKeyID: owner(r.Context()), Model: validated.Model, Scenario: validated.Scenario, RequestJSON: string(persistedJSON), RequestHash: hex.EncodeToString(requestHash[:]), Resolution: validated.Resolution, Duration: validated.Duration, Ratio: validated.Ratio, InputImageCount: validated.InputImageCount}
+	if h.activeProfiles != nil {
+		newTask.ConfigSnapshotJSON = activeProfile.ConfigJSON
+		newTask.ConfigHash = activeProfile.ConfigHash
+		newTask.Stages, err = freezeStages(taskID, validated, activeProfile.ConfigJSON)
+		if err != nil {
+			h.internalError(w, r, err)
+			return
+		}
+	}
+	if callbackTarget != nil {
+		newTask.CallbackURLCiphertext = callbackTarget.Ciphertext
+		newTask.CallbackURLNonce = callbackTarget.Nonce
+		delivery, deliveryErr := callback.NewDelivery("event_"+randomHex(16), taskID, "queued", 1, nil)
+		if deliveryErr != nil {
+			h.internalError(w, r, deliveryErr)
+			return
+		}
+		newTask.CallbackDeliveryID = delivery.ID
+		newTask.CallbackRequestBody = string(delivery.Body)
+		newTask.CallbackRequestBodyHash = delivery.BodyHash
+	}
+	task, err := h.store.Create(r.Context(), newTask, idempotencyHash, h.available)
 	if err != nil {
 		h.storeError(w, r, err)
 		return
@@ -164,6 +258,107 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 	}
 	h.logger.InfoContext(r.Context(), "视频生成任务已入队", "request_id", requestID(r.Context()), "task_id", task.TaskID, "api_key_id", task.APIKeyID, "scenario", task.Scenario)
 	h.writeJSON(w, http.StatusOK, map[string]string{"task_id": task.TaskID})
+}
+
+func freezeStages(taskID string, request ValidatedRequest, configJSON string) ([]domain.NewTaskStage, error) {
+	var config domain.ProfileConfig
+	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+		return nil, errors.New("已发布配置快照损坏")
+	}
+	mapping, ok := config.Ratios[request.Ratio]
+	if !ok {
+		return nil, errors.New("已发布配置缺少请求比例映射")
+	}
+	modelMode := config.Generation.ModelMode
+	if modelMode == "" {
+		modelMode = "high_quality"
+	}
+	const mainModel = "__follow_model_mode__"
+	const fps = 24
+	seed, err := randomSeed()
+	if err != nil {
+		return nil, err
+	}
+	loras := make([]map[string]any, 0, len(config.LoRAs))
+	for _, lora := range config.LoRAs {
+		loras = append(loras, map[string]any{"name": lora.Name, "strength": lora.Strength})
+	}
+	stageParameters := []struct {
+		stageType  string
+		parameters map[string]any
+		expected   map[string]any
+	}{
+		{
+			stageType: "generation",
+			parameters: map[string]any{
+				"scenario": request.Scenario, "prompt": request.Prompt,
+				"width": mapping.BaseWidth, "height": mapping.BaseHeight,
+				"duration": request.Duration, "fps": fps, "steps": config.Generation.Steps, "seed": seed,
+				"model_mode": modelMode, "sage_attention": config.Generation.SageAttention,
+				"easycache_enabled": config.Generation.CacheMode == "easycache",
+				"te_speed_enabled":  config.Generation.CacheMode == "te_speed",
+				"loras":             loras, "ref_image_size": "match",
+				"fl2va_model": mainModel, "ref2va_model": mainModel,
+			},
+			expected: map[string]any{"preserve_timeline": true, "preserve_audio": true},
+		},
+	}
+	if config.Interpolation.Enabled {
+		stageParameters = append(stageParameters, struct {
+			stageType  string
+			parameters map[string]any
+			expected   map[string]any
+		}{
+			stageType: "interpolation",
+			parameters: map[string]any{
+				"engine": config.Interpolation.Engine, "scale": config.Interpolation.Scale,
+			},
+			expected: map[string]any{"fps_multiplier": config.Interpolation.Scale, "preserve_timeline": true, "preserve_audio": true},
+		})
+	}
+	if config.Restoration.Enabled {
+		stageParameters = append(stageParameters, struct {
+			stageType  string
+			parameters map[string]any
+			expected   map[string]any
+		}{
+			stageType: "restoration",
+			parameters: map[string]any{
+				"engine": config.Restoration.Engine, "scale": config.Restoration.Scale,
+				"source_width": mapping.BaseWidth, "source_height": mapping.BaseHeight,
+				"target_width": mapping.TargetWidth, "target_height": mapping.TargetHeight,
+			},
+			expected: map[string]any{"preserve_timeline": true, "preserve_audio": true},
+		})
+	}
+	if request.AIGCWatermark != nil && *request.AIGCWatermark {
+		stageParameters = append(stageParameters, struct {
+			stageType  string
+			parameters map[string]any
+			expected   map[string]any
+		}{
+			stageType: "watermark",
+			parameters: map[string]any{
+				"enabled": true, "aigc_watermark": true,
+			},
+			expected: map[string]any{"preserve_timeline": true, "preserve_audio": true},
+		})
+	}
+	stages := make([]domain.NewTaskStage, 0, len(stageParameters))
+	for index, stage := range stageParameters {
+		snapshot, err := json.Marshal(map[string]any{
+			"task_id": taskID, "stage_type": stage.stageType,
+			"parameters": stage.parameters, "expected_media": stage.expected,
+		})
+		if err != nil {
+			return nil, err
+		}
+		stages = append(stages, domain.NewTaskStage{
+			ID: "stage_" + randomHex(16), StageType: stage.stageType, StageOrder: (index + 1) * 10,
+			MaxAttempts: 3, ConfigSnapshotJSON: string(snapshot),
+		})
+	}
+	return stages, nil
 }
 
 func (h *handler) get(w http.ResponseWriter, r *http.Request) {
@@ -177,7 +372,12 @@ func (h *handler) get(w http.ResponseWriter, r *http.Request) {
 		h.storeError(w, r, err)
 		return
 	}
-	h.writeJSON(w, http.StatusOK, map[string]TaskResponse{"task": mapTask(task)})
+	response, err := h.mapTask(task)
+	if err != nil {
+		h.internalError(w, r, err)
+		return
+	}
+	h.writeJSON(w, http.StatusOK, map[string]TaskResponse{"task": response})
 }
 
 func (h *handler) list(w http.ResponseWriter, r *http.Request) {
@@ -220,7 +420,12 @@ func (h *handler) list(w http.ResponseWriter, r *http.Request) {
 	}
 	responses := make([]TaskResponse, 0, len(items))
 	for _, item := range items {
-		responses = append(responses, mapTask(item))
+		response, err := h.mapTask(item)
+		if err != nil {
+			h.internalError(w, r, err)
+			return
+		}
+		responses = append(responses, response)
 	}
 	h.writeJSON(w, http.StatusOK, map[string]any{"items": responses, "total": total})
 }
@@ -249,11 +454,15 @@ func (h *handler) authenticate(next http.Handler) http.Handler {
 			h.writeError(w, r, http.StatusUnauthorized, "authorized_error", "login fail: 请在 Authorization 中携带 API Key (1004)")
 			return
 		}
-		digest := sha256.Sum256([]byte(header[7:]))
 		matched := ""
-		for _, key := range h.keys {
-			if subtle.ConstantTimeCompare(digest[:], key.digest[:]) == 1 {
-				matched = key.id
+		if h.authenticator != nil {
+			matched, _ = h.authenticator.Authenticate(header[7:])
+		} else {
+			digest := sha256.Sum256([]byte(header[7:]))
+			for _, key := range h.keys {
+				if subtle.ConstantTimeCompare(digest[:], key.digest[:]) == 1 {
+					matched = key.id
+				}
 			}
 		}
 		if matched == "" {
@@ -306,19 +515,30 @@ func (h *handler) writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-func mapTask(task domain.Task) TaskResponse {
+func (h *handler) mapTask(task domain.Task) (TaskResponse, error) {
 	ratio := task.RatioActual
 	if ratio == "" {
 		ratio = task.RatioRequested
 	}
 	response := TaskResponse{ID: task.TaskID, Model: task.Model, Status: task.Status.V2(), CreatedAt: task.CreatedAt.Unix(), UpdatedAt: task.UpdatedAt.Unix(), Resolution: task.Resolution, Duration: task.Duration, Usage: TaskUsage{TotalSeconds: task.UsageTotalSeconds, InputSeconds: task.UsageInputSeconds, OutputSeconds: task.UsageOutputSeconds, InputImageCount: task.UsageInputImageCount}, Ratio: ratio, TaskType: "generation", Modality: "video"}
 	if task.Status == domain.StatusSucceeded {
-		response.Content = &TaskContent{URL: task.ResultPublicURL}
+		if task.ResultArtifactID != "" {
+			if h.artifactURLs == nil {
+				return TaskResponse{}, errors.New("artifact URL signer is not configured")
+			}
+			resultURL, err := h.artifactURLs.SignURL(task.ResultArtifactID, task.APIKeyID)
+			if err != nil {
+				return TaskResponse{}, err
+			}
+			response.Content = &TaskContent{URL: resultURL}
+		} else if resultURL, ok := artifactservice.LegacyPublicURL(task.ResultPublicURL); ok {
+			response.Content = &TaskContent{URL: resultURL}
+		}
 	}
 	if task.Status == domain.StatusFailed {
 		response.Error = &TaskError{Code: task.ErrorCode, Message: task.ErrorMessage}
 	}
-	return response
+	return response, nil
 }
 
 func ensureJSONEnd(decoder *json.Decoder) error {
@@ -372,4 +592,12 @@ func newNumericID() (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("%018d", number), nil
+}
+
+func randomSeed() (int64, error) {
+	number, err := rand.Int(rand.Reader, new(big.Int).SetInt64(int64(^uint64(0)>>1)))
+	if err != nil {
+		return 0, err
+	}
+	return number.Int64(), nil
 }

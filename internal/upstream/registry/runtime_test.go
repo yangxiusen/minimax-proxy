@@ -2,8 +2,11 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"path/filepath"
 	"testing"
 	"time"
@@ -13,6 +16,7 @@ import (
 	"minimax-h3-tc/internal/monitor"
 	storepkg "minimax-h3-tc/internal/store/sqlite"
 	"minimax-h3-tc/internal/upstream/gradio"
+	"minimax-h3-tc/internal/upstream/nodeapi"
 )
 
 func TestNodeRuntimeFactoryMonitorsDisabledNodeWithoutClaiming(t *testing.T) {
@@ -148,8 +152,150 @@ func TestCachedSchedulableRejectsPrivateWorkAndSchedulingBlock(t *testing.T) {
 	}
 }
 
+func TestNodeAPIRuntimeUsesSingleServiceEndpointAndBearerSecret(t *testing.T) {
+	ctx := context.Background()
+	store, err := storepkg.Open(ctx, filepath.Join(t.TempDir(), "node-api.db"), storepkg.Options{
+		ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 10, Retention: time.Hour, IdempotencyTTL: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	nodeInput := domain.ModelNodeInput{
+		ID: "gpu-api", ServiceURL: "http://127.0.0.1:7860", ProtocolVersion: nodeapi.ProtocolVersion,
+		APIKeyNonce: []byte("nonce"), APIKeyCiphertext: []byte("ciphertext"), APIKeyFingerprint: "fingerprint",
+		PollInterval: time.Second, RequestTimeout: time.Second, Enabled: true,
+	}
+	node, err := store.CreateModelNode(ctx, nodeInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := domain.NewTask{
+		TaskID: "active-h3", APIKeyID: "owner", Model: "MiniMax-H3", Scenario: "t2va",
+		RequestJSON: `{"model":"MiniMax-H3"}`, RequestHash: "active-h3", Resolution: "480P", Duration: 5, Ratio: "16:9",
+		Stages: []domain.NewTaskStage{{ID: "active-stage", StageType: "generation", StageOrder: 10, MaxAttempts: 2, ConfigSnapshotJSON: `{}`}},
+	}
+	if _, err := store.Create(ctx, input, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	stage, err := store.ClaimStage(ctx, node.ID, "lease", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := storepkg.StageAttempt{ID: "active-attempt", StageID: stage.ID, AttemptNo: 1, OperationID: "active-operation", NodeID: node.ID, Status: "dispatching"}
+	if err := store.CreateStageAttempt(ctx, attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindStageExecution(ctx, stage.ID, stage.LeaseToken, attempt.ID, "active-execution"); err != nil {
+		t.Fatal(err)
+	}
+	queueRunning, queuePending := 0, 2
+	memoryTotal, memoryFree := int64(1000), int64(250)
+	vramTotal, vramFree := int64(800), int64(200)
+	cpu, gpu := 12.5, 42.0
+	client := &nodeAPIClientFake{
+		called: make(chan string, 2),
+		health: nodeapi.Health{Status: "healthy", ProtocolVersion: nodeapi.ProtocolVersion, Runtime: &nodeapi.HealthRuntime{
+			QueueRunning: &queueRunning, QueuePending: &queuePending,
+			MemoryTotalBytes: &memoryTotal, MemoryFreeBytes: &memoryFree,
+			VRAMTotalBytes: &vramTotal, VRAMFreeBytes: &vramFree,
+			CPUPercent: &cpu, GPUPercent: &gpu,
+		}},
+	}
+	cache := monitor.NewCache(nil)
+	factory := NodeRuntimeFactory{
+		Store:           store,
+		Cache:           cache,
+		MonitorInterval: time.Hour,
+		NodeSecrets:     nodeSecretFake{},
+		NodeAPIClientFactory: func(serviceURL *url.URL, apiKey string, _ *http.Client, _ int64) NodeAPIClient {
+			if serviceURL.String() != "http://127.0.0.1:7860" || apiKey != "Abcdefghijklmnopqrstuvwx12345678" {
+				t.Fatalf("node API connection=%s key=%q", serviceURL, apiKey)
+			}
+			return client
+		},
+	}
+	runtime, err := factory.Start(ctx, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Stop()
+	for range 2 {
+		select {
+		case <-client.called:
+		case <-time.After(time.Second):
+			t.Fatal("node API was not probed")
+		}
+	}
+	waitFor(t, func() bool {
+		snapshot, ok := cache.Get(node.ID)
+		return ok && snapshot.Health == monitor.HealthHealthy && snapshot.Runtime == monitor.RuntimeRunning && !snapshot.Applying &&
+			snapshot.PrivateQueue != nil && *snapshot.PrivateQueue == 2 &&
+			snapshot.MemoryPercent != nil && *snapshot.MemoryPercent == 75 &&
+			snapshot.VRAMPercent != nil && *snapshot.VRAMPercent == 75 &&
+			snapshot.CPUPercent != nil && *snapshot.CPUPercent == cpu &&
+			snapshot.GPUPercent != nil && *snapshot.GPUPercent == gpu &&
+			snapshot.CurrentTask != nil && snapshot.CurrentTask.ID == input.TaskID && snapshot.CurrentTask.Status == "running"
+	})
+	if err := store.CompleteStage(ctx, stage.ID, stage.LeaseToken, attempt.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	runtime.Wake()
+	for range 2 {
+		select {
+		case <-client.called:
+		case <-time.After(time.Second):
+			t.Fatal("node API was not reprobed")
+		}
+	}
+	waitFor(t, func() bool {
+		snapshot, ok := cache.Get(node.ID)
+		return ok && snapshot.CurrentTask == nil && snapshot.LatestFinishedTask != nil &&
+			snapshot.LatestFinishedTask.ID == input.TaskID && snapshot.LatestFinishedTask.Status == "succeeded"
+	})
+}
+
 type runtimeClientFake struct {
 	called chan struct{}
+}
+
+type nodeSecretFake struct{}
+
+func (nodeSecretFake) Open(_ []byte, _ []byte) (string, error) {
+	return "Abcdefghijklmnopqrstuvwx12345678", nil
+}
+
+type nodeAPIClientFake struct {
+	called chan string
+	health nodeapi.Health
+}
+
+func (f *nodeAPIClientFake) Health(_ context.Context, requestID string) (nodeapi.Health, error) {
+	f.called <- requestID
+	if f.health.Status != "" {
+		return f.health, nil
+	}
+	return nodeapi.Health{Status: "healthy", ProtocolVersion: nodeapi.ProtocolVersion}, nil
+}
+
+func (f *nodeAPIClientFake) Capabilities(_ context.Context, requestID string) (nodeapi.Capabilities, error) {
+	f.called <- requestID
+	return nodeapi.Capabilities{ProtocolVersion: nodeapi.ProtocolVersion}, nil
+}
+
+func (*nodeAPIClientFake) CreateExecution(context.Context, string, nodeapi.ExecutionRequest) (nodeapi.ExecutionReference, error) {
+	return nodeapi.ExecutionReference{}, errors.New("unexpected execution create")
+}
+
+func (*nodeAPIClientFake) GetExecution(context.Context, string, string) (nodeapi.Execution, error) {
+	return nodeapi.Execution{}, errors.New("unexpected execution read")
+}
+
+func (*nodeAPIClientFake) GetArtifact(context.Context, string, string) (nodeapi.Artifact, error) {
+	return nodeapi.Artifact{}, errors.New("unexpected artifact read")
+}
+func (*nodeAPIClientFake) ImportArtifact(context.Context, string, nodeapi.ImportArtifactRequest) (nodeapi.Artifact, error) {
+	return nodeapi.Artifact{}, errors.New("unexpected import")
 }
 
 func (*runtimeClientFake) Healthy(context.Context, string) error { return nil }

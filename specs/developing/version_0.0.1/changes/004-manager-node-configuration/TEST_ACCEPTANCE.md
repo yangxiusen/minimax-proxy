@@ -1,5 +1,7 @@
 # 管理后台与动态节点测试验收准备
 
+> 模型节点凭据验收以 `006-node-single-key-conf/TEST_ACCEPTANCE.md` 为准；本文旧 Key ID、scope 和复合 Token 用例不再作为现行验收标准。
+
 ## 1. 基本信息
 
 | 项目 | 内容 |
@@ -7,7 +9,7 @@
 | 版本/变更 | `004-manager-node-configuration` |
 | 测试范围 | YAML 首次导入、SQLite 节点配置、动态运行时、管理接口和页面 |
 | 输入文档 | `CHANGE_SPEC.md`、`TECH_SOLUTION.md`、`DATABASE_DELTA.md`、`API_DELTA.md`、`PROTOTYPE_DELTA.md`、`task.md` |
-| 状态 | 自动化验收完成，人工联调待确认 |
+| 状态 | 原动态节点功能自动化完成；H3 真实生成闭环已通过，取消/公网 callback 等发布门禁仍待验收 |
 
 ## 2. 自动化测试范围
 
@@ -25,24 +27,24 @@
 
 | 用例ID | 场景 | 前置条件 | 操作步骤 | 预期结果 | 结果 |
 | --- | --- | --- | --- | --- | --- |
-| MN-001 | 合法旧 YAML 首次导入 | v3 数据库，2 个合法 upstream | 启动新版本两次 | 第一次原子导入 2 条并写标记，第二次不重复 | 通过（自动化） |
-| MN-002 | 导入中存在非法节点 | v3 数据库，旧 YAML 有非法 URL | 启动服务 | 启动失败；节点和标记均未写入，修正后可重试 | 通过（自动化） |
-| MN-003 | 首次启动没有 YAML 节点 | 空数据库，无 upstream | 启动服务 | 服务和 `/manager` 正常，写入 0 条导入标记 | 通过（自动化/本地启动） |
-| MN-004 | 导入后 YAML 变更 | 已存在导入标记 | 保持 YAML 语法合法但把节点 URL 改为无效值，或删除 upstream 后重启 | 节点仍取数据库，启动不受旧节点内容影响 | 通过（自动化） |
-| MN-005 | 节点全删后重启 | 导入完成，节点均软删除 | 重启服务 | 不重新导入 YAML，节点列表保持空 | 通过（自动化） |
-| MN-006 | 新增启用节点 | 管理员已登录 | 保存合法节点 | DB version=1，Registry 应用，首次探测前不可调度 | 通过（自动化） |
-| MN-007 | 更新空闲节点连接 | 节点无活动任务 | PUT 新配置和当前版本 | 版本加一，旧槽退出且仅有一个新槽 | 通过（自动化） |
-| MN-008 | 活动任务时修改地址 | 节点有 running 任务 | PUT 新配置和当前版本 | 409 `node_has_active_task`，数据库不变 | 通过（自动化） |
-| MN-009 | 活动任务时停用 | 节点有 running 任务 | 仅把 enabled 改为 false | 保存成功，当前任务继续处理，不领取下一条 | 通过（自动化） |
-| MN-010 | 重启恢复停用节点任务 | 停用节点有 reconciling 任务 | 重启前置服务 | 为该节点恢复 Worker，任务进入终态后不领取新任务 | 通过（自动化） |
-| MN-011 | 重新启用节点 | 已停用且无活动任务 | 更新 enabled=true | 首次新健康检查通过后恢复调度 | 通过（自动化） |
-| MN-012 | 删除启用节点 | 节点 enabled=true | DELETE | 409 `node_must_be_disabled` | 通过（自动化） |
-| MN-013 | 删除停用活动节点 | enabled=false 且有活动任务 | DELETE | 409 `node_has_active_task` | 通过（自动化） |
-| MN-014 | 删除停用空闲节点 | enabled=false 且无活动任务 | DELETE | 软删除，停止运行条目并清缓存，历史任务 ID 保留 | 通过（自动化） |
-| MN-015 | 并发更新 | 两个请求使用相同 version | 并发 PUT | 仅一个成功，另一个 409 版本冲突 | 通过（自动化） |
-| MN-016 | 草稿连接测试 | 合法本地 HTTP fake | POST test | 并行检查 Gradio/Jobs，DB 和缓存不变 | 通过（自动化） |
-| MN-017 | Registry 通知丢失 | 配置已写但不调用 Wake | 等待兜底周期 | Registry 最终应用新版本 | 通过（自动化） |
-| MN-018 | 零可用节点创建任务 | 零节点或全停用 | 调用创建视频任务 | 返回现有服务不可用响应，不产生假运行任务 | 通过（自动化） |
+| BASE-001 | 合法旧 YAML 首次导入 | v3 数据库，2 个合法 upstream | 启动新版本两次 | 第一次原子导入 2 条并写标记，第二次不重复 | 通过（自动化） |
+| BASE-002 | 导入中存在非法节点 | v3 数据库，旧 YAML 有非法 URL | 启动服务 | 启动失败；节点和标记均未写入，修正后可重试 | 通过（自动化） |
+| BASE-003 | 首次启动没有 YAML 节点 | 空数据库，无 upstream | 启动服务 | 服务和 `/manager` 正常，写入 0 条导入标记 | 通过（自动化/本地启动） |
+| BASE-004 | 导入后 YAML 变更 | 已存在导入标记 | 保持 YAML 语法合法但把节点 URL 改为无效值，或删除 upstream 后重启 | 节点仍取数据库，启动不受旧节点内容影响 | 通过（自动化） |
+| BASE-005 | 节点全删后重启 | 导入完成，节点均软删除 | 重启服务 | 不重新导入 YAML，节点列表保持空 | 通过（自动化） |
+| BASE-006 | 新增启用节点 | 管理员已登录 | 保存合法节点 | DB version=1，Registry 应用，首次探测前不可调度 | 通过（自动化） |
+| BASE-007 | 更新空闲节点连接 | 节点无活动任务 | PUT 新配置和当前版本 | 版本加一，旧槽退出且仅有一个新槽 | 通过（自动化） |
+| BASE-008 | 活动任务时修改地址 | 节点有 running 任务 | PUT 新配置和当前版本 | 409 `node_has_active_task`，数据库不变 | 通过（自动化） |
+| BASE-009 | 活动任务时停用 | 节点有 running 任务 | 仅把 enabled 改为 false | 保存成功，当前任务继续处理，不领取下一条 | 通过（自动化） |
+| BASE-010 | 重启恢复停用节点任务 | 停用节点有 reconciling 任务 | 重启前置服务 | 为该节点恢复 Worker，任务进入终态后不领取新任务 | 通过（自动化） |
+| BASE-011 | 重新启用节点 | 已停用且无活动任务 | 更新 enabled=true | 首次新健康检查通过后恢复调度 | 通过（自动化） |
+| BASE-012 | 删除启用节点 | 节点 enabled=true | DELETE | 409 `node_must_be_disabled` | 通过（自动化） |
+| BASE-013 | 删除停用活动节点 | enabled=false 且有活动任务 | DELETE | 409 `node_has_active_task` | 通过（自动化） |
+| BASE-014 | 删除停用空闲节点 | enabled=false 且无活动任务 | DELETE | 软删除，停止运行条目并清缓存，历史任务 ID 保留 | 通过（自动化） |
+| BASE-015 | 并发更新 | 两个请求使用相同 version | 并发 PUT | 仅一个成功，另一个 409 版本冲突 | 通过（自动化） |
+| BASE-016 | 草稿连接测试 | 合法本地 HTTP fake | POST test | 并行检查 Gradio/Jobs，DB 和缓存不变 | 通过（自动化） |
+| BASE-017 | Registry 通知丢失 | 配置已写但不调用 Wake | 等待兜底周期 | Registry 最终应用新版本 | 通过（自动化） |
+| BASE-018 | 零可用节点创建任务 | 零节点或全停用 | 调用创建视频任务 | 返回现有服务不可用响应，不产生假运行任务 | 通过（自动化） |
 
 ## 4. 接口与页面测试
 
@@ -134,4 +136,101 @@
 
 | 问题ID | 问题 | 严重程度 | 复现步骤 | 处理状态 |
 | --- | --- | --- | --- | --- |
-| 暂无 | 暂无 | - | - | - |
+| H3-A01 | Proxy 只发送 Secret，未按 Key ID + Secret 组装 Node Token | Critical | 新建真实 H3 节点后测试/探测返回 401 | 待修复 |
+| H3-A02 | Legacy 节点编辑时隐式切换 H3 且复用空密钥，SQLite CHECK 返回 500 | High | 编辑首次导入节点并直接保存 | 待修复 |
+| H3-A03 | H3 Orchestrator 未调用取消接口 | High | 运行中任务发起管理员取消 | 待修复 |
+| H3-A04 | 提交/轮询未知可能创建新 operation 并重复生成 | High | Node 接收提交后断开响应或轮询断网 | 待修复 |
+
+## 12. H3 契约修订自动化验收
+
+| 用例ID | 场景 | 预期 | 状态 |
+| --- | --- | --- | --- |
+| H3-001 | 分离 `proxy`/`secret` 构造客户端 | 请求头为 `Bearer proxy.secret`，日志无 Token | Pending |
+| H3-002 | Legacy 节点空 Secret 普通保存 | 400 稳定错误或仅启停成功，不写 DB、不返回 500 | Pending |
+| H3-003 | Legacy 显式升级 | Key ID/Secret 完整时升级；活动任务、缺 Secret、隐式升级均拒绝 | Pending |
+| H3-004 | Key ID 边界 | 点号、65 位、空值拒绝；下划线和连字符接受 | Pending |
+| H3-005 | Node Pydantic 校验失败 | 422 统一错误包，`retryable=false` | Pending |
+| H3-006 | Scope 检查 | 缺任一必需 scope 时连接测试失败并列出缺失项 | Pending |
+| H3-007 | 运行任务取消 | 调用相同 cancel operation，Node/Proxy 收口 cancelled | Pending |
+| H3-008 | 取消与成功竞争 | 以 Node 真实 succeeded 为准，不伪造 cancelled | Pending |
+| H3-009 | 提交响应未知 | 重试相同 operation，最多一个 Node execution | Pending |
+| H3-010 | 轮询短暂中断 | 保留同一 execution/attempt，恢复后正常完成 | Pending |
+| H3-011 | 确定性 4xx | 不重试、不创建新 attempt | Pending |
+| H3-012 | v8 升级 v9 | 新状态约束、行数、索引和外键全部正确 | Pending |
+| H3-013 | Profile 测试超时 | 尽力取消远端 execution，无长期遗留作业 | Pending |
+| H3-014 | 历史 CFG 配置 | 可读，发布新配置时删除，页面不展示 CFG | Pending |
+| H3-015 | 发布/消费接口矩阵 | Node 12 路由存在；Proxy 9 路由完整；3 条 maintenance 不消费 | Pending |
+| H3-016 | ASGI 内查询已完成 execution | 不调用嵌套 `asyncio.run`；返回 succeeded + artifact | Passed（自动化 + 真实 Node） |
+| H3-017 | 8188 队列和容量转发 | health/Manager 显示真实队列、CPU、GPU、内存、显存 | Passed（自动化 + 真实 Node） |
+| H3-018 | Stage 开始同步父任务 | 单查、列表、Manager 均显示 running + node ID | Passed（自动化 + 真实任务） |
+| H3-019 | Stage 完成同步与回调 | Proxy succeeded、签名 URL 可下载、callback 收到 succeeded | Partially passed：真实生成/查询/列表/下载通过；callback 状态与投递自动化通过，公网地址待提供 |
+| H3-020 | H3 URL 含 `/ui` | Manager 保存返回 400；运行请求不出现 `/ui/internal/v1/*` | Passed（自动化 + 正式日志） |
+
+## 13. 验证命令与人工门禁
+
+Proxy 自动化：
+
+```powershell
+go test ./internal/upstream/nodeapi ./internal/httpapi/manager ./internal/orchestrator ./internal/profile ./internal/cleanup ./internal/artifact -count=1
+go test ./... -count=1
+go vet ./...
+go build ./cmd/server ./cmd/healthcheck
+```
+
+Node 自动化：
+
+```powershell
+walkingwithai\python.exe -m pytest tests\h3_service -q
+```
+
+2026-08-13 最终执行：Node `231 passed`；Proxy `go test ./... -count=1`、`go vet ./...`、`go build ./cmd/server ./cmd/healthcheck` 全部通过。真实任务、下载摘要和运行快照证据见 `task.md` 的 MN-025。
+
+人工门禁：真实 Key ID/Secret 认证、全部必需 scope、真实 GPU 生成取消、提交响应未知、轮询断网恢复、升级备份与回滚演练。任何一项未执行都不得宣称生产联调完成。
+
+## 14. FIFO、播放与绝对 URL 自动化验收
+
+| 用例ID | 场景 | 预期 | 状态 |
+| --- | --- | --- | --- |
+| TD-001 | 早任务含 generation+restoration，后任务仅 generation | 早任务 generation 成功后下一次领取 restoration，不领取后任务 generation | Passed（自动化） |
+| TD-002 | 同一任务三阶段 | 严格按 stage_order 领取，前序未成功时后序不可领取 | Passed（自动化） |
+| TD-003 | 两节点并行 | 节点 A 已运行早任务时，节点 B 可领取其最早可执行任务，不重复领取阶段 | Passed（自动化并发） |
+| TD-004 | 最早阶段限定其他节点 | 当前节点跳过不可执行阶段，领取对其最早的可执行任务 | Passed（自动化） |
+| TD-005 | 最早阶段在 retry_wait | `next_attempt_at` 未到时不阻塞后续可执行任务；到期后恢复 FIFO | Passed（自动化） |
+| TD-006 | 重启恢复活动阶段 | 使用原 current node/operation/execution 恢复，不因排序新建执行 | Passed（自动化） |
+| TD-007 | public_base_url 合法性 | 合法 HTTP/HTTPS 根地址规范化；凭据、query、fragment、子路径和缺 host 拒绝启动 | Passed（自动化） |
+| TD-008 | V2 单任务成功 | `content.url` 为配置的 Proxy 绝对地址且签名可下载 | Passed（自动化/独立本地实例） |
+| TD-009 | V2 列表混合状态 | 仅成功项有绝对 content URL，其他响应字段不变 | Passed（自动化/独立本地实例） |
+| TD-010 | Host 头注入 | 恶意 Host/X-Forwarded 不改变返回 URL 前缀 | Passed（自动化） |
+| TD-011 | Manager H3 artifact 任务 | 列表返回非空绝对 `video_url`，不返回 artifact ID/Node URL | Passed（自动化/独立本地实例） |
+| TD-012 | Manager 历史任务 | 无 artifact、有合法历史 public URL 时仍可播放 | Passed（自动化，仅兼容安全 HTTP(S) 绝对地址） |
+| TD-013 | 播放按钮显隐 | 仅 video_url 非空的成功任务显示“播放” | Passed（页面契约/Playwright） |
+| TD-014 | 播放弹窗生命周期 | 打开可播放；关闭暂停、清 src、释放资源；列表轮询不干扰 | Passed（Playwright 桌面/480px） |
+| TD-015 | Range 播放 | 浏览器 Range 请求得到 206 和正确 Content-Range，可拖动进度 | Partially passed（206/Content-Range 自动化通过；真实大视频拖动待人工） |
+| TD-016 | URL 过期或文件故障 | 文件 API 保持稳定错误，播放弹窗显示受控失败文案 | Passed（自动化/Playwright） |
+
+自动化命令准备：
+
+```powershell
+go test ./internal/store/sqlite -run 'TestClaimStage' -count=1
+go test ./internal/config ./internal/artifact ./internal/httpapi/v2 ./internal/httpapi/manager ./cmd/server -count=1
+node --check internal/httpapi/manager/web/manager.js
+go test ./... -count=1
+go vet ./...
+go build ./cmd/server ./cmd/healthcheck
+```
+
+执行记录（2026-08-13，MN-026 至 MN-030）：
+
+- ClaimStage 定向测试重复 20 次通过；查询计划使用 claim、前序阶段和任务主键索引。取消中、已取消、其他终态和软删除父任务均不可再领取。
+- 独立本地 Proxy `18082` 完成绝对 URL、单查、列表、Manager 和播放器验证；正式 `18081` 未重启，不将本地验证误报为正式发布。
+- 历史 `result_public_url` 不做 DNS 解析；为避免请求期 DNS/网络副作用，兼容层拒绝已知本机/私网字面地址和非规范数值 IPv4，但历史域名的当前 DNS 指向仍依赖部署方维护可信数据。新 H3 任务不走该路径，统一使用 Proxy artifact 签名 URL。
+- 全仓测试、vet、双入口构建、JS 语法和 diff 检查通过；race 因本机缺少 `gcc` 未执行。
+
+## 15. 新增人工确认项
+
+| 确认项 | 原因 | 负责人/角色 | 状态 |
+| --- | --- | --- | --- |
+| 外部地址可达性 | 需要从非 Proxy 主机验证真实域名、防火墙和反向代理 | 运维/测试 | 待人工确认 |
+| 真实多节点 FIFO 与吞吐 | 需要至少两台可运行 Node，且任务耗时不可由单测等价模拟 | 测试/研发 | 待专用环境确认 |
+| 大视频播放和拖动 | 需要真实 MP4、浏览器和网络条件验证 Range 体验 | 测试/业务 | 待人工确认 |
+| HTTPS 混合内容检查 | 需要真实 HTTPS Manager 页面确认视频 URL 也为 HTTPS | 运维/测试 | 待人工确认 |

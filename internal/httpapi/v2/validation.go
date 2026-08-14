@@ -49,21 +49,12 @@ func ValidateCreate(request CreateRequest, profiles map[string]config.Generation
 	if len(request.Content) < 1 || len(request.Content) > 16 {
 		return ValidatedRequest{}, fmt.Errorf("content 数量必须为 1-16")
 	}
-	switch request.Resolution {
-	case "480P", "768P", "2K":
-	default:
-		return ValidatedRequest{}, fmt.Errorf("resolution 仅支持 480P、768P 或 2K")
-	}
 	if request.Duration < 4 || request.Duration > 15 {
 		return ValidatedRequest{}, fmt.Errorf("duration 必须为 4-15 的整数")
 	}
-	if request.CallbackURL != nil {
-		return ValidatedRequest{}, fmt.Errorf("callback_url 暂不支持")
+	if request.CallbackURL != nil && strings.TrimSpace(*request.CallbackURL) == "" {
+		return ValidatedRequest{}, fmt.Errorf("callback_url 不能为空")
 	}
-	if request.AIGCWatermark != nil && *request.AIGCWatermark {
-		return ValidatedRequest{}, fmt.Errorf("aigc_watermark=true 暂不支持")
-	}
-
 	validated := ValidatedRequest{CreateRequest: request}
 	validated.Content = append([]ContentItem(nil), request.Content...)
 	textCount, firstCount, lastCount := 0, 0, 0
@@ -126,6 +117,9 @@ func ValidateCreate(request CreateRequest, profiles map[string]config.Generation
 	if firstCount > 1 || lastCount > 1 {
 		return ValidatedRequest{}, fmt.Errorf("首帧和尾帧最多各 1 张")
 	}
+	if lastCount > 0 && firstCount == 0 {
+		return ValidatedRequest{}, fmt.Errorf("尾帧必须与首帧一起提供")
+	}
 	if referenceImages > 9 || referenceVideos > 3 || referenceAudios > 3 {
 		return ValidatedRequest{}, fmt.Errorf("参考媒体数量超过限制")
 	}
@@ -151,15 +145,17 @@ func ValidateCreate(request CreateRequest, profiles map[string]config.Generation
 	if !validRatio(validated.Ratio) {
 		return ValidatedRequest{}, fmt.Errorf("ratio 无效")
 	}
-	profile, ok := profiles[validated.Resolution]
-	if !ok {
-		return ValidatedRequest{}, fmt.Errorf("resolution 未配置生成 profile")
+	if profiles != nil {
+		profile, ok := profiles[validated.Resolution]
+		if !ok {
+			return ValidatedRequest{}, fmt.Errorf("resolution 仅支持 480P、768P 或 2K")
+		}
+		dimension, ok := profile.Dimensions[validated.Ratio]
+		if !ok {
+			return ValidatedRequest{}, fmt.Errorf("ratio 未配置尺寸映射")
+		}
+		validated.Width, validated.Height = dimension.Width, dimension.Height
 	}
-	dimension, ok := profile.Dimensions[validated.Ratio]
-	if !ok {
-		return ValidatedRequest{}, fmt.Errorf("ratio 未配置尺寸映射")
-	}
-	validated.Width, validated.Height = dimension.Width, dimension.Height
 	validated.InputImageCount = firstCount + lastCount + referenceImages
 	validated.CreateRequest.Ratio = validated.Ratio
 	return validated, nil

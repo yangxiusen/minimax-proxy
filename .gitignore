@@ -7,3 +7,6 @@ data/
 .playwright-cli/
 .worktrees/
 .env.docker
+.env
+.env.*
+!.env.docker.example

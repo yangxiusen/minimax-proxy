@@ -51,6 +51,31 @@ func TestListAdminTasksFiltersAcrossOwners(t *testing.T) {
 	}
 }
 
+func TestListAdminTasksIncludesArtifactForPlaybackSigning(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 20, GlobalLimit: 100})
+	ctx := context.Background()
+	if _, err := store.Create(ctx, task("artifact-task", "customer-a"), "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateArtifact(ctx, TaskArtifact{
+		ID: "artifact-1", TaskID: "artifact-task", Kind: "final_video", SizeBytes: 4,
+		SHA256: "digest", ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE video_tasks SET status='succeeded',result_artifact_id='artifact-1' WHERE task_id='artifact-task'`); err != nil {
+		t.Fatal(err)
+	}
+
+	items, total, err := store.ListAdminTasks(ctx, domain.AdminTaskFilter{PageNum: 1, PageSize: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(items) != 1 || items[0].ResultArtifactID != "artifact-1" {
+		t.Fatalf("items = %+v, total = %d", items, total)
+	}
+}
+
 func TestListAdminTasksTreatsSearchWildcardsLiterally(t *testing.T) {
 	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 20, GlobalLimit: 100})
 	ctx := context.Background()

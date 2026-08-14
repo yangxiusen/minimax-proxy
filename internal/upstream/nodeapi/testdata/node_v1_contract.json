@@ -1,0 +1,18 @@
+{
+  "protocol_version": "h3-node-v1",
+  "routes": [
+    ["GET", "/internal/v1/health", "health"],
+    ["GET", "/internal/v1/capabilities", "health"],
+    ["POST", "/internal/v1/executions", "execute"],
+    ["GET", "/internal/v1/executions/{execution_id}", "execute"],
+    ["POST", "/internal/v1/executions/{execution_id}/cancel", "execute"],
+    ["POST", "/internal/v1/artifacts/import", "artifact:write"],
+    ["GET", "/internal/v1/artifacts/{artifact_id}", "artifact:read"],
+    ["GET", "/internal/v1/artifacts/{artifact_id}/content", "artifact:read"],
+    ["POST", "/internal/v1/artifacts/delete", "artifact:delete"],
+    ["POST", "/internal/v1/maintenance/cleanup/preview", "maintenance"],
+    ["POST", "/internal/v1/maintenance/cleanup", "maintenance"],
+    ["GET", "/internal/v1/maintenance/cleanup/{operation_id}", "maintenance"]
+  ],
+  "error_fields": ["code", "message", "retryable", "request_id", "details"]
+}

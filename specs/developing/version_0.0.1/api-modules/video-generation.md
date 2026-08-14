@@ -41,7 +41,7 @@ Body 参数：
 | `duration` | integer | 是 | 4-15 |
 | `ratio` | string | 场景相关 | `adaptive/21:9/16:9/4:3/1:1/3:4/9:16` |
 | `callback_url` | string | 否 | 首版不支持；出现即 400 |
-| `aigc_watermark` | boolean | 否 | 默认 false；true 时 400 |
+| `aigc_watermark` | boolean | 否 | 默认 false；true 时追加 AIGC 水印阶段 |
 
 `content` 元素：
 
