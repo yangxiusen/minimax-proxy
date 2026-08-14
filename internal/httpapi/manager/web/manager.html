@@ -113,8 +113,8 @@
 
   <dialog id="api-key-secret-dialog" class="config-dialog api-key-secret-dialog">
     <div class="dialog-shell">
-      <header class="dialog-head"><h2>保存新密钥</h2><button id="close-api-key-secret" class="icon-button" type="button" title="关闭" aria-label="关闭">×</button></header>
-      <div class="api-key-secret-body"><p>完整密钥已保存，可随时在密钥列表中复制。</p><div class="api-key-secret-wrap"><code id="api-key-secret" class="api-key-secret"></code></div><p id="api-key-copy-status" class="form-status" aria-live="polite"></p><footer class="form-actions"><button id="copy-api-key" type="button">复制</button><span class="action-spacer"></span><button id="confirm-api-key-saved" class="primary-button" type="button">完成</button></footer></div>
+      <header class="dialog-head"><h2 id="api-key-secret-title">查看密钥</h2><button id="close-api-key-secret" class="icon-button" type="button" title="关闭" aria-label="关闭">×</button></header>
+      <div class="api-key-secret-body"><p id="api-key-secret-description">选中下方完整密钥后可手动复制。</p><div class="api-key-secret-wrap"><code id="api-key-secret" class="api-key-secret" tabindex="0"></code></div><p id="api-key-copy-status" class="form-status" aria-live="polite"></p><footer class="form-actions"><button id="copy-api-key" type="button">复制</button><span class="action-spacer"></span><button id="confirm-api-key-saved" class="primary-button" type="button">完成</button></footer></div>
     </div>
   </dialog>
 

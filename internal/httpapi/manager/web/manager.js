@@ -41,6 +41,8 @@ const elements = {
   apiKeyName: document.getElementById("api-key-name"),
   apiKeyStatus: document.getElementById("api-key-status"),
   apiKeySecretDialog: document.getElementById("api-key-secret-dialog"),
+  apiKeySecretTitle: document.getElementById("api-key-secret-title"),
+  apiKeySecretDescription: document.getElementById("api-key-secret-description"),
   apiKeySecret: document.getElementById("api-key-secret"),
   apiKeyCopyStatus: document.getElementById("api-key-copy-status"),
   videoPlayerDialog: document.getElementById("video-player-dialog"),
@@ -71,7 +73,7 @@ const state = {
   cleanupTimer: null,
   apiKeys: [],
   apiKeyBusy: false,
-  oneTimeAPIKey: null
+  visibleAPIKey: null
 };
 let taskRequestGeneration = 0;
 let apiKeyRequestGeneration = 0;
@@ -586,15 +588,15 @@ function renderAPIKeys(enabledCount = state.apiKeys.filter((item) => item.enable
     const details = makeElement("div", "api-key-details");
     details.append(makeElement("strong", "api-key-name", item.name), makeElement("code", "api-key-mask", item.masked_key), statusPill(item.enabled ? "healthy" : "idle", item.enabled ? "已启用" : "已停用"));
     const actions = makeElement("div", "api-key-actions");
-    const copy = makeElement("button", "", "复制"); copy.type = "button"; copy.disabled = !item.key; copy.title = item.key ? "复制完整密钥" : "该历史密钥没有可恢复的明文，请重新创建";
+    const view = makeElement("button", "", "查看"); view.type = "button"; view.disabled = !item.key; view.title = item.key ? "查看完整密钥" : "该历史密钥没有可恢复的明文，请重新创建";
     const rename = makeElement("button", "", "重命名"); rename.type = "button";
     const toggle = makeElement("button", "", item.enabled ? "停用" : "启用"); toggle.type = "button";
     const remove = makeElement("button", "danger-button", "删除"); remove.type = "button";
-    copy.addEventListener("click", () => copyStoredAPIKey(item));
+    view.addEventListener("click", () => viewStoredAPIKey(item));
     rename.addEventListener("click", () => renameAPIKey(item));
     toggle.addEventListener("click", () => updateAPIKey(item, { name: item.name, enabled: !item.enabled }));
     remove.addEventListener("click", () => deleteAPIKey(item));
-    actions.append(copy, rename, toggle, remove); row.append(details, actions); return row;
+    actions.append(view, rename, toggle, remove); row.append(details, actions); return row;
   }));
 }
 
@@ -609,10 +611,18 @@ async function copyText(value) {
   }
 }
 
-async function copyStoredAPIKey(item) {
+function showAPIKeySecret(key, title, description) {
+  state.visibleAPIKey = key;
+  elements.apiKeySecretTitle.textContent = title;
+  elements.apiKeySecretDescription.textContent = description;
+  elements.apiKeySecret.textContent = key;
+  elements.apiKeyCopyStatus.textContent = "";
+  elements.apiKeySecretDialog.showModal();
+}
+
+function viewStoredAPIKey(item) {
   if (!item.key) { setAPIKeyStatus("该历史密钥没有可恢复的明文，请重新创建", "error"); return; }
-  const copied = await copyText(item.key);
-  setAPIKeyStatus(copied ? `已复制 ${item.name}` : "复制失败", copied ? "success" : "error");
+  showAPIKeySecret(item.key, "查看密钥", `${item.name} 的完整密钥，选中文本后可手动复制。`);
 }
 
 async function loadAPIKeys() {
@@ -647,12 +657,9 @@ async function createAPIKey(event) {
   setAPIKeyBusy(true); setAPIKeyStatus("正在创建...");
   try {
     let created = await requestJSON(apiKeysPath, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
-    state.oneTimeAPIKey = created.key;
+    showAPIKeySecret(created.key, "保存新密钥", "完整密钥已保存，请妥善保管。选中文本后可手动复制。");
     created = null;
-    elements.apiKeySecret.textContent = state.oneTimeAPIKey;
-    elements.apiKeyCopyStatus.textContent = "";
     elements.apiKeyForm.hidden = true;
-    elements.apiKeySecretDialog.showModal();
     loadAPIKeys().catch(() => {});
   } catch (error) { if (error.message !== "unauthorized") setAPIKeyStatus(apiKeyErrorMessage(error), "error"); }
   finally { setAPIKeyBusy(false); }
@@ -680,18 +687,18 @@ async function deleteAPIKey(item) {
   finally { setAPIKeyBusy(false); }
 }
 
-function clearOneTimeAPIKey() {
+function clearVisibleAPIKey() {
   const selection = window.getSelection(); if (selection) selection.removeAllRanges();
   elements.apiKeySecret.textContent = "";
   elements.apiKeyCopyStatus.textContent = "";
-  state.oneTimeAPIKey = null;
+  state.visibleAPIKey = null;
 }
 
-function closeOneTimeAPIKey() { clearOneTimeAPIKey(); elements.apiKeySecretDialog.close(); }
+function closeVisibleAPIKey() { clearVisibleAPIKey(); elements.apiKeySecretDialog.close(); }
 
-async function copyOneTimeAPIKey() {
-  if (!state.oneTimeAPIKey) return;
-  elements.apiKeyCopyStatus.textContent = await copyText(state.oneTimeAPIKey) ? "已复制" : "复制失败，请手动选择密钥";
+async function copyVisibleAPIKey() {
+  if (!state.visibleAPIKey) return;
+  elements.apiKeyCopyStatus.textContent = await copyText(state.visibleAPIKey) ? "已复制" : "复制失败，请手动选择密钥";
 }
 
 function renderNodeProbe(checks) {
@@ -957,11 +964,11 @@ document.getElementById("close-api-keys").addEventListener("click", () => { if (
 document.getElementById("new-api-key").addEventListener("click", showCreateAPIKey);
 document.getElementById("cancel-api-key").addEventListener("click", () => { elements.apiKeyForm.hidden = true; elements.apiKeyName.value = ""; setAPIKeyStatus(""); });
 elements.apiKeyForm.addEventListener("submit", createAPIKey);
-document.getElementById("copy-api-key").addEventListener("click", copyOneTimeAPIKey);
-document.getElementById("close-api-key-secret").addEventListener("click", closeOneTimeAPIKey);
-document.getElementById("confirm-api-key-saved").addEventListener("click", closeOneTimeAPIKey);
-elements.apiKeySecretDialog.addEventListener("cancel", (event) => { event.preventDefault(); closeOneTimeAPIKey(); });
-elements.apiKeySecretDialog.addEventListener("close", clearOneTimeAPIKey);
+document.getElementById("copy-api-key").addEventListener("click", copyVisibleAPIKey);
+document.getElementById("close-api-key-secret").addEventListener("click", closeVisibleAPIKey);
+document.getElementById("confirm-api-key-saved").addEventListener("click", closeVisibleAPIKey);
+elements.apiKeySecretDialog.addEventListener("cancel", (event) => { event.preventDefault(); closeVisibleAPIKey(); });
+elements.apiKeySecretDialog.addEventListener("close", clearVisibleAPIKey);
 document.getElementById("close-video-player").addEventListener("click", () => closeVideoPlayer());
 elements.videoPlayerDialog.addEventListener("cancel", (event) => { event.preventDefault(); closeVideoPlayer(); });
 elements.videoPlayerDialog.addEventListener("close", resetVideoPlayer);

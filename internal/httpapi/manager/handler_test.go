@@ -249,7 +249,8 @@ func TestManagerPageIncludesAPIKeyManagementWorkflow(t *testing.T) {
 
 	for _, expected := range []string{
 		"open-api-keys", "密钥管理", "api-key-dialog", "api-key-list", "new-api-key",
-		"api-key-name", "api-key-secret-dialog", "api-key-secret", "copy-api-key",
+		"api-key-name", "api-key-secret-dialog", "api-key-secret-title", "api-key-secret-description",
+		"api-key-secret", "copy-api-key",
 		"close-api-key-secret", "当前无可用对外密钥", "正在加载密钥", "暂无对外 API Key",
 	} {
 		if !strings.Contains(string(page), expected) {
@@ -261,8 +262,9 @@ func TestManagerPageIncludesAPIKeyManagementWorkflow(t *testing.T) {
 		`const apiKeysPath = "/manager/api/api-keys"`,
 		"apiKeyRequestGeneration", "apiKeyBusy", "enabled_count", "masked_key",
 		`navigator.clipboard.writeText`, `document.execCommand("copy")`,
-		`copy.addEventListener("click", () => copyStoredAPIKey(item))`,
-		"clearOneTimeAPIKey", `elements.apiKeySecret.textContent = ""`, "state.oneTimeAPIKey = null",
+		`const view = makeElement("button", "", "查看")`,
+		`view.addEventListener("click", () => viewStoredAPIKey(item))`, "showAPIKeySecret",
+		"clearVisibleAPIKey", `elements.apiKeySecret.textContent = ""`, "state.visibleAPIKey = null",
 		"api_key_name_conflict", "api_key_version_conflict", "key_in_use", "cache_refresh_failed",
 	} {
 		if !strings.Contains(string(script), expected) {
