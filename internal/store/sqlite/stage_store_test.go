@@ -36,7 +36,7 @@ func TestStageLifecycleSynchronizesParentTaskAndCallbacks(t *testing.T) {
 	}
 	attempt := StageAttempt{
 		ID: "attempt-1", StageID: stage.ID, AttemptNo: 1,
-		OperationID: "operation-1", NodeID: "gpu-1", Status: "dispatching",
+		OperationID: "operation-1", NodeID: "gpu-1", LeaseToken: stage.LeaseToken, Status: "dispatching",
 	}
 	if err := store.CreateStageAttempt(ctx, attempt); err != nil {
 		t.Fatal(err)
@@ -129,7 +129,7 @@ func TestIntermediateCompletionAndRetryReleaseNodeAssignment(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			attempt := StageAttempt{ID: "attempt-1", StageID: stage.ID, AttemptNo: 1, OperationID: "operation-1", NodeID: "gpu-1", Status: "dispatching"}
+			attempt := StageAttempt{ID: "attempt-1", StageID: stage.ID, AttemptNo: 1, OperationID: "operation-1", NodeID: "gpu-1", LeaseToken: stage.LeaseToken, Status: "dispatching"}
 			if err := store.CreateStageAttempt(ctx, attempt); err != nil {
 				t.Fatal(err)
 			}
@@ -150,6 +150,126 @@ func TestIntermediateCompletionAndRetryReleaseNodeAssignment(t *testing.T) {
 				t.Fatalf("ActiveForUpstream() error = %v", err)
 			}
 		})
+	}
+}
+
+func TestAdminCancelImmediatelyFinishesUnassignedStageTask(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 10})
+	ctx := context.Background()
+	insertNodeAPINode(t, store, "gpu-1")
+	input := task("cancel-between-stages", "owner")
+	input.Stages = []domain.NewTaskStage{
+		{ID: "cancel-stage-1", StageType: "generation", StageOrder: 10, MaxAttempts: 3, ConfigSnapshotJSON: `{}`},
+		{ID: "cancel-stage-2", StageType: "restoration", StageOrder: 20, MaxAttempts: 3, ConfigSnapshotJSON: `{}`},
+	}
+	if _, err := store.Create(ctx, input, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	stage, err := store.ClaimStage(ctx, "gpu-1", "lease-1", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := StageAttempt{ID: "cancel-attempt-1", StageID: stage.ID, AttemptNo: 1, OperationID: "cancel-operation-1", NodeID: "gpu-1", LeaseToken: stage.LeaseToken, Status: "dispatching"}
+	if err := store.CreateStageAttempt(ctx, attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindStageExecution(ctx, stage.ID, stage.LeaseToken, attempt.ID, "cancel-execution-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteStage(ctx, stage.ID, stage.LeaseToken, attempt.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.RequestAdminCancel(ctx, input.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, "owner", input.TaskID)
+	if err != nil || got.Status != domain.StatusCancelled || got.FinishedAt.IsZero() {
+		t.Fatalf("cancelled task = %+v, %v", got, err)
+	}
+	if _, err := store.ClaimStage(ctx, "gpu-1", "lease-after-cancel", time.Minute); !errors.Is(err, ErrNoClaimableStage) {
+		t.Fatalf("ClaimStage() after cancel error = %v", err)
+	}
+}
+
+func TestAdminCancelImmediatelyFinishesBoundStageTask(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 10})
+	ctx := context.Background()
+	insertNodeAPINode(t, store, "gpu-1")
+	input := task("cancel-bound-stage", "owner")
+	input.Stages = []domain.NewTaskStage{
+		{ID: "bound-stage-1", StageType: "generation", StageOrder: 10, MaxAttempts: 3, ConfigSnapshotJSON: `{}`},
+		{ID: "bound-stage-2", StageType: "restoration", StageOrder: 20, MaxAttempts: 3, ConfigSnapshotJSON: `{}`},
+	}
+	if _, err := store.Create(ctx, input, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	stage, err := store.ClaimStage(ctx, "gpu-1", "bound-lease", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := StageAttempt{ID: "bound-attempt", StageID: stage.ID, AttemptNo: 1, OperationID: "bound-operation", NodeID: "gpu-1", LeaseToken: stage.LeaseToken, Status: "dispatching"}
+	if err := store.CreateStageAttempt(ctx, attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindStageExecution(ctx, stage.ID, stage.LeaseToken, attempt.ID, "bound-execution"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RequestAdminCancel(ctx, input.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, "owner", input.TaskID)
+	if err != nil || got.Status != domain.StatusCancelled || got.UpstreamID != "" || got.ActiveStageID != "" {
+		t.Fatalf("cancelled task = %+v, %v", got, err)
+	}
+	var unfinished int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM task_stages WHERE task_id=? AND status!='cancelled'`, input.TaskID).Scan(&unfinished); err != nil {
+		t.Fatal(err)
+	}
+	if unfinished != 0 {
+		t.Fatalf("unfinished stages = %d", unfinished)
+	}
+	if _, err := store.CompleteStageWithOutput(ctx, input.TaskID, stage.ID, stage.LeaseToken, attempt.ID, "gpu-1", "late-node-artifact", 123, strings.Repeat("a", 64), `{}`); !errors.Is(err, domain.ErrStateConflict) {
+		t.Fatalf("late CompleteStageWithOutput() error = %v", err)
+	}
+	var activeArtifacts int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM task_artifacts WHERE stage_id=? AND state='active'`, stage.ID).Scan(&activeArtifacts); err != nil {
+		t.Fatal(err)
+	}
+	if activeArtifacts != 0 {
+		t.Fatalf("late active artifacts = %d", activeArtifacts)
+	}
+}
+
+func TestCreateStageAttemptRejectsLeaseAfterTaskCancellation(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 10})
+	ctx := context.Background()
+	insertNodeAPINode(t, store, "gpu-1")
+	input := task("cancel-before-attempt", "owner")
+	input.Stages = []domain.NewTaskStage{{ID: "cancel-before-attempt-stage", StageType: "generation", StageOrder: 10, MaxAttempts: 1, ConfigSnapshotJSON: `{}`}}
+	if _, err := store.Create(ctx, input, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	stage, err := store.ClaimStage(ctx, "gpu-1", "stale-lease", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RequestAdminCancel(ctx, input.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	attempt := StageAttempt{
+		ID: "late-attempt", StageID: stage.ID, AttemptNo: 1, OperationID: "late-operation",
+		NodeID: "gpu-1", LeaseToken: stage.LeaseToken, Status: "dispatching", RequestSnapshotJSON: `{}`,
+	}
+	if err := store.CreateStageAttempt(ctx, attempt); !errors.Is(err, domain.ErrStateConflict) {
+		t.Fatalf("CreateStageAttempt() error = %v", err)
+	}
+	var count int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM stage_attempts WHERE id=?`, attempt.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("late attempt count = %d", count)
 	}
 }
 
@@ -183,7 +303,7 @@ func TestClaimStageCompletesEarlierTaskBeforeStartingLaterTask(t *testing.T) {
 	}
 	attempt := StageAttempt{
 		ID: "attempt-generation", StageID: claimed.ID, AttemptNo: 1,
-		OperationID: "operation-generation", NodeID: "gpu-1", Status: "dispatching",
+		OperationID: "operation-generation", NodeID: "gpu-1", LeaseToken: claimed.LeaseToken, Status: "dispatching",
 	}
 	if err := store.CreateStageAttempt(ctx, attempt); err != nil {
 		t.Fatal(err)

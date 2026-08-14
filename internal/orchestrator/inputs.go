@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"os"
@@ -34,10 +35,20 @@ type InputImportClient interface {
 	ImportArtifact(context.Context, string, nodeapi.ImportArtifactRequest) (nodeapi.Artifact, error)
 }
 
+type inputMaterializationError struct {
+	phase string
+	err   error
+}
+
+func (e inputMaterializationError) Error() string                     { return e.err.Error() }
+func (e inputMaterializationError) Unwrap() error                     { return e.err }
+func (e inputMaterializationError) InputMaterializationPhase() string { return e.phase }
+
 type InputMaterializer struct {
 	Store  InputStore
 	Guard  *netguard.Guard
 	Client *http.Client
+	Logger *slog.Logger
 }
 
 func (m *InputMaterializer) Materialize(ctx context.Context, taskID, nodeID, requestID string, client InputImportClient) ([]nodeapi.InputArtifact, error) {
@@ -66,6 +77,8 @@ func (m *InputMaterializer) Materialize(ctx context.Context, taskID, nodeID, req
 	if err := json.Unmarshal([]byte(task.RequestJSON), &request); err != nil {
 		return nil, errors.New("任务输入素材快照损坏")
 	}
+	logger := m.logger()
+	logger.InfoContext(ctx, "输入素材处理开始", "task_id", taskID, "node_id", nodeID, "stage", "input_materialization")
 	result := make([]nodeapi.InputArtifact, 0)
 	for index, item := range request.Content {
 		if item.Type == "text" {
@@ -97,8 +110,16 @@ func (m *InputMaterializer) Materialize(ctx context.Context, taskID, nodeID, req
 		}
 		file, mediaType, suffix, size, digest, err := m.fetch(ctx, rawURL, item.Type)
 		if err != nil {
-			return nil, err
+			phaseErr := inputMaterializationError{phase: "read", err: err}
+			logger.ErrorContext(ctx, "输入素材读取失败", "task_id", taskID, "node_id", nodeID, "input_index", index, "role", item.Role, "stage", "input_materialization", "error_code", "input_materialization_failed", "error_reason", materializationErrorMessage(phaseErr))
+			return nil, phaseErr
 		}
+		if strings.HasPrefix(rawURL, "data:") {
+			logger.InfoContext(ctx, "输入素材 Base64 解码完成", "task_id", taskID, "node_id", nodeID, "input_index", index, "role", item.Role, "media_type", mediaType, "size_bytes", size, "stage", "input_materialization")
+		} else {
+			logger.InfoContext(ctx, "输入素材下载完成", "task_id", taskID, "node_id", nodeID, "input_index", index, "role", item.Role, "media_type", mediaType, "size_bytes", size, "stage", "input_materialization")
+		}
+		logger.InfoContext(ctx, "开始向节点导入输入素材", "task_id", taskID, "node_id", nodeID, "input_index", index, "role", item.Role, "media_type", mediaType, "size_bytes", size, "stage", "input_materialization")
 		artifact, importErr := client.ImportArtifact(ctx, requestID+fmt.Sprintf("-input-%d", index), nodeapi.ImportArtifactRequest{
 			OperationID: "import-" + logicalID + "-" + nodeID, SourceArtifactID: logicalID,
 			ExternalTaskID: taskID, ExpectedSize: size, ExpectedSHA256: digest, Kind: inputKind(mediaType),
@@ -108,7 +129,9 @@ func (m *InputMaterializer) Materialize(ctx context.Context, taskID, nodeID, req
 		closeErr := file.Close()
 		removeErr := os.Remove(fileName)
 		if importErr != nil {
-			return nil, importErr
+			phaseErr := inputMaterializationError{phase: "import", err: importErr}
+			logger.ErrorContext(ctx, "输入素材节点导入失败", "task_id", taskID, "node_id", nodeID, "input_index", index, "role", item.Role, "stage", "input_materialization", "error_code", "input_materialization_failed", "error_reason", materializationErrorMessage(phaseErr))
+			return nil, phaseErr
 		}
 		if closeErr != nil {
 			return nil, closeErr
@@ -126,9 +149,17 @@ func (m *InputMaterializer) Materialize(ctx context.Context, taskID, nodeID, req
 		if err := m.Store.RegisterInputArtifact(ctx, logicalID, taskID, proxyInputKind(mediaType), nodeID, artifact.ArtifactID, size, digest, manifest); err != nil {
 			return nil, err
 		}
+		logger.InfoContext(ctx, "输入素材节点导入完成", "task_id", taskID, "node_id", nodeID, "input_index", index, "role", item.Role, "artifact_id", artifact.ArtifactID, "size_bytes", size, "stage", "input_materialization")
 		result = append(result, nodeapi.InputArtifact{ArtifactID: artifact.ArtifactID, Role: item.Role})
 	}
 	return result, nil
+}
+
+func (m *InputMaterializer) logger() *slog.Logger {
+	if m.Logger != nil {
+		return m.Logger
+	}
+	return slog.Default()
 }
 
 func (m *InputMaterializer) fetch(ctx context.Context, rawURL, contentType string) (*os.File, string, string, int64, string, error) {

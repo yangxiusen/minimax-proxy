@@ -1,9 +1,11 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"io"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -35,6 +37,27 @@ func TestInputMaterializerImportsDataURIWithRoleAndReusesNodeLocation(t *testing
 	}
 	if second[0].ArtifactID != "node-input-1" || client.calls != 1 {
 		t.Fatalf("second=%+v calls=%d", second, client.calls)
+	}
+}
+
+func TestInputMaterializerLogsBase64UploadMilestonesWithoutContent(t *testing.T) {
+	var logs bytes.Buffer
+	payload := []byte("fake-image-content")
+	requestJSON := `{"content":[{"type":"image_url","role":"first_frame","image_url":{"url":"data:image/jpeg;base64,` + base64.StdEncoding.EncodeToString(payload) + `"}}]}`
+	store := &inputStoreFake{task: domain.Task{TaskID: "task-log", RequestJSON: requestJSON}, locations: map[string]sqlite.ArtifactLocation{}}
+	materializer := InputMaterializer{Store: store, Logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+
+	if _, err := materializer.Materialize(context.Background(), "task-log", "node-log", "request-log", &inputClientFake{}); err != nil {
+		t.Fatal(err)
+	}
+	output := logs.String()
+	for _, expected := range []string{"输入素材处理开始", "输入素材 Base64 解码完成", "开始向节点导入输入素材", "输入素材节点导入完成", `"task_id":"task-log"`, `"node_id":"node-log"`} {
+		if !strings.Contains(output, expected) {
+			t.Fatalf("logs missing %q: %s", expected, output)
+		}
+	}
+	if strings.Contains(output, base64.StdEncoding.EncodeToString(payload)) || strings.Contains(output, string(payload)) {
+		t.Fatalf("logs leaked input media: %s", output)
 	}
 }
 

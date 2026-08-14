@@ -152,6 +152,65 @@ func TestCachedSchedulableRejectsPrivateWorkAndSchedulingBlock(t *testing.T) {
 	}
 }
 
+func TestNodeAPISnapshotRestoresCancellationBarrierAsBlockedWork(t *testing.T) {
+	ctx := context.Background()
+	store, err := storepkg.Open(ctx, filepath.Join(t.TempDir(), "barrier-runtime.db"), storepkg.Options{
+		ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 10, Retention: time.Hour, IdempotencyTTL: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	nodeInput := domain.ModelNodeInput{
+		ID: "gpu-barrier", ServiceURL: "http://127.0.0.1:7860", ProtocolVersion: nodeapi.ProtocolVersion,
+		APIKeyNonce: []byte("nonce"), APIKeyCiphertext: []byte("ciphertext"), APIKeyFingerprint: "fingerprint",
+		PollInterval: time.Second, RequestTimeout: time.Second, Enabled: true,
+	}
+	node, err := store.CreateModelNode(ctx, nodeInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := domain.NewTask{
+		TaskID: "barrier-task", APIKeyID: "owner", Model: "MiniMax-H3", Scenario: "t2va",
+		RequestJSON: `{"model":"MiniMax-H3"}`, RequestHash: "barrier-task", Resolution: "480P", Duration: 5, Ratio: "16:9",
+		Stages: []domain.NewTaskStage{{ID: "barrier-stage", StageType: "generation", StageOrder: 10, MaxAttempts: 1, ConfigSnapshotJSON: `{}`}},
+	}
+	if _, err := store.Create(ctx, input, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	stage, err := store.ClaimStage(ctx, node.ID, "barrier-lease", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := storepkg.StageAttempt{
+		ID: "barrier-attempt", StageID: stage.ID, AttemptNo: 1, OperationID: "barrier-operation", NodeID: node.ID,
+		LeaseToken: stage.LeaseToken, Status: "dispatching", RequestSnapshotJSON: `{"operation_id":"barrier-operation"}`,
+	}
+	if err := store.CreateStageAttempt(ctx, attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindStageExecution(ctx, stage.ID, stage.LeaseToken, attempt.ID, "barrier-execution"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RequestAdminCancel(ctx, input.TaskID); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := monitor.NewCache(nil)
+	factory := NodeRuntimeFactory{Store: store, Cache: cache}
+	_, upstream, err := config.NormalizeModelNode(nodeInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := factory.initializeSnapshot(ctx, node, nodeInput, upstream); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok := cache.Get(node.ID)
+	if !ok || !snapshot.SchedulingBlocked || snapshot.Runtime != monitor.RuntimeRunning || snapshot.LastError == nil || snapshot.LastError.Code != "node_cancel_reconciling" {
+		t.Fatalf("snapshot = %+v, lastError=%+v, ok=%v", snapshot, snapshot.LastError, ok)
+	}
+}
+
 func TestNodeAPIRuntimeUsesSingleServiceEndpointAndBearerSecret(t *testing.T) {
 	ctx := context.Background()
 	store, err := storepkg.Open(ctx, filepath.Join(t.TempDir(), "node-api.db"), storepkg.Options{
@@ -182,7 +241,7 @@ func TestNodeAPIRuntimeUsesSingleServiceEndpointAndBearerSecret(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	attempt := storepkg.StageAttempt{ID: "active-attempt", StageID: stage.ID, AttemptNo: 1, OperationID: "active-operation", NodeID: node.ID, Status: "dispatching"}
+	attempt := storepkg.StageAttempt{ID: "active-attempt", StageID: stage.ID, AttemptNo: 1, OperationID: "active-operation", NodeID: node.ID, LeaseToken: stage.LeaseToken, Status: "dispatching"}
 	if err := store.CreateStageAttempt(ctx, attempt); err != nil {
 		t.Fatal(err)
 	}
@@ -296,6 +355,10 @@ func (*nodeAPIClientFake) GetArtifact(context.Context, string, string) (nodeapi.
 }
 func (*nodeAPIClientFake) ImportArtifact(context.Context, string, nodeapi.ImportArtifactRequest) (nodeapi.Artifact, error) {
 	return nodeapi.Artifact{}, errors.New("unexpected import")
+}
+
+func (*nodeAPIClientFake) CancelExecution(context.Context, string, string, string) (nodeapi.ExecutionReference, error) {
+	return nodeapi.ExecutionReference{}, nil
 }
 
 func (*runtimeClientFake) Healthy(context.Context, string) error { return nil }

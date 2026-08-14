@@ -6,25 +6,33 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/url"
 	"time"
 
 	"github.com/google/uuid"
 
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/logsafe"
 	"minimax-h3-tc/internal/mediagate"
 	"minimax-h3-tc/internal/store/sqlite"
 	"minimax-h3-tc/internal/upstream/nodeapi"
 )
 
 type Store interface {
+	GetNodeDispatchBarrier(context.Context, string) (sqlite.NodeDispatchBarrier, error)
+	BindBarrierExecution(context.Context, string, int64, string) error
+	DeferNodeDispatchBarrier(context.Context, string, int64, string, time.Time) error
+	ResolveNodeDispatchBarrier(context.Context, string, int64) error
+	HasNodeDispatchBarrier(context.Context, string) (bool, error)
 	ClaimStage(context.Context, string, string, time.Duration) (sqlite.TaskStage, error)
 	RenewStageLease(context.Context, string, string, time.Duration) error
 	CreateStageAttempt(context.Context, sqlite.StageAttempt) error
 	BindStageExecution(context.Context, string, string, string, string) error
 	GetRunningStageAttempt(context.Context, string, string) (sqlite.StageAttempt, error)
 	CompleteStage(context.Context, string, string, string, string) error
+	CompleteStageWithOutput(context.Context, string, string, string, string, string, string, int64, string, string) (string, error)
 	FailStage(context.Context, string, string, string, string, string, time.Time, bool) error
-	RegisterStageOutput(context.Context, string, string, string, string, int64, string, string) (string, error)
 	GetActiveArtifactLocation(context.Context, string, string) (sqlite.ArtifactLocation, error)
 	GetPrimaryArtifactLocation(context.Context, string) (sqlite.ArtifactLocation, error)
 	GetTaskForExecution(context.Context, string) (domain.Task, error)
@@ -36,10 +44,12 @@ type InputArtifactMigrator interface {
 }
 
 type NodeClient interface {
+	Health(context.Context, string) (nodeapi.Health, error)
 	CreateExecution(context.Context, string, nodeapi.ExecutionRequest) (nodeapi.ExecutionReference, error)
 	GetExecution(context.Context, string, string) (nodeapi.Execution, error)
 	GetArtifact(context.Context, string, string) (nodeapi.Artifact, error)
 	ImportArtifact(context.Context, string, nodeapi.ImportArtifactRequest) (nodeapi.Artifact, error)
+	CancelExecution(context.Context, string, string, string) (nodeapi.ExecutionReference, error)
 }
 
 type Processor struct {
@@ -50,12 +60,23 @@ type Processor struct {
 	Inputs        *InputMaterializer
 	LeaseDuration time.Duration
 	PollInterval  time.Duration
+	Logger        *slog.Logger
 	Now           func() time.Time
 }
 
 func (processor *Processor) ProcessOne(ctx context.Context) error {
 	if processor.Store == nil || processor.Client == nil || processor.NodeID == "" {
 		return errors.New("阶段编排依赖未配置")
+	}
+	barrier, err := processor.Store.GetNodeDispatchBarrier(ctx, processor.NodeID)
+	if err == nil {
+		if barrier.NextRetryAt > processor.now().UnixMilli() {
+			return domain.ErrQueueEmpty
+		}
+		return processor.reconcileCancellationBarrier(ctx, barrier)
+	}
+	if !errors.Is(err, sqlite.ErrNodeDispatchBarrierNotFound) {
+		return err
 	}
 	leaseToken := uuid.NewString()
 	stage, err := processor.Store.ClaimStage(ctx, processor.NodeID, leaseToken, processor.leaseDuration())
@@ -65,9 +86,13 @@ func (processor *Processor) ProcessOne(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	processor.logger().InfoContext(ctx, "任务阶段已认领", "task_id", stage.TaskID, "stage_id", stage.ID, "node_id", processor.NodeID, "stage_type", stage.StageType, "attempt_no", stage.AttemptCount+1, "stage", "stage_claim")
+	if cancelled, err := processor.taskCancelled(ctx, stage.TaskID); err != nil || cancelled {
+		return err
+	}
 	stageForNode, err := processor.localizeInput(ctx, stage)
 	if err != nil {
-		return processor.fail(ctx, stage, sqlite.StageAttempt{}, "artifact_migration_failed", "输入产物无法迁移到目标节点", false)
+		return processor.fail(ctx, stage, sqlite.StageAttempt{}, "artifact_migration_failed", operationErrorMessage("输入产物无法迁移到目标节点", err), false)
 	}
 	request, err := executionRequest(stageForNode)
 	if err != nil {
@@ -79,8 +104,15 @@ func (processor *Processor) ProcessOne(ctx context.Context) error {
 		}
 		request.InputArtifacts, err = processor.Inputs.Materialize(ctx, stage.TaskID, processor.NodeID, "stage-inputs-"+stage.ID, processor.Client)
 		if err != nil {
-			return processor.fail(ctx, stage, sqlite.StageAttempt{}, "input_materialization_failed", "输入素材导入失败", false)
+			if cancelled, taskErr := processor.taskCancelled(ctx, stage.TaskID); taskErr != nil || cancelled {
+				return taskErr
+			}
+			return processor.fail(ctx, stage, sqlite.StageAttempt{}, "input_materialization_failed", materializationErrorMessage(err), false)
 		}
+		if cancelled, err := processor.taskCancelled(ctx, stage.TaskID); err != nil || cancelled {
+			return err
+		}
+		processor.logger().InfoContext(ctx, "输入素材处理完成", "task_id", stage.TaskID, "stage_id", stage.ID, "node_id", processor.NodeID, "input_count", len(request.InputArtifacts), "stage", "input_materialization")
 	}
 	if stage.AttemptCount > 0 {
 		attempt, attemptErr := processor.Store.GetRunningStageAttempt(ctx, stage.ID, stage.LeaseToken)
@@ -89,9 +121,10 @@ func (processor *Processor) ProcessOne(ctx context.Context) error {
 			request.ExternalTaskID = stage.TaskID
 			request.StageID = stage.ID
 			if attempt.ExecutionID == "" {
+				processor.logger().InfoContext(ctx, "节点阶段恢复提交开始", "task_id", stage.TaskID, "stage_id", stage.ID, "attempt_id", attempt.ID, "node_id", processor.NodeID, "stage", "stage_submit")
 				reference, submitErr := processor.Client.CreateExecution(ctx, "stage-resubmit-"+attempt.ID, request)
 				if submitErr != nil {
-					return processor.fail(ctx, stage, attempt, classifySubmitError(submitErr), "节点阶段恢复提交失败", false)
+					return processor.fail(ctx, stage, attempt, classifySubmitError(submitErr), operationErrorMessage("节点阶段恢复提交失败", submitErr), false)
 				}
 				if reference.ExecutionID == "" {
 					return processor.fail(ctx, stage, attempt, "node_protocol_error", "节点未返回 execution_id", false)
@@ -109,17 +142,23 @@ func (processor *Processor) ProcessOne(ctx context.Context) error {
 	}
 	attempt := sqlite.StageAttempt{
 		ID: uuid.NewString(), StageID: stage.ID, AttemptNo: stage.AttemptCount + 1,
-		OperationID: uuid.NewString(), NodeID: processor.NodeID, Status: "dispatching", InputArtifactID: stage.InputArtifactID,
+		OperationID: uuid.NewString(), NodeID: processor.NodeID, LeaseToken: stage.LeaseToken, Status: "dispatching", InputArtifactID: stage.InputArtifactID,
 	}
 	request.OperationID = attempt.OperationID
 	request.ExternalTaskID = stage.TaskID
 	request.StageID = stage.ID
+	requestSnapshot, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	attempt.RequestSnapshotJSON = string(requestSnapshot)
 	if err := processor.Store.CreateStageAttempt(ctx, attempt); err != nil {
 		return err
 	}
+	processor.logger().InfoContext(ctx, "节点阶段提交开始", "task_id", stage.TaskID, "stage_id", stage.ID, "attempt_id", attempt.ID, "node_id", processor.NodeID, "stage", "stage_submit")
 	reference, err := processor.Client.CreateExecution(ctx, "stage-submit-"+attempt.ID, request)
 	if err != nil {
-		return processor.fail(ctx, stage, attempt, classifySubmitError(err), "节点阶段提交失败", false)
+		return processor.fail(ctx, stage, attempt, classifySubmitError(err), operationErrorMessage("节点阶段提交失败", err), false)
 	}
 	if reference.ExecutionID == "" {
 		return processor.fail(ctx, stage, attempt, "node_protocol_error", "节点未返回 execution_id", false)
@@ -128,7 +167,94 @@ func (processor *Processor) ProcessOne(ctx context.Context) error {
 		return err
 	}
 	attempt.ExecutionID = reference.ExecutionID
+	processor.logger().InfoContext(ctx, "节点阶段已接受", "task_id", stage.TaskID, "stage_id", stage.ID, "attempt_id", attempt.ID, "execution_id", attempt.ExecutionID, "node_id", processor.NodeID, "node_status", reference.Status, "stage", "stage_submit")
 	return processor.poll(ctx, stage, attempt)
+}
+
+func (processor *Processor) reconcileCancellationBarrier(ctx context.Context, barrier sqlite.NodeDispatchBarrier) error {
+	if barrier.ExecutionID == "" {
+		if barrier.RequestSnapshotJSON == "" {
+			return processor.deferCancellationBarrier(ctx, barrier, "execution_request_snapshot_missing")
+		}
+		var request nodeapi.ExecutionRequest
+		if err := json.Unmarshal([]byte(barrier.RequestSnapshotJSON), &request); err != nil || request.OperationID != barrier.OperationID {
+			return processor.deferCancellationBarrier(ctx, barrier, "execution_request_snapshot_invalid")
+		}
+		reference, err := processor.Client.CreateExecution(ctx, "cancel-recover-"+barrier.AttemptID, request)
+		if err != nil {
+			return processor.deferCancellationBarrier(ctx, barrier, cancellationErrorCode("node_execution_recovery_failed", err))
+		}
+		if reference.ExecutionID == "" {
+			return processor.deferCancellationBarrier(ctx, barrier, "node_protocol_error")
+		}
+		if err := processor.Store.BindBarrierExecution(ctx, barrier.NodeID, barrier.RowVersion, reference.ExecutionID); err != nil {
+			return err
+		}
+		barrier.ExecutionID = reference.ExecutionID
+		barrier.RowVersion++
+	}
+
+	_, cancelErr := processor.Client.CancelExecution(ctx, "cancel-reconcile-"+barrier.AttemptID, barrier.ExecutionID, barrier.CancelOperationID)
+	execution, getErr := processor.Client.GetExecution(ctx, "cancel-check-"+barrier.AttemptID, barrier.ExecutionID)
+	if getErr == nil {
+		if terminalNodeExecution(execution.Status) {
+			return processor.Store.ResolveNodeDispatchBarrier(ctx, barrier.NodeID, barrier.RowVersion)
+		}
+		code := "node_cancel_reconciling"
+		if cancelErr != nil {
+			code = cancellationErrorCode("node_cancel_unavailable", cancelErr)
+		}
+		return processor.deferCancellationBarrier(ctx, barrier, code)
+	}
+	if nodeExecutionNotFound(getErr) {
+		health, healthErr := processor.Client.Health(ctx, "cancel-health-"+barrier.AttemptID)
+		if healthErr == nil && nodeQueueExplicitlyIdle(health) {
+			return processor.Store.ResolveNodeDispatchBarrier(ctx, barrier.NodeID, barrier.RowVersion)
+		}
+		if healthErr != nil {
+			return processor.deferCancellationBarrier(ctx, barrier, cancellationErrorCode("node_health_unavailable", healthErr))
+		}
+		return processor.deferCancellationBarrier(ctx, barrier, "node_queue_not_idle")
+	}
+	return processor.deferCancellationBarrier(ctx, barrier, cancellationErrorCode("node_execution_unavailable", getErr))
+}
+
+func (processor *Processor) deferCancellationBarrier(ctx context.Context, barrier sqlite.NodeDispatchBarrier, code string) error {
+	retryAt := processor.now().Add(processor.pollInterval())
+	if err := processor.Store.DeferNodeDispatchBarrier(ctx, barrier.NodeID, barrier.RowVersion, code, retryAt); err != nil {
+		return err
+	}
+	return nil
+}
+
+func terminalNodeExecution(status string) bool {
+	return status == "succeeded" || status == "failed" || status == "cancelled"
+}
+
+func nodeExecutionNotFound(err error) bool {
+	var responseError *nodeapi.HTTPError
+	return errors.As(err, &responseError) && responseError.StatusCode == 404
+}
+
+func nodeQueueExplicitlyIdle(health nodeapi.Health) bool {
+	return health.Status == "healthy" && health.Runtime != nil && health.Runtime.QueueRunning != nil && health.Runtime.QueuePending != nil && *health.Runtime.QueueRunning == 0 && *health.Runtime.QueuePending == 0
+}
+
+func cancellationErrorCode(fallback string, err error) string {
+	var responseError *nodeapi.HTTPError
+	if !errors.As(err, &responseError) {
+		return fallback
+	}
+	if responseError.StatusCode == 401 || responseError.StatusCode == 403 {
+		return "node_authentication_failed"
+	}
+	if responseError.StatusCode >= 500 {
+		return fallback
+	}
+	if responseError.Code != "" {
+		return responseError.Code
+	}
+	return fallback
 }
 
 func generationUsesInputs(parameters json.RawMessage) bool {
@@ -184,7 +310,20 @@ func (processor *Processor) poll(ctx context.Context, stage sqlite.TaskStage, at
 		renewEvery = time.Second
 	}
 	lastRenewed := processor.now()
+	lastStatus := ""
 	for {
+		task, taskErr := processor.Store.GetTaskForExecution(ctx, stage.TaskID)
+		if taskErr != nil {
+			return taskErr
+		}
+		if task.Status == domain.StatusCancelling {
+			_, _ = processor.Client.CancelExecution(ctx, "stage-cancel-"+attempt.ID, attempt.ExecutionID, "stage-cancel-"+attempt.ID)
+			return nil
+		}
+		if task.Status == domain.StatusCancelled {
+			_, _ = processor.Client.CancelExecution(ctx, "stage-cancel-"+attempt.ID, attempt.ExecutionID, "stage-cancel-"+attempt.ID)
+			return nil
+		}
 		if processor.now().Sub(lastRenewed) >= renewEvery {
 			if err := processor.Store.RenewStageLease(ctx, stage.ID, stage.LeaseToken, processor.leaseDuration()); err != nil {
 				return err
@@ -194,14 +333,19 @@ func (processor *Processor) poll(ctx context.Context, stage sqlite.TaskStage, at
 		execution, err := processor.Client.GetExecution(ctx, "stage-poll-"+attempt.ID, attempt.ExecutionID)
 		if err != nil {
 			if code, terminal := terminalExecutionReadError(err); terminal {
-				return processor.fail(ctx, stage, attempt, code, "节点执行状态不可恢复", true)
+				return processor.fail(ctx, stage, attempt, code, operationErrorMessage("节点执行状态不可恢复", err), true)
 			}
+			processor.logger().WarnContext(ctx, "节点阶段状态读取失败，将继续重试", "task_id", stage.TaskID, "stage_id", stage.ID, "attempt_id", attempt.ID, "execution_id", attempt.ExecutionID, "node_id", processor.NodeID, "stage", "stage_poll", "error_code", "node_execution_unavailable", "error_reason", logsafe.Error(err))
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-time.After(interval):
 			}
 			continue
+		}
+		if execution.Status != lastStatus {
+			processor.logger().InfoContext(ctx, "节点阶段状态变更", "task_id", stage.TaskID, "stage_id", stage.ID, "attempt_id", attempt.ID, "execution_id", attempt.ExecutionID, "node_id", processor.NodeID, "node_status", execution.Status, "stage", "stage_poll")
+			lastStatus = execution.Status
 		}
 		switch execution.Status {
 		case "accepted", "queued", "running", "validating", "cancelling", "unknown":
@@ -216,7 +360,7 @@ func (processor *Processor) poll(ctx context.Context, stage sqlite.TaskStage, at
 			}
 			artifact, metadataErr := processor.Client.GetArtifact(ctx, "stage-artifact-"+attempt.ID, execution.ResultArtifactID)
 			if metadataErr != nil {
-				return processor.fail(ctx, stage, attempt, "node_artifact_unavailable", "节点阶段产物元数据不可用", false)
+				return processor.fail(ctx, stage, attempt, "node_artifact_unavailable", operationErrorMessage("节点阶段产物元数据不可用", metadataErr), false)
 			}
 			if artifact.ArtifactID != execution.ResultArtifactID || artifact.Kind != "video" || artifact.State != "active" || artifact.SizeBytes <= 0 || len(artifact.SHA256) != 64 || len(artifact.MediaManifest) == 0 || string(artifact.MediaManifest) == "null" {
 				return processor.fail(ctx, stage, attempt, "node_artifact_invalid", "节点阶段产物元数据无效", true)
@@ -228,14 +372,15 @@ func (processor *Processor) poll(ctx context.Context, stage sqlite.TaskStage, at
 			if validationErr := mediagate.Validate(stage.StageType, request.Parameters, artifact.MediaManifest); validationErr != nil {
 				return processor.fail(ctx, stage, attempt, "node_artifact_invalid", validationErr.Error(), true)
 			}
-			logicalArtifactID, registerErr := processor.Store.RegisterStageOutput(
-				ctx, stage.TaskID, stage.ID, processor.NodeID, artifact.ArtifactID,
+			logicalArtifactID, completeErr := processor.Store.CompleteStageWithOutput(
+				ctx, stage.TaskID, stage.ID, stage.LeaseToken, attempt.ID, processor.NodeID, artifact.ArtifactID,
 				artifact.SizeBytes, artifact.SHA256, string(artifact.MediaManifest),
 			)
-			if registerErr != nil {
-				return registerErr
+			if completeErr != nil {
+				return completeErr
 			}
-			return processor.Store.CompleteStage(ctx, stage.ID, stage.LeaseToken, attempt.ID, logicalArtifactID)
+			processor.logger().InfoContext(ctx, "任务阶段执行完成", "task_id", stage.TaskID, "stage_id", stage.ID, "attempt_id", attempt.ID, "execution_id", attempt.ExecutionID, "node_id", processor.NodeID, "artifact_id", logicalArtifactID, "stage", "stage_complete")
+			return nil
 		case "failed", "cancelled":
 			code, retryable := "node_execution_failed", false
 			message := "节点阶段执行失败"
@@ -250,6 +395,14 @@ func (processor *Processor) poll(ctx context.Context, stage sqlite.TaskStage, at
 			return processor.fail(ctx, stage, attempt, "node_protocol_error", "节点返回未知状态", false)
 		}
 	}
+}
+
+func (processor *Processor) taskCancelled(ctx context.Context, taskID string) (bool, error) {
+	task, err := processor.Store.GetTaskForExecution(ctx, taskID)
+	if err != nil {
+		return false, err
+	}
+	return task.Status == domain.StatusCancelled, nil
 }
 
 func executionRequest(stage sqlite.TaskStage) (nodeapi.ExecutionRequest, error) {
@@ -301,13 +454,14 @@ func deriveParameters(stageType string, profile map[string]any) (json.RawMessage
 
 func (processor *Processor) fail(ctx context.Context, stage sqlite.TaskStage, attempt sqlite.StageAttempt, code, message string, terminal bool) error {
 	if attempt.ID == "" {
-		attempt = sqlite.StageAttempt{ID: uuid.NewString(), StageID: stage.ID, AttemptNo: stage.AttemptCount + 1, OperationID: uuid.NewString(), NodeID: processor.NodeID, Status: "dispatching"}
+		attempt = sqlite.StageAttempt{ID: uuid.NewString(), StageID: stage.ID, AttemptNo: stage.AttemptCount + 1, OperationID: uuid.NewString(), NodeID: processor.NodeID, LeaseToken: stage.LeaseToken, Status: "dispatching"}
 		if err := processor.Store.CreateStageAttempt(ctx, attempt); err != nil {
 			return err
 		}
 	}
 	terminal = terminal || stage.AttemptCount+1 >= stage.MaxAttempts || !retryableCode(code)
 	next := processor.now().Add(backoff(stage.AttemptCount + 1))
+	processor.logger().ErrorContext(ctx, "任务阶段执行失败", "task_id", stage.TaskID, "stage_id", stage.ID, "attempt_id", attempt.ID, "node_id", processor.NodeID, "stage", "stage_failure", "error_code", code, "error_reason", sanitize(message), "terminal", terminal, "retry_at", next)
 	return processor.Store.FailStage(ctx, stage.ID, stage.LeaseToken, attempt.ID, code, sanitize(message), next, terminal)
 }
 
@@ -317,6 +471,25 @@ func classifySubmitError(err error) string {
 		return responseError.Code
 	}
 	return "node_submit_unavailable"
+}
+
+func materializationErrorMessage(err error) string {
+	var phased interface{ InputMaterializationPhase() string }
+	if errors.As(err, &phased) {
+		if phased.InputMaterializationPhase() == "read" {
+			return "输入素材下载失败：" + logsafe.Error(err)
+		}
+		return "输入素材导入失败：" + logsafe.Error(err)
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return "输入素材下载失败：" + logsafe.Error(urlErr)
+	}
+	return "输入素材导入失败：" + logsafe.Error(err)
+}
+
+func operationErrorMessage(prefix string, err error) string {
+	return prefix + "：" + logsafe.Error(err)
 }
 
 func terminalExecutionReadError(err error) (string, bool) {
@@ -363,9 +536,23 @@ func (processor *Processor) leaseDuration() time.Duration {
 	return 10 * time.Minute
 }
 
+func (processor *Processor) pollInterval() time.Duration {
+	if processor.PollInterval > 0 {
+		return processor.PollInterval
+	}
+	return time.Second
+}
+
 func (processor *Processor) now() time.Time {
 	if processor.Now != nil {
 		return processor.Now().UTC()
 	}
 	return time.Now().UTC()
+}
+
+func (processor *Processor) logger() *slog.Logger {
+	if processor.Logger != nil {
+		return processor.Logger
+	}
+	return slog.Default()
 }

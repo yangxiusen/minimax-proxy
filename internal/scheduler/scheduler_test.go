@@ -105,6 +105,24 @@ func TestDisabledSlotWaitsWithoutHealthWarning(t *testing.T) {
 	}
 }
 
+func TestHealthFailureLogIncludesReason(t *testing.T) {
+	var output bytes.Buffer
+	scheduler := New([]Slot{{
+		ID:        "unhealthy-node",
+		Processor: notifyingProcessor{called: make(chan struct{}, 1)},
+		Health:    func(context.Context) error { return errors.New("健康快照已过期") },
+	}}, 10*time.Millisecond, slog.New(slog.NewJSONHandler(&output, nil)))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	scheduler.Run(ctx)
+
+	logs := output.String()
+	if !bytes.Contains([]byte(logs), []byte(`"error_reason":"健康快照已过期"`)) {
+		t.Fatalf("health failure reason missing: %s", logs)
+	}
+}
+
 type blockingProcessor struct {
 	id      string
 	started chan<- string

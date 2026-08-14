@@ -82,6 +82,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		{version: 11, name: "请求配置简化", sql: migrations.RequestProfileSimplification},
 		{version: 12, name: "对外 API Key 明文", sql: migrations.ExternalAPIKeyPlaintext},
 		{version: 13, name: "动态逻辑分辨率", sql: migrations.DynamicRequestResolutions},
+		{version: 14, name: "节点取消对账屏障", sql: migrations.NodeDispatchBarriers},
 	})
 }
 
@@ -519,15 +520,23 @@ func (s *Store) RequestAdminCancel(ctx context.Context, taskID string) (err erro
 	defer completeTransaction(finish, &err)
 	now := s.nowUnix()
 	var status domain.InternalStatus
-	err = conn.QueryRowContext(ctx, `SELECT status FROM video_tasks WHERE task_id=? AND deleted_at IS NULL AND expires_at>?`, taskID, now).Scan(&status)
+	var upstreamID, activeStageID string
+	err = conn.QueryRowContext(ctx, `SELECT status,COALESCE(upstream_id,''),COALESCE(active_stage_id,'') FROM video_tasks WHERE task_id=? AND deleted_at IS NULL AND expires_at>?`, taskID, now).Scan(&status, &upstreamID, &activeStageID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.ErrTaskNotFound
 	}
 	if err != nil {
 		return err
 	}
+	hasBarrier, err := createNodeDispatchBarrierForTask(ctx, conn, taskID, now*1000)
+	if err != nil {
+		return err
+	}
 	switch status {
 	case domain.StatusQueuedOpen, domain.StatusQueuedLocked:
+		if hasBarrier {
+			return finishStageTaskCancellation(ctx, conn, taskID, now)
+		}
 		result, execErr := conn.ExecContext(ctx, `UPDATE video_tasks SET status='cancelled',cancel_locked=0,cancel_requested_at=?,finished_at=?,updated_at=?,version=version+1 WHERE task_id=? AND status=?`, now, now, now, taskID, status)
 		if err := oneRow(result, execErr); err != nil {
 			return err
@@ -537,11 +546,39 @@ func (s *Store) RequestAdminCancel(ctx context.Context, taskID string) (err erro
 		}
 		return createCallbackDeliveryWithConn(ctx, conn, taskID, "cancelled", now*1000)
 	case domain.StatusDispatching, domain.StatusRunning, domain.StatusReconciling:
+		if hasBarrier || activeStageID != "" || upstreamID == "" {
+			return finishStageTaskCancellation(ctx, conn, taskID, now)
+		}
 		result, execErr := conn.ExecContext(ctx, `UPDATE video_tasks SET status='cancelling',cancel_requested_at=?,updated_at=?,version=version+1 WHERE task_id=? AND status=?`, now, now, taskID, status)
 		return oneRow(result, execErr)
+	case domain.StatusCancelling:
+		if hasBarrier || activeStageID != "" || upstreamID == "" {
+			return finishStageTaskCancellation(ctx, conn, taskID, now)
+		}
+		if upstreamID != "" {
+			return nil
+		}
 	default:
 		return domain.ErrTaskNotOperable
 	}
+	return domain.ErrTaskNotOperable
+}
+
+func finishStageTaskCancellation(ctx context.Context, conn *sql.Conn, taskID string, now int64) error {
+	if _, err := conn.ExecContext(ctx, `UPDATE stage_attempts SET status='failed',error_code='task_cancelled',error_message='任务已取消',heartbeat_at=?,finished_at=? WHERE stage_id IN (SELECT id FROM task_stages WHERE task_id=?) AND status IN ('dispatching','running','validating','unknown')`, now*1000, now*1000, taskID); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE task_stages SET status='cancelled',lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,updated_at=?,finished_at=COALESCE(finished_at,?),row_version=row_version+1 WHERE task_id=? AND status NOT IN ('succeeded','failed','skipped','cancelled')`, now*1000, now*1000, taskID); err != nil {
+		return err
+	}
+	result, err := conn.ExecContext(ctx, `UPDATE video_tasks SET status='cancelled',cancel_locked=0,cancel_requested_at=COALESCE(cancel_requested_at,?),upstream_id=NULL,active_stage_id=NULL,finished_at=?,updated_at=?,version=version+1 WHERE task_id=? AND status IN ('queued_open','queued_locked','dispatching','running','reconciling','cancelling')`, now, now, now, taskID)
+	if err := oneRow(result, err); err != nil {
+		return err
+	}
+	if err := createCallbackDeliveryWithConn(ctx, conn, taskID, "cancelled", now*1000); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) FinishCancelled(ctx context.Context, taskID, upstreamID string) error {

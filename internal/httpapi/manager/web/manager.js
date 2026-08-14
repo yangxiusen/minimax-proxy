@@ -88,7 +88,7 @@ const statusLabels = {
 };
 const healthLabels = { healthy: "健康", unhealthy: "连接失败", unknown: "未知" };
 const runtimeLabels = { running: "运行中", idle: "空闲", unknown: "状态未知" };
-const phaseLabels = { dispatching: "提交中", recovering: "恢复中", retrying: "重试中", cancelling: "中止中" };
+const phaseLabels = { dispatching: "提交中", recovering: "恢复中", retrying: "重试中", waiting: "等待实例", cancelling: "中止中" };
 
 function makeElement(tag, className, text) {
   const node = document.createElement(tag);

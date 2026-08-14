@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/logsafe"
 )
 
 type Processor interface{ ProcessOne(context.Context) error }
@@ -65,7 +66,7 @@ func (s *Scheduler) runSlot(ctx context.Context, slot Slot) {
 		if slot.Active != nil {
 			active, err := slot.Active(ctx)
 			if err != nil {
-				s.logger.ErrorContext(ctx, "读取实例活动任务失败", "upstream_id", slot.ID, "stage", "active_check", "error_code", "active_check_failed")
+				s.logger.ErrorContext(ctx, "读取实例活动任务失败", "upstream_id", slot.ID, "stage", "active_check", "error_code", "active_check_failed", "error_reason", logsafe.Error(err))
 				if !s.wait(ctx) {
 					return
 				}
@@ -79,7 +80,7 @@ func (s *Scheduler) runSlot(ctx context.Context, slot Slot) {
 			cancel()
 			if err != nil {
 				if !errors.Is(err, domain.ErrNodeDisabled) {
-					s.logger.WarnContext(ctx, "私有服务健康检查失败，暂停该实例调度", "upstream_id", slot.ID, "stage", "health", "error_code", "upstream_unhealthy")
+					s.logger.WarnContext(ctx, "私有服务健康检查失败，暂停该实例调度", "upstream_id", slot.ID, "stage", "health", "error_code", "upstream_unhealthy", "error_reason", logsafe.Error(err))
 				}
 				if !s.wait(ctx) {
 					return
@@ -95,7 +96,7 @@ func (s *Scheduler) runSlot(ctx context.Context, slot Slot) {
 			return
 		}
 		if !errors.Is(err, domain.ErrQueueEmpty) && !errors.Is(err, domain.ErrUpstreamBusy) {
-			s.logger.ErrorContext(ctx, "上游执行槽处理失败", "upstream_id", slot.ID, "stage", "worker", "error_code", "worker_error")
+			s.logger.ErrorContext(ctx, "上游执行槽处理失败", "upstream_id", slot.ID, "stage", "worker", "error_code", "worker_error", "error_reason", logsafe.Error(err))
 		}
 		if !s.wait(ctx) {
 			return

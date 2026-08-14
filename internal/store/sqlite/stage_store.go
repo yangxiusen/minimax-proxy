@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"time"
+
+	"minimax-h3-tc/internal/domain"
 )
 
 var ErrNoClaimableStage = errors.New("没有可领取阶段")
@@ -32,22 +34,24 @@ type TaskStage struct {
 }
 
 type StageAttempt struct {
-	ID               string
-	StageID          string
-	AttemptNo        int
-	OperationID      string
-	NodeID           string
-	ExecutionID      string
-	Status           string
-	InputArtifactID  string
-	OutputArtifactID string
-	MediaBeforeJSON  string
-	MediaAfterJSON   string
-	ErrorCode        string
-	ErrorMessage     string
-	StartedAt        int64
-	HeartbeatAt      int64
-	FinishedAt       int64
+	ID                  string
+	StageID             string
+	AttemptNo           int
+	OperationID         string
+	NodeID              string
+	LeaseToken          string
+	ExecutionID         string
+	Status              string
+	InputArtifactID     string
+	OutputArtifactID    string
+	MediaBeforeJSON     string
+	MediaAfterJSON      string
+	RequestSnapshotJSON string
+	ErrorCode           string
+	ErrorMessage        string
+	StartedAt           int64
+	HeartbeatAt         int64
+	FinishedAt          int64
 }
 
 const stageSelect = `SELECT id,task_id,stage_order,stage_type,required,status,attempt_count,max_attempts,COALESCE(preferred_node_id,''),COALESCE(current_node_id,''),COALESCE(input_artifact_id,''),COALESCE(output_artifact_id,''),config_snapshot_json,COALESCE(lease_token,''),COALESCE(lease_expires_at,0),COALESCE(next_attempt_at,0),created_at,updated_at,row_version FROM task_stages`
@@ -79,6 +83,13 @@ func (s *Store) ClaimStage(ctx context.Context, nodeID, leaseToken string, lease
 		return TaskStage{}, err
 	}
 	defer completeTransaction(finish, &err)
+	var blocked int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM node_dispatch_barriers WHERE node_id=?`, nodeID).Scan(&blocked); err != nil {
+		return TaskStage{}, err
+	}
+	if blocked > 0 {
+		return TaskStage{}, ErrNoClaimableStage
+	}
 	now := s.nowMillis()
 	stage, err := scanStage(conn.QueryRowContext(ctx, stageSelect+` WHERE task_stages.id=(`+claimStageCandidateSelect+`)`, now, now, nodeID, nodeID))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -108,8 +119,13 @@ func (s *Store) CreateStageAttempt(ctx context.Context, attempt StageAttempt) (e
 	}
 	defer completeTransaction(finish, &err)
 	var currentCount, maxAttempts int
-	if err := conn.QueryRowContext(ctx, `SELECT attempt_count,max_attempts FROM task_stages WHERE id=?`, attempt.StageID).Scan(&currentCount, &maxAttempts); err != nil {
+	var stageStatus, leaseToken, currentNodeID string
+	var taskStatus domain.InternalStatus
+	if err := conn.QueryRowContext(ctx, `SELECT s.attempt_count,s.max_attempts,s.status,COALESCE(s.lease_token,''),COALESCE(s.current_node_id,''),t.status FROM task_stages s JOIN video_tasks t ON t.task_id=s.task_id WHERE s.id=? AND t.deleted_at IS NULL`, attempt.StageID).Scan(&currentCount, &maxAttempts, &stageStatus, &leaseToken, &currentNodeID, &taskStatus); err != nil {
 		return err
+	}
+	if stageStatus != "leased" || attempt.LeaseToken == "" || attempt.LeaseToken != leaseToken || attempt.NodeID != currentNodeID || !taskStatus.AdminCanCancel() {
+		return domain.ErrStateConflict
 	}
 	if attempt.AttemptNo != currentCount+1 || attempt.AttemptNo > maxAttempts {
 		return errors.New("阶段尝试序号冲突")
@@ -117,7 +133,7 @@ func (s *Store) CreateStageAttempt(ctx context.Context, attempt StageAttempt) (e
 	if attempt.StartedAt == 0 {
 		attempt.StartedAt = s.nowMillis()
 	}
-	if _, err := conn.ExecContext(ctx, `INSERT INTO stage_attempts(id,stage_id,attempt_no,operation_id,node_id,execution_id,status,input_artifact_id,output_artifact_id,media_before_json,media_after_json,error_code,error_message,started_at,heartbeat_at,finished_at) VALUES(?,?,?,?,?,NULLIF(?,''),?,NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),?,NULLIF(?,0),NULLIF(?,0))`, attempt.ID, attempt.StageID, attempt.AttemptNo, attempt.OperationID, attempt.NodeID, attempt.ExecutionID, attempt.Status, attempt.InputArtifactID, attempt.OutputArtifactID, attempt.MediaBeforeJSON, attempt.MediaAfterJSON, attempt.ErrorCode, attempt.ErrorMessage, attempt.StartedAt, attempt.HeartbeatAt, attempt.FinishedAt); err != nil {
+	if _, err := conn.ExecContext(ctx, `INSERT INTO stage_attempts(id,stage_id,attempt_no,operation_id,node_id,execution_id,status,input_artifact_id,output_artifact_id,media_before_json,media_after_json,request_snapshot_json,error_code,error_message,started_at,heartbeat_at,finished_at) VALUES(?,?,?,?,?,NULLIF(?,''),?,NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),?,NULLIF(?,0),NULLIF(?,0))`, attempt.ID, attempt.StageID, attempt.AttemptNo, attempt.OperationID, attempt.NodeID, attempt.ExecutionID, attempt.Status, attempt.InputArtifactID, attempt.OutputArtifactID, attempt.MediaBeforeJSON, attempt.MediaAfterJSON, attempt.RequestSnapshotJSON, attempt.ErrorCode, attempt.ErrorMessage, attempt.StartedAt, attempt.HeartbeatAt, attempt.FinishedAt); err != nil {
 		return err
 	}
 	result, err := conn.ExecContext(ctx, `UPDATE task_stages SET attempt_count=attempt_count+1,updated_at=?,row_version=row_version+1 WHERE id=? AND attempt_count=?`, attempt.StartedAt, attempt.StageID, currentCount)
@@ -151,9 +167,9 @@ func (s *Store) BindStageExecution(ctx context.Context, stageID, leaseToken, att
 }
 
 func (s *Store) GetRunningStageAttempt(ctx context.Context, stageID, leaseToken string) (attempt StageAttempt, err error) {
-	err = s.db.QueryRowContext(ctx, `SELECT a.id,a.stage_id,a.attempt_no,a.operation_id,a.node_id,COALESCE(a.execution_id,''),a.status,COALESCE(a.input_artifact_id,''),COALESCE(a.output_artifact_id,''),COALESCE(a.media_before_json,''),COALESCE(a.media_after_json,''),COALESCE(a.error_code,''),COALESCE(a.error_message,''),a.started_at,COALESCE(a.heartbeat_at,0),COALESCE(a.finished_at,0) FROM stage_attempts a JOIN task_stages s ON s.id=a.stage_id WHERE a.stage_id=? AND s.lease_token=? ORDER BY a.attempt_no DESC LIMIT 1`, stageID, leaseToken).Scan(
+	err = s.db.QueryRowContext(ctx, `SELECT a.id,a.stage_id,a.attempt_no,a.operation_id,a.node_id,COALESCE(a.execution_id,''),a.status,COALESCE(a.input_artifact_id,''),COALESCE(a.output_artifact_id,''),COALESCE(a.media_before_json,''),COALESCE(a.media_after_json,''),COALESCE(a.request_snapshot_json,''),COALESCE(a.error_code,''),COALESCE(a.error_message,''),a.started_at,COALESCE(a.heartbeat_at,0),COALESCE(a.finished_at,0) FROM stage_attempts a JOIN task_stages s ON s.id=a.stage_id WHERE a.stage_id=? AND s.lease_token=? ORDER BY a.attempt_no DESC LIMIT 1`, stageID, leaseToken).Scan(
 		&attempt.ID, &attempt.StageID, &attempt.AttemptNo, &attempt.OperationID, &attempt.NodeID, &attempt.ExecutionID,
-		&attempt.Status, &attempt.InputArtifactID, &attempt.OutputArtifactID, &attempt.MediaBeforeJSON, &attempt.MediaAfterJSON,
+		&attempt.Status, &attempt.InputArtifactID, &attempt.OutputArtifactID, &attempt.MediaBeforeJSON, &attempt.MediaAfterJSON, &attempt.RequestSnapshotJSON,
 		&attempt.ErrorCode, &attempt.ErrorMessage, &attempt.StartedAt, &attempt.HeartbeatAt, &attempt.FinishedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -168,6 +184,10 @@ func (s *Store) CompleteStage(ctx context.Context, stageID, leaseToken, attemptI
 		return err
 	}
 	defer completeTransaction(finish, &err)
+	return s.completeStageWithConn(ctx, conn, stageID, leaseToken, attemptID, outputArtifactID)
+}
+
+func (s *Store) completeStageWithConn(ctx context.Context, conn *sql.Conn, stageID, leaseToken, attemptID, outputArtifactID string) error {
 	now := s.nowMillis()
 	result, err := conn.ExecContext(ctx, `UPDATE stage_attempts SET status='succeeded',output_artifact_id=NULLIF(?,''),heartbeat_at=?,finished_at=? WHERE id=? AND stage_id=? AND status IN ('running','validating','unknown')`, outputArtifactID, now, now, attemptID, stageID)
 	if err := oneRow(result, err); err != nil {

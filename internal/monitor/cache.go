@@ -140,7 +140,7 @@ func (c *Cache) AvailableFresh(now time.Time, maxAge time.Duration) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	for _, node := range c.nodes {
-		if !node.Disabled && !node.Applying && node.Health == HealthHealthy && !node.CheckedAt.IsZero() && !node.CheckedAt.Before(now.Add(-maxAge)) {
+		if !node.Disabled && !node.Applying && (node.Health == HealthHealthy || node.SchedulingBlocked) && !node.CheckedAt.IsZero() && !node.CheckedAt.Before(now.Add(-maxAge)) {
 			return true
 		}
 	}
@@ -232,6 +232,8 @@ func sanitizeError(code string) *ErrorSnapshot {
 		return &ErrorSnapshot{Code: code, Summary: "私有任务中止状态待确认"}
 	case "node_api_unhealthy":
 		return &ErrorSnapshot{Code: code, Summary: "模型节点 API 健康检查失败"}
+	case "node_cancel_reconciling":
+		return &ErrorSnapshot{Code: code, Summary: "模型节点任务中止状态待确认"}
 	default:
 		return &ErrorSnapshot{Code: "upstream_error", Summary: "私有服务异常"}
 	}

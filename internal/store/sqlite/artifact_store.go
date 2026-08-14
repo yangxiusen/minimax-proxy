@@ -55,19 +55,50 @@ func (s *Store) RegisterStageOutput(
 	sizeBytes int64,
 	digest, mediaJSON string,
 ) (artifactID string, err error) {
-	if taskID == "" || stageID == "" || nodeID == "" || nodeArtifactID == "" || sizeBytes <= 0 || len(digest) != 64 || !json.Valid([]byte(mediaJSON)) {
-		return "", errors.New("节点阶段产物元数据无效")
+	if err := validateStageOutput(taskID, stageID, nodeID, nodeArtifactID, sizeBytes, digest, mediaJSON); err != nil {
+		return "", err
 	}
-	if decoded, decodeErr := hex.DecodeString(digest); decodeErr != nil || len(decoded) != sha256.Size {
-		return "", errors.New("节点阶段产物 SHA-256 无效")
-	}
-	artifactID = stableArtifactID("art", stageID)
-	locationID := stableArtifactID("loc", nodeID+"\x00"+nodeArtifactID)
 	conn, finish, err := s.immediate(ctx)
 	if err != nil {
 		return "", err
 	}
 	defer completeTransaction(finish, &err)
+	return s.registerStageOutputWithConn(ctx, conn, taskID, stageID, nodeID, nodeArtifactID, sizeBytes, digest, mediaJSON)
+}
+
+func (s *Store) CompleteStageWithOutput(
+	ctx context.Context,
+	taskID, stageID, leaseToken, attemptID, nodeID, nodeArtifactID string,
+	sizeBytes int64,
+	digest, mediaJSON string,
+) (artifactID string, err error) {
+	if err := validateStageOutput(taskID, stageID, nodeID, nodeArtifactID, sizeBytes, digest, mediaJSON); err != nil {
+		return "", err
+	}
+	conn, finish, err := s.immediate(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer completeTransaction(finish, &err)
+	artifactID, err = s.registerStageOutputWithConn(ctx, conn, taskID, stageID, nodeID, nodeArtifactID, sizeBytes, digest, mediaJSON)
+	if err != nil {
+		return "", err
+	}
+	if err := s.completeStageWithConn(ctx, conn, stageID, leaseToken, attemptID, artifactID); err != nil {
+		return "", err
+	}
+	return artifactID, nil
+}
+
+func (s *Store) registerStageOutputWithConn(
+	ctx context.Context,
+	conn *sql.Conn,
+	taskID, stageID, nodeID, nodeArtifactID string,
+	sizeBytes int64,
+	digest, mediaJSON string,
+) (artifactID string, err error) {
+	artifactID = stableArtifactID("art", stageID)
+	locationID := stableArtifactID("loc", nodeID+"\x00"+nodeArtifactID)
 	var stageTaskID string
 	var stageOrder int
 	if err := conn.QueryRowContext(ctx, `SELECT task_id,stage_order FROM task_stages WHERE id=?`, stageID).Scan(&stageTaskID, &stageOrder); errors.Is(err, sql.ErrNoRows) {
@@ -115,6 +146,16 @@ func (s *Store) RegisterStageOutput(
 		return "", fmt.Errorf("阶段产物位置幂等冲突")
 	}
 	return artifactID, nil
+}
+
+func validateStageOutput(taskID, stageID, nodeID, nodeArtifactID string, sizeBytes int64, digest, mediaJSON string) error {
+	if taskID == "" || stageID == "" || nodeID == "" || nodeArtifactID == "" || sizeBytes <= 0 || len(digest) != 64 || !json.Valid([]byte(mediaJSON)) {
+		return errors.New("节点阶段产物元数据无效")
+	}
+	if decoded, err := hex.DecodeString(digest); err != nil || len(decoded) != sha256.Size {
+		return errors.New("节点阶段产物 SHA-256 无效")
+	}
+	return nil
 }
 
 func stableArtifactID(prefix, value string) string {

@@ -641,6 +641,13 @@ func TestTasksSignsArtifactPlaybackURLWithoutExposingArtifactID(t *testing.T) {
 	}
 }
 
+func TestTaskPhaseShowsWaitingForUnassignedRunningStageTask(t *testing.T) {
+	item := domain.AdminTaskSummary{InternalStatus: domain.StatusRunning}
+	if got := taskPhase(item); got != "waiting" {
+		t.Fatalf("taskPhase() = %q, want waiting", got)
+	}
+}
+
 func TestPublicVideoURLDoesNotExposePrivateLegacyNodeAddress(t *testing.T) {
 	h := &handler{}
 	unsafe, err := h.publicVideoURL(context.Background(), domain.AdminTaskSummary{

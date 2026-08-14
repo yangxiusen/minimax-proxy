@@ -34,6 +34,7 @@ type NodeAPIClient interface {
 	GetExecution(context.Context, string, string) (nodeapi.Execution, error)
 	GetArtifact(context.Context, string, string) (nodeapi.Artifact, error)
 	ImportArtifact(context.Context, string, nodeapi.ImportArtifactRequest) (nodeapi.Artifact, error)
+	CancelExecution(context.Context, string, string, string) (nodeapi.ExecutionReference, error)
 }
 
 type RuntimeStore interface {
@@ -144,6 +145,15 @@ func (f NodeRuntimeFactory) initializeSnapshot(ctx context.Context, node domain.
 		ID: node.ID, Address: address, Disabled: !input.Enabled, Applying: true,
 		SchedulingBlocked: previous.SchedulingBlocked,
 	}
+	blocked, err := f.Store.HasNodeDispatchBarrier(ctx, node.ID)
+	if err != nil {
+		return err
+	}
+	if blocked {
+		snapshot.SchedulingBlocked = true
+		snapshot.Runtime = monitor.RuntimeRunning
+		snapshot.LastError = &monitor.ErrorSnapshot{Code: "node_cancel_reconciling"}
+	}
 	active, err := f.Store.ActiveForUpstream(ctx, node.ID)
 	if err != nil && !errors.Is(err, domain.ErrTaskNotFound) {
 		return err
@@ -201,8 +211,8 @@ func (f NodeRuntimeFactory) startNodeAPI(parent context.Context, node domain.Mod
 	maxHealthAge := upstream.RequestTimeout + monitorInterval(f.MonitorInterval)
 	processor := &orchestrator.Processor{
 		Store: f.Store, Client: client, NodeID: node.ID, Migrator: f.ArtifactMigrator,
-		Inputs:        &orchestrator.InputMaterializer{Store: f.Store},
-		LeaseDuration: max(f.ExecutionTimeout, 10*time.Minute), PollInterval: input.PollInterval, Now: f.Now,
+		Inputs:        &orchestrator.InputMaterializer{Store: f.Store, Logger: f.Logger},
+		LeaseDuration: max(f.ExecutionTimeout, 10*time.Minute), PollInterval: input.PollInterval, Logger: f.Logger, Now: f.Now,
 	}
 	dispatcher := scheduler.New([]scheduler.Slot{{
 		ID: node.ID, Processor: processor,
@@ -211,6 +221,17 @@ func (f NodeRuntimeFactory) startNodeAPI(parent context.Context, node domain.Mod
 				return domain.ErrNodeDisabled
 			}
 			return cachedSchedulable(f.Cache, node.ID, runtimeNow(f.Now), maxHealthAge)
+		},
+		Active: func(ctx context.Context) (bool, error) {
+			blocked, err := f.Store.HasNodeDispatchBarrier(ctx, node.ID)
+			if err != nil || blocked {
+				return blocked, err
+			}
+			_, err = f.Store.ActiveForUpstream(ctx, node.ID)
+			if errors.Is(err, domain.ErrTaskNotFound) {
+				return false, nil
+			}
+			return err == nil, err
 		},
 	}}, time.Second, f.Logger)
 	done := make(chan struct{})
@@ -263,7 +284,11 @@ func (f NodeRuntimeFactory) probeNodeAPI(parent context.Context, nodeID string, 
 	ctx, cancel := context.WithTimeout(parent, monitorInterval(f.MonitorInterval))
 	defer cancel()
 	now := runtimeNow(f.Now)
+	blocked, barrierErr := f.Store.HasNodeDispatchBarrier(ctx, nodeID)
 	health, err := client.Health(ctx, "monitor-health-"+nodeID)
+	if barrierErr != nil {
+		err = barrierErr
+	}
 	if err == nil && health.Status != "healthy" {
 		err = errors.New("节点健康状态异常")
 	}
@@ -297,21 +322,31 @@ func (f NodeRuntimeFactory) probeNodeAPI(parent context.Context, nodeID string, 
 			snapshot.Disabled = !enabled
 			snapshot.Health = monitor.HealthUnhealthy
 			snapshot.Runtime = monitor.RuntimeUnknown
+			snapshot.SchedulingBlocked = blocked
 			snapshot.CheckedAt = now
 			snapshot.UpdatedAt = now
-			snapshot.LastError = &monitor.ErrorSnapshot{Code: "node_api_unhealthy"}
+			code := "node_api_unhealthy"
+			if blocked {
+				code = "node_cancel_reconciling"
+				snapshot.Runtime = monitor.RuntimeRunning
+			}
+			snapshot.LastError = &monitor.ErrorSnapshot{Code: code}
 		})
 		return
 	}
 	queue, memory, vram, cpu, gpu := healthRuntimeSnapshot(health.Runtime)
 	runtimeStatus := monitor.RuntimeIdle
-	if hasActive || queue != nil && *queue > 0 {
+	if hasActive || blocked || queue != nil && *queue > 0 {
 		runtimeStatus = monitor.RuntimeRunning
 	}
 	f.Cache.Update(nodeID, func(snapshot *monitor.NodeSnapshot) {
 		snapshot.Applying = false
 		snapshot.Disabled = !enabled
 		snapshot.Health = monitor.HealthHealthy
+		snapshot.SchedulingBlocked = blocked
+		if blocked {
+			snapshot.Health = monitor.HealthUnhealthy
+		}
 		snapshot.Runtime = runtimeStatus
 		snapshot.PrivateQueue = queue
 		snapshot.MemoryPercent = memory
@@ -339,6 +374,9 @@ func (f NodeRuntimeFactory) probeNodeAPI(parent context.Context, nodeID string, 
 		snapshot.LastHealthyAt = now
 		snapshot.UpdatedAt = now
 		snapshot.LastError = nil
+		if blocked {
+			snapshot.LastError = &monitor.ErrorSnapshot{Code: "node_cancel_reconciling"}
+		}
 		snapshot.Capabilities = capabilities.Raw
 	})
 }

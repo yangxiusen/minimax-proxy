@@ -61,3 +61,8 @@ var ExternalAPIKeyPlaintext string
 //
 //go:embed 013_dynamic_request_resolutions.sql
 var DynamicRequestResolutions string
+
+// NodeDispatchBarriers 增加节点取消对账屏障和阶段请求快照。
+//
+//go:embed 014_node_dispatch_barriers.sql
+var NodeDispatchBarriers string

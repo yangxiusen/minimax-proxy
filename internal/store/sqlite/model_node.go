@@ -183,7 +183,9 @@ func (s *Store) ImportLegacyNodes(ctx context.Context, inputs []domain.ModelNode
 
 func activeTaskCount(ctx context.Context, query rowQuerier, nodeID string) (int, error) {
 	var count int
-	err := query.QueryRowContext(ctx, `SELECT COUNT(*) FROM video_tasks WHERE upstream_id=? AND status IN ('dispatching','running','reconciling','cancelling') AND deleted_at IS NULL`, nodeID).Scan(&count)
+	err := query.QueryRowContext(ctx, `SELECT
+    (SELECT COUNT(*) FROM video_tasks WHERE upstream_id=? AND status IN ('dispatching','running','reconciling','cancelling') AND deleted_at IS NULL) +
+    (SELECT COUNT(*) FROM node_dispatch_barriers WHERE node_id=?)`, nodeID, nodeID).Scan(&count)
 	return count, err
 }
 

@@ -23,6 +23,7 @@
 - [Node 单 Key 与 conf.yml 凭据变更](developing/version_0.0.1/changes/006-node-single-key-conf/CHANGE_SPEC.md)：Node 首次启动生成单 Key 和 WebUI 凭据，Proxy 节点配置移除 Key ID，并保留旧数据库列作为兼容占位。
 - [模型请求配置简化与参数收敛](developing/version_0.0.1/changes/007-request-profile-simplification/CHANGE_SPEC.md)：每个请求分辨率一份即时生效配置，支持删除，移除版本发布链、场景配置和无效/固定参数。
 - [节点直出视频签名链接](developing/version_0.0.1/changes/008-direct-node-artifact-delivery/CHANGE_SPEC.md)：成功任务返回 48 小时 Node 直连签名 URL，视频正文不再经过 Proxy，并移除 Proxy 公共根地址配置。
+- [运行中任务中止一致性](developing/version_0.0.1/changes/009-running-task-cancellation-consistency/CHANGE_SPEC.md)：中止任务立即退出 FIFO，未确认停止的 execution 通过持久化 Node 调度屏障对账，其他健康 Node 继续执行后续任务。
 - [归档](archive/)：已完成版本与历史资料。
 
 `docs/` 是外部参考资料，只用于分析，不得被运行时代码直接引用或依赖。

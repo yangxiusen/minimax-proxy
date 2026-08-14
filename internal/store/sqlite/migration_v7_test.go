@@ -12,7 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func TestOpenMigratesEmptyDatabaseThroughVersionThirteenAndIsRepeatable(t *testing.T) {
+func TestOpenMigratesEmptyDatabaseThroughVersionFourteenAndIsRepeatable(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "empty.db")
 	for attempt := 0; attempt < 2; attempt++ {
@@ -24,10 +24,10 @@ func TestOpenMigratesEmptyDatabaseThroughVersionThirteenAndIsRepeatable(t *testi
 		if err := store.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version IN (1,2,3,4,5,6,7,8,10,11,12,13)`).Scan(&migrationCount); err != nil {
+		if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version IN (1,2,3,4,5,6,7,8,10,11,12,13,14)`).Scan(&migrationCount); err != nil {
 			t.Fatal(err)
 		}
-		if userVersion != 13 || migrationCount != 12 {
+		if userVersion != 14 || migrationCount != 13 {
 			t.Fatalf("attempt %d user_version=%d migrations=%d", attempt, userVersion, migrationCount)
 		}
 		for _, table := range []string{"model_request_profiles", "request_profiles", "profile_test_runs", "task_stages", "stage_attempts", "task_artifacts", "artifact_locations", "artifact_deletion_jobs", "artifact_deletion_items", "callback_deliveries", "external_api_keys", "api_key_config_bootstrap"} {
@@ -127,7 +127,7 @@ func TestMigrationBatchRollsBackOnFailure(t *testing.T) {
 	}
 }
 
-func TestOpenForwardsVersionSevenCallbackRowsThroughVersionThirteen(t *testing.T) {
+func TestOpenForwardsVersionSevenCallbackRowsThroughVersionFourteen(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "v7.db")
 	db, err := sql.Open("sqlite", path)
@@ -164,7 +164,7 @@ func TestOpenForwardsVersionSevenCallbackRowsThroughVersionThirteen(t *testing.T
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('callback_deliveries') WHERE name IN ('request_body','lease_expires_at')`).Scan(&columns); err != nil {
 		t.Fatal(err)
 	}
-	if userVersion != 13 || columns != 2 {
+	if userVersion != 14 || columns != 2 {
 		t.Fatalf("user_version=%d columns=%d", userVersion, columns)
 	}
 }

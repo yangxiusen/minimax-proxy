@@ -587,6 +587,9 @@ func (h *handler) writeTaskActionError(w http.ResponseWriter, r *http.Request, e
 }
 
 func taskPhase(item domain.AdminTaskSummary) string {
+	if item.InternalStatus == domain.StatusRunning && item.UpstreamID == "" {
+		return "waiting"
+	}
 	if item.RetryCount > 0 && (item.InternalStatus == domain.StatusDispatching || item.InternalStatus == domain.StatusRunning || item.InternalStatus == domain.StatusReconciling) {
 		return "retrying"
 	}

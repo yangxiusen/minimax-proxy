@@ -217,6 +217,18 @@ func TestCacheAvailableFreshRequiresRecentHealthyCheck(t *testing.T) {
 	}
 }
 
+func TestCacheAvailableFreshAcceptsQueueWhileNodeCancellationIsReconciling(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0).UTC()
+	cache := NewCache([]NodeSnapshot{{
+		ID: "gpu-cancelling", Health: HealthUnhealthy, Runtime: RuntimeRunning,
+		SchedulingBlocked: true, CheckedAt: now, LastError: &ErrorSnapshot{Code: "node_cancel_reconciling"},
+	}})
+
+	if !cache.AvailableFresh(now, time.Second) {
+		t.Fatal("cancellation barrier must preserve queue admission capacity")
+	}
+}
+
 func TestCacheAvailabilityExcludesDisabledAndApplyingNodesAndSupportsDelete(t *testing.T) {
 	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
 	cache := NewCache([]NodeSnapshot{
