@@ -20,6 +20,7 @@ import (
 	"minimax-h3-tc/internal/domain"
 	managerapi "minimax-h3-tc/internal/httpapi/manager"
 	"minimax-h3-tc/internal/httpapi/v2"
+	"minimax-h3-tc/internal/inputspool"
 	monitorcache "minimax-h3-tc/internal/monitor"
 	"minimax-h3-tc/internal/orchestrator"
 	profileservice "minimax-h3-tc/internal/profile"
@@ -111,6 +112,15 @@ func run(configPath string, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	inputSpoolRoot := inputspool.RootFromDatabasePath(cfg.Database.Path)
+	inputSpooler := inputspool.New(inputSpoolRoot)
+	liveInputSpoolTasks, err := store.ListInputSpoolTaskIDs(ctx)
+	if err != nil {
+		return err
+	}
+	if err := inputSpooler.CleanupOrphans(ctx, liveInputSpoolTasks, time.Hour); err != nil {
+		return err
+	}
 	cache := monitorcache.NewCache(nil)
 	artifactService, err := artifactservice.NewService(store, store, nodeSecrets, artifactservice.Options{
 		SigningKey: artifactSigningKey,
@@ -122,6 +132,7 @@ func run(configPath string, logger *slog.Logger) error {
 		Store: store, Cache: cache, Profiles: cfg.GenerationProfiles, ExecutionTimeout: cfg.Task.ExecutionTimeout,
 		MonitorInterval: cfg.Admin.MonitorInterval, Logger: logger, NodeSecrets: nodeSecrets,
 		ArtifactMigrator: orchestrator.MigrationService{Artifacts: artifactService},
+		InputSpoolRoot:   inputSpoolRoot,
 	}
 	nodeRegistry := upstreamregistry.New(store, runtimeFactory.Start, cache, time.Second, logger)
 	maxHealthAge := 3 * cfg.Admin.MonitorInterval
@@ -136,6 +147,7 @@ func run(configPath string, logger *slog.Logger) error {
 		Cleanups:       store,
 		APIKeyService:  apiKeyService,
 		ArtifactURLs:   artifactService,
+		InputSpooler:   inputSpooler,
 		ProbeNode: func(ctx context.Context, input managerapi.NodeProbeInput) managerapi.NodeProbeResult {
 			result := prober.ProbeNodeAPI(ctx, input.Node, input.APIKey)
 			checks := []managerapi.NodeCheck{
@@ -148,7 +160,7 @@ func run(configPath string, logger *slog.Logger) error {
 			}
 		},
 	})
-	v2Handler := v2.NewHandler(v2.Dependencies{Store: store, Authenticator: keyAuthenticator, Profiles: cfg.GenerationProfiles, Logger: logger, Wake: nodeRegistry.Wake, Available: available, CallbackService: callbackService, CallbackCipher: nodeSecrets, ActiveProfiles: store, ArtifactURLs: artifactService})
+	v2Handler := v2.NewHandler(v2.Dependencies{Store: store, Authenticator: keyAuthenticator, Profiles: cfg.GenerationProfiles, Logger: logger, Wake: nodeRegistry.Wake, Available: available, CallbackService: callbackService, CallbackCipher: nodeSecrets, ActiveProfiles: store, ArtifactURLs: artifactService, InputSpooler: inputSpooler})
 	filesHandler := v2.NewFilesHandler(v2.FilesDependencies{Service: artifactService, Authenticator: keyAuthenticator, Logger: logger})
 	handler := newAppHandler(v2Handler, filesHandler, managerHandler)
 	server := &http.Server{Addr: cfg.Server.Address, Handler: handler, ReadTimeout: cfg.Server.ReadTimeout, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: cfg.Server.WriteTimeout, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}

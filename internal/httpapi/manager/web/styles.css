@@ -185,6 +185,16 @@ h3 { margin-bottom: 3px; font-size: 17px; }
 .video-player-body .form-status { color: #d7dde7; }
 .video-player-body .form-status.error { color: #ff8b8b; }
 .video-player { display: block; width: 100%; max-height: calc(100vh - 150px); aspect-ratio: 16 / 9; background: #000; object-fit: contain; }
+.task-detail-dialog { width: min(920px, calc(100vw - 24px)); }
+.task-detail-body { min-height: 360px; padding: 16px; overflow-y: auto; }
+.task-detail-content { display: grid; gap: 14px; }
+.task-detail-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.task-detail-section { min-width: 0; padding-top: 12px; border-top: 1px solid var(--line); }
+.task-detail-section h3 { margin-bottom: 8px; font-size: 14px; }
+.task-detail-row { min-width: 0; display: grid; grid-template-columns: 86px minmax(0, 1fr); gap: 8px; padding: 6px 0; }
+.task-detail-row strong { min-width: 0; overflow-wrap: anywhere; font-weight: 600; }
+.task-detail-text, .task-detail-json { max-height: 220px; margin: 0; padding: 10px; overflow: auto; border: 1px solid var(--line); border-radius: 4px; background: #f7f9fb; white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-detail-media { margin-top: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 4px; background: #fbfcfd; }
 @media (max-width: 800px) {
   .topbar { padding: 10px 12px; align-items: flex-start; }
   .session-info { flex-wrap: wrap; justify-content: flex-end; gap: 7px 10px; }
@@ -233,4 +243,5 @@ h3 { margin-bottom: 3px; font-size: 17px; }
   .api-key-form > div button, .api-key-actions button { flex: 1; min-width: 0; }
   .video-player-dialog { width: calc(100vw - 12px); }
   .video-player-body { padding: 8px; }
+  .task-detail-grid { grid-template-columns: 1fr; }
 }

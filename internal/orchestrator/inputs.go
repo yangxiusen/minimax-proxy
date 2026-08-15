@@ -14,6 +14,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -27,6 +28,7 @@ const maxInputArtifactBytes int64 = 256 << 20
 
 type InputStore interface {
 	GetTaskForExecution(context.Context, string) (domain.Task, error)
+	GetInputSpoolFile(context.Context, string, string) (domain.InputSpoolFile, error)
 	GetActiveArtifactLocation(context.Context, string, string) (sqlite.ArtifactLocation, error)
 	RegisterInputArtifact(context.Context, string, string, string, string, string, int64, string, string) error
 }
@@ -45,10 +47,11 @@ func (e inputMaterializationError) Unwrap() error                     { return e
 func (e inputMaterializationError) InputMaterializationPhase() string { return e.phase }
 
 type InputMaterializer struct {
-	Store  InputStore
-	Guard  *netguard.Guard
-	Client *http.Client
-	Logger *slog.Logger
+	Store          InputStore
+	Guard          *netguard.Guard
+	Client         *http.Client
+	Logger         *slog.Logger
+	InputSpoolRoot string
 }
 
 func (m *InputMaterializer) Materialize(ctx context.Context, taskID, nodeID, requestID string, client InputImportClient) ([]nodeapi.InputArtifact, error) {
@@ -102,19 +105,27 @@ func (m *InputMaterializer) Materialize(ctx context.Context, taskID, nodeID, req
 			return nil, errors.New("任务输入素材类型无效")
 		}
 		logicalID := stableInputID(taskID, index, rawURL)
+		if inputTaskID, inputID, ok := parseProxyInputRef(rawURL); ok {
+			if inputTaskID != taskID {
+				return nil, errors.New("输入临时文件引用不属于当前任务")
+			}
+			logicalID = inputID
+		}
 		if local, localErr := m.Store.GetActiveArtifactLocation(ctx, logicalID, nodeID); localErr == nil {
 			result = append(result, nodeapi.InputArtifact{ArtifactID: local.NodeArtifactID, Role: item.Role})
 			continue
 		} else if !errors.Is(localErr, sqlite.ErrArtifactNotFound) {
 			return nil, localErr
 		}
-		file, mediaType, suffix, size, digest, err := m.fetch(ctx, rawURL, item.Type)
+		file, mediaType, suffix, size, digest, cleanup, err := m.fetch(ctx, taskID, rawURL, item.Type)
 		if err != nil {
 			phaseErr := inputMaterializationError{phase: "read", err: err}
 			logger.ErrorContext(ctx, "输入素材读取失败", "task_id", taskID, "node_id", nodeID, "input_index", index, "role", item.Role, "stage", "input_materialization", "error_code", "input_materialization_failed", "error_reason", materializationErrorMessage(phaseErr))
 			return nil, phaseErr
 		}
-		if strings.HasPrefix(rawURL, "data:") {
+		if strings.HasPrefix(rawURL, "proxy-input://") {
+			logger.InfoContext(ctx, "输入素材临时文件读取完成", "task_id", taskID, "node_id", nodeID, "input_index", index, "role", item.Role, "media_type", mediaType, "size_bytes", size, "stage", "input_materialization")
+		} else if strings.HasPrefix(rawURL, "data:") {
 			logger.InfoContext(ctx, "输入素材 Base64 解码完成", "task_id", taskID, "node_id", nodeID, "input_index", index, "role", item.Role, "media_type", mediaType, "size_bytes", size, "stage", "input_materialization")
 		} else {
 			logger.InfoContext(ctx, "输入素材下载完成", "task_id", taskID, "node_id", nodeID, "input_index", index, "role", item.Role, "media_type", mediaType, "size_bytes", size, "stage", "input_materialization")
@@ -127,7 +138,10 @@ func (m *InputMaterializer) Materialize(ctx context.Context, taskID, nodeID, req
 		})
 		fileName := file.Name()
 		closeErr := file.Close()
-		removeErr := os.Remove(fileName)
+		var removeErr error
+		if cleanup {
+			removeErr = os.Remove(fileName)
+		}
 		if importErr != nil {
 			phaseErr := inputMaterializationError{phase: "import", err: importErr}
 			logger.ErrorContext(ctx, "输入素材节点导入失败", "task_id", taskID, "node_id", nodeID, "input_index", index, "role", item.Role, "stage", "input_materialization", "error_code", "input_materialization_failed", "error_reason", materializationErrorMessage(phaseErr))
@@ -162,16 +176,22 @@ func (m *InputMaterializer) logger() *slog.Logger {
 	return slog.Default()
 }
 
-func (m *InputMaterializer) fetch(ctx context.Context, rawURL, contentType string) (*os.File, string, string, int64, string, error) {
+func (m *InputMaterializer) fetch(ctx context.Context, taskID, rawURL, contentType string) (*os.File, string, string, int64, string, bool, error) {
+	if refTaskID, inputID, ok := parseProxyInputRef(rawURL); ok {
+		if refTaskID != taskID {
+			return nil, "", "", 0, "", false, errors.New("输入临时文件引用不属于当前任务")
+		}
+		return m.fetchProxyInput(ctx, taskID, inputID, contentType)
+	}
 	temporary, err := os.CreateTemp("", "minimax-h3-input-*")
 	if err != nil {
-		return nil, "", "", 0, "", err
+		return nil, "", "", 0, "", false, err
 	}
-	fail := func(err error) (*os.File, string, string, int64, string, error) {
+	fail := func(err error) (*os.File, string, string, int64, string, bool, error) {
 		name := temporary.Name()
 		_ = temporary.Close()
 		_ = os.Remove(name)
-		return nil, "", "", 0, "", err
+		return nil, "", "", 0, "", false, err
 	}
 	mediaType, suffix := "", ".bin"
 	var source io.ReadCloser
@@ -229,7 +249,69 @@ func (m *InputMaterializer) fetch(ctx context.Context, rawURL, contentType strin
 	if _, err := temporary.Seek(0, io.SeekStart); err != nil {
 		return fail(err)
 	}
-	return temporary, mediaType, suffix, size, hex.EncodeToString(hash.Sum(nil)), nil
+	return temporary, mediaType, suffix, size, hex.EncodeToString(hash.Sum(nil)), true, nil
+}
+
+func (m *InputMaterializer) fetchProxyInput(ctx context.Context, taskID, inputID, contentType string) (*os.File, string, string, int64, string, bool, error) {
+	if m.InputSpoolRoot == "" {
+		return nil, "", "", 0, "", false, errors.New("输入临时目录未配置")
+	}
+	fileMeta, err := m.Store.GetInputSpoolFile(ctx, taskID, inputID)
+	if err != nil {
+		return nil, "", "", 0, "", false, err
+	}
+	if !strings.HasPrefix(fileMeta.MediaType, strings.TrimSuffix(contentType, "_url")+"/") {
+		return nil, "", "", 0, "", false, errors.New("输入临时文件媒体类型不匹配")
+	}
+	path := filepath.Join(m.InputSpoolRoot, filepath.FromSlash(fileMeta.RelativePath))
+	if !safeUnder(m.InputSpoolRoot, path) {
+		return nil, "", "", 0, "", false, errors.New("输入临时文件路径无效")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, "", "", 0, "", false, fmt.Errorf("input_spool_missing: %w", err)
+	}
+	hash := sha256.New()
+	size, err := io.Copy(hash, file)
+	if err != nil {
+		_ = file.Close()
+		return nil, "", "", 0, "", false, err
+	}
+	if size != fileMeta.SizeBytes || !strings.EqualFold(hex.EncodeToString(hash.Sum(nil)), fileMeta.SHA256) {
+		_ = file.Close()
+		return nil, "", "", 0, "", false, errors.New("input_spool_integrity_failed")
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		_ = file.Close()
+		return nil, "", "", 0, "", false, err
+	}
+	return file, fileMeta.MediaType, fileMeta.Extension, fileMeta.SizeBytes, fileMeta.SHA256, false, nil
+}
+
+func parseProxyInputRef(rawURL string) (taskID, inputID string, ok bool) {
+	const prefix = "proxy-input://"
+	if !strings.HasPrefix(rawURL, prefix) {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(rawURL, prefix)
+	taskID, inputID, ok = strings.Cut(rest, "/")
+	if !ok || taskID == "" || inputID == "" || strings.Contains(inputID, "/") {
+		return "", "", false
+	}
+	return taskID, inputID, true
+}
+
+func safeUnder(root, path string) bool {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	pathAbs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(rootAbs, pathAbs)
+	return err == nil && rel != "." && !strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel)
 }
 
 func stableInputID(taskID string, index int, source string) string {

@@ -6,15 +6,16 @@ import (
 )
 
 var (
-	ErrTaskNotFound        = errors.New("任务不存在")
-	ErrTaskNotOperable     = errors.New("任务当前状态不可操作")
-	ErrIdempotencyConflict = errors.New("幂等键对应不同请求")
-	ErrPerKeyLimit         = errors.New("API Key 未结束任务达到上限")
-	ErrGlobalLimit         = errors.New("全局未结束任务达到上限")
-	ErrUpstreamBusy        = errors.New("上游实例正在执行任务")
-	ErrQueueEmpty          = errors.New("队列为空")
-	ErrStateConflict       = errors.New("任务状态已变化")
-	ErrResourceUnavailable = errors.New("资源不足")
+	ErrTaskNotFound           = errors.New("任务不存在")
+	ErrTaskNotOperable        = errors.New("任务当前状态不可操作")
+	ErrIdempotencyConflict    = errors.New("幂等键对应不同请求")
+	ErrPerKeyLimit            = errors.New("API Key 未结束任务达到上限")
+	ErrGlobalLimit            = errors.New("全局未结束任务达到上限")
+	ErrUpstreamBusy           = errors.New("上游实例正在执行任务")
+	ErrQueueEmpty             = errors.New("队列为空")
+	ErrStateConflict          = errors.New("任务状态已变化")
+	ErrResourceUnavailable    = errors.New("资源不足")
+	ErrCancelReconcilePending = errors.New("任务仍在中止对账中")
 )
 
 type InternalStatus string
@@ -92,11 +93,30 @@ type NewTask struct {
 	ProfileID, ConfigSnapshotJSON, ConfigHash                        string
 	ProfileVersion                                                   int64
 	Stages                                                           []NewTaskStage
+	InputSpoolFiles                                                  []InputSpoolFile
 }
 
 type NewTaskStage struct {
 	ID, StageType, ConfigSnapshotJSON string
 	StageOrder, MaxAttempts           int
+}
+
+type InputSpoolFile struct {
+	ID           string
+	TaskID       string
+	ContentIndex int
+	ContentType  string
+	Role         string
+	SourceKind   string
+	DeclaredMIME string
+	DetectedMIME string
+	MediaType    string
+	Extension    string
+	RelativePath string
+	SizeBytes    int64
+	SHA256       string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 type Task struct {
@@ -148,4 +168,18 @@ type AdminTaskSummary struct {
 	ResultPublicURL, ResultArtifactID string
 	Duration                          int
 	CreatedAt, StartedAt, FinishedAt  time.Time
+}
+
+type AdminTaskDetail struct {
+	Task                Task
+	InputSpoolFiles     []InputSpoolFile
+	LegacyBase64Present bool
+}
+
+type TaskArtifactLocation struct {
+	ID             string
+	TaskID         string
+	NodeID         string
+	NodeArtifactID string
+	State          string
 }

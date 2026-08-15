@@ -48,7 +48,11 @@ const elements = {
   videoPlayerDialog: document.getElementById("video-player-dialog"),
   videoPlayerTitle: document.getElementById("video-player-title"),
   videoPlayerStatus: document.getElementById("video-player-status"),
-  videoPlayer: document.getElementById("video-player")
+  videoPlayer: document.getElementById("video-player"),
+  taskDetailDialog: document.getElementById("task-detail-dialog"),
+  taskDetailTitle: document.getElementById("task-detail-title"),
+  taskDetailStatus: document.getElementById("task-detail-status"),
+  taskDetailBody: document.getElementById("task-detail-body")
 };
 
 const state = {
@@ -334,6 +338,12 @@ function renderTasks(response) {
     row.setAttribute("role", "row");
     const phaseLabel = phaseLabels[item.phase];
     const actions = makeElement("span", "task-actions");
+    const view = makeElement("button", "task-action", "查看");
+    view.type = "button";
+    view.title = "查看用户提交内容";
+    view.disabled = state.taskActions.has(item.id);
+    view.addEventListener("click", () => openTaskDetail(item));
+    actions.append(view);
     if (item.video_url) {
       const play = makeElement("button", "task-action play-action", "播放");
       play.type = "button";
@@ -376,7 +386,10 @@ function renderTasks(response) {
 
 async function runTaskAction(item, action, button) {
   const label = action === "cancel" ? "中止" : "删除";
-  if (!window.confirm(`确认${label}任务 ${item.id}？`)) return;
+  const message = action === "delete"
+    ? `确认物理删除任务 ${item.id}？该操作会删除数据库记录和本地临时输入文件，不可恢复。`
+    : `确认${label}任务 ${item.id}？`;
+  if (!window.confirm(message)) return;
   state.taskActions.add(item.id);
   button.disabled = true;
   try {
@@ -618,6 +631,83 @@ function showAPIKeySecret(key, title, description) {
   elements.apiKeySecret.textContent = key;
   elements.apiKeyCopyStatus.textContent = "";
   elements.apiKeySecretDialog.showModal();
+}
+
+function closeTaskDetail() {
+  if (elements.taskDetailDialog.open) elements.taskDetailDialog.close();
+}
+
+async function openTaskDetail(item) {
+  if (!item?.id) return;
+  elements.taskDetailTitle.textContent = `任务 ${item.id}`;
+  elements.taskDetailStatus.className = "form-status";
+  elements.taskDetailStatus.textContent = "正在加载请求内容...";
+  elements.taskDetailBody.replaceChildren();
+  elements.taskDetailDialog.showModal();
+  try {
+    const detail = await requestJSON(`/manager/api/tasks/${encodeURIComponent(item.id)}`);
+    renderTaskDetail(detail);
+  } catch (error) {
+    if (error.message === "unauthorized") return;
+    elements.taskDetailStatus.className = "form-status error";
+    elements.taskDetailStatus.textContent = "任务详情加载失败，请稍后重试";
+  }
+}
+
+function detailRow(label, value) {
+  const row = makeElement("div", "task-detail-row");
+  row.append(makeElement("span", "muted", label), makeElement("strong", "", value == null || value === "" ? "--" : String(value)));
+  return row;
+}
+
+function renderTaskDetail(detail) {
+  elements.taskDetailStatus.textContent = detail.legacy_base64_present ? "历史任务含 Base64，后台已隐藏正文。" : "";
+  const summary = makeElement("section", "task-detail-grid");
+  summary.append(
+    detailRow("状态", statusLabels[detail.status] || detail.status),
+    detailRow("方式", detail.scenario),
+    detailRow("规格", detail.resolution),
+    detailRow("比例", detail.ratio),
+    detailRow("时长", `${detail.duration || 0}s`),
+    detailRow("创建时间", localTime(detail.created_at))
+  );
+  const request = detail.request || {};
+  const content = Array.isArray(request.content) ? request.content : [];
+  const textItems = content.filter((item) => item.type === "text");
+  const mediaItems = content.filter((item) => item.type === "image_url" || item.type === "audio_url" || item.type === "video_url");
+  const textSection = makeElement("section", "task-detail-section");
+  textSection.append(makeElement("h3", "", "文案"));
+  if (!textItems.length) {
+    textSection.append(makeElement("p", "muted", "无文案"));
+  } else {
+    textItems.forEach((item) => textSection.append(makeElement("pre", "task-detail-text", item.text || "")));
+  }
+  const mediaSection = makeElement("section", "task-detail-section");
+  mediaSection.append(makeElement("h3", "", "媒体输入"));
+  if (!mediaItems.length) {
+    mediaSection.append(makeElement("p", "muted", "无媒体输入"));
+  } else {
+    mediaItems.forEach((item, index) => {
+      const box = makeElement("div", "task-detail-media");
+      box.append(
+        detailRow("序号", index + 1),
+        detailRow("类型", item.type),
+        detailRow("角色", item.role),
+        detailRow("来源", item.source_kind || "url"),
+        detailRow("MIME", item.media_type),
+        detailRow("文件", item.file_name || item.input_ref || "已隐藏"),
+        detailRow("大小", item.size_bytes ? `${item.size_bytes} B` : "--"),
+        detailRow("SHA256", item.sha256 ? `${String(item.sha256).slice(0, 16)}...` : "--")
+      );
+      mediaSection.append(box);
+    });
+  }
+  const configSection = makeElement("section", "task-detail-section");
+  configSection.append(makeElement("h3", "", "设置"));
+  configSection.append(makeElement("pre", "task-detail-json", JSON.stringify(detail.config || {
+    model: detail.model, resolution: detail.resolution, ratio: detail.ratio, duration: detail.duration
+  }, null, 2)));
+  elements.taskDetailBody.replaceChildren(summary, textSection, mediaSection, configSection);
 }
 
 function viewStoredAPIKey(item) {
@@ -975,6 +1065,8 @@ elements.videoPlayerDialog.addEventListener("close", resetVideoPlayer);
 elements.videoPlayer.addEventListener("loadstart", () => setVideoPlayerStatus("正在加载视频..."));
 elements.videoPlayer.addEventListener("canplay", () => setVideoPlayerStatus(""));
 elements.videoPlayer.addEventListener("error", () => setVideoPlayerStatus("视频加载失败，请关闭后重试", "error"));
+document.getElementById("close-task-detail").addEventListener("click", () => closeTaskDetail());
+elements.taskDetailDialog.addEventListener("cancel", (event) => { event.preventDefault(); closeTaskDetail(); });
 
 async function poll() {
   if (state.polling) return;

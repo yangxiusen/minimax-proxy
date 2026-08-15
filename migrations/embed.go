@@ -66,3 +66,8 @@ var DynamicRequestResolutions string
 //
 //go:embed 014_node_dispatch_barriers.sql
 var NodeDispatchBarriers string
+
+// InputSpoolAdminMaintenance 增加输入临时文件元数据表。
+//
+//go:embed 015_input_spool_admin_maintenance.sql
+var InputSpoolAdminMaintenance string

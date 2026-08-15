@@ -83,6 +83,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		{version: 12, name: "对外 API Key 明文", sql: migrations.ExternalAPIKeyPlaintext},
 		{version: 13, name: "动态逻辑分辨率", sql: migrations.DynamicRequestResolutions},
 		{version: 14, name: "节点取消对账屏障", sql: migrations.NodeDispatchBarriers},
+		{version: 15, name: "输入临时文件与后台维护", sql: migrations.InputSpoolAdminMaintenance},
 	})
 }
 
@@ -210,6 +211,22 @@ func (s *Store) Create(ctx context.Context, input domain.NewTask, keyHash string
 		_, err = conn.ExecContext(ctx, `INSERT INTO task_stages(id,task_id,stage_order,stage_type,required,max_attempts,config_snapshot_json,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?,?)`, stage.ID, input.TaskID, stage.StageOrder, stage.StageType, stage.MaxAttempts, stage.ConfigSnapshotJSON, now*1000, now*1000)
 		if err != nil {
 			return domain.Task{}, fmt.Errorf("插入任务阶段: %w", err)
+		}
+	}
+	for _, file := range input.InputSpoolFiles {
+		if file.TaskID == "" {
+			file.TaskID = input.TaskID
+		}
+		if file.SourceKind == "" {
+			file.SourceKind = "data_uri"
+		}
+		if err := validateInputSpoolFile(file); err != nil {
+			return domain.Task{}, err
+		}
+		_, err = conn.ExecContext(ctx, `INSERT INTO task_input_spool_files(id,task_id,content_index,content_type,role,source_kind,declared_mime,detected_mime,media_type,extension,relative_path,size_bytes,sha256,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			file.ID, file.TaskID, file.ContentIndex, file.ContentType, file.Role, file.SourceKind, nullEmpty(file.DeclaredMIME), nullEmpty(file.DetectedMIME), file.MediaType, file.Extension, file.RelativePath, file.SizeBytes, file.SHA256, now*1000, now*1000)
+		if err != nil {
+			return domain.Task{}, fmt.Errorf("插入输入临时文件元数据: %w", err)
 		}
 	}
 	if keyHash != "" {
@@ -595,10 +612,15 @@ func (s *Store) FinishCancelled(ctx context.Context, taskID, upstreamID string) 
 	return createCallbackDeliveryWithConn(ctx, conn, taskID, "cancelled", now*1000)
 }
 
-func (s *Store) AdminDelete(ctx context.Context, taskID string) (err error) {
-	now := s.nowUnix()
+func (s *Store) AdminDelete(ctx context.Context, taskID string, purgedLocations ...domain.TaskArtifactLocation) (err error) {
+	conn, finish, err := s.immediate(ctx)
+	if err != nil {
+		return err
+	}
+	defer completeTransaction(finish, &err)
 	var status domain.InternalStatus
-	err = s.db.QueryRowContext(ctx, `SELECT status FROM video_tasks WHERE task_id=? AND deleted_at IS NULL AND expires_at>?`, taskID, now).Scan(&status)
+	var version int64
+	err = conn.QueryRowContext(ctx, `SELECT status,version FROM video_tasks WHERE task_id=? AND deleted_at IS NULL`, taskID).Scan(&status, &version)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.ErrTaskNotFound
 	}
@@ -608,11 +630,82 @@ func (s *Store) AdminDelete(ctx context.Context, taskID string) (err error) {
 	if !status.AdminCanDelete() {
 		return domain.ErrTaskNotOperable
 	}
-	_, err = s.RequestTaskDeletion(ctx, taskID, "task_delete", "admin")
-	if errors.Is(err, ErrDeletionNotFound) {
-		return domain.ErrTaskNotFound
+	var barrierCount int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM node_dispatch_barriers WHERE task_id=?`, taskID).Scan(&barrierCount); err != nil {
+		return err
 	}
-	return err
+	if barrierCount != 0 {
+		return domain.ErrCancelReconcilePending
+	}
+	var profileRefs int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM profile_test_runs WHERE artifact_id IN (SELECT id FROM task_artifacts WHERE task_id=?)`, taskID).Scan(&profileRefs); err != nil {
+		return err
+	}
+	if profileRefs != 0 {
+		return domain.ErrStateConflict
+	}
+	if purgedLocations != nil {
+		currentLocations, err := listTaskArtifactLocationsWithConn(ctx, conn, taskID)
+		if err != nil {
+			return err
+		}
+		if !sameTaskArtifactLocations(currentLocations, purgedLocations) {
+			return domain.ErrStateConflict
+		}
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE video_tasks SET active_stage_id=NULL,result_artifact_id=NULL WHERE task_id=? AND version=?`, taskID, version); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE task_stages SET input_artifact_id=NULL,output_artifact_id=NULL WHERE task_id=?`, taskID); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `DELETE FROM idempotency_keys WHERE task_id=?`, taskID); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `DELETE FROM callback_deliveries WHERE task_id=?`, taskID); err != nil {
+		return err
+	}
+	rows, err := conn.QueryContext(ctx, `SELECT DISTINCT i.job_id FROM artifact_deletion_items i WHERE i.artifact_id IN (SELECT id FROM task_artifacts WHERE task_id=?) OR i.location_id IN (SELECT l.id FROM artifact_locations l JOIN task_artifacts a ON a.id=l.artifact_id WHERE a.task_id=?)`, taskID, taskID)
+	if err != nil {
+		return err
+	}
+	var deletionJobIDs []string
+	for rows.Next() {
+		var jobID string
+		if err := rows.Scan(&jobID); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		deletionJobIDs = append(deletionJobIDs, jobID)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `DELETE FROM artifact_deletion_items WHERE artifact_id IN (SELECT id FROM task_artifacts WHERE task_id=?) OR location_id IN (SELECT l.id FROM artifact_locations l JOIN task_artifacts a ON a.id=l.artifact_id WHERE a.task_id=?)`, taskID, taskID); err != nil {
+		return err
+	}
+	for _, jobID := range deletionJobIDs {
+		if _, err := conn.ExecContext(ctx, `DELETE FROM artifact_deletion_jobs WHERE id=? AND NOT EXISTS (SELECT 1 FROM artifact_deletion_items WHERE job_id=?)`, jobID, jobID); err != nil {
+			return err
+		}
+	}
+	if _, err := conn.ExecContext(ctx, `DELETE FROM stage_attempts WHERE stage_id IN (SELECT id FROM task_stages WHERE task_id=?)`, taskID); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `DELETE FROM artifact_locations WHERE artifact_id IN (SELECT id FROM task_artifacts WHERE task_id=?)`, taskID); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `DELETE FROM task_artifacts WHERE task_id=?`, taskID); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `DELETE FROM task_stages WHERE task_id=?`, taskID); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `DELETE FROM task_input_spool_files WHERE task_id=?`, taskID); err != nil {
+		return err
+	}
+	result, err := conn.ExecContext(ctx, `DELETE FROM video_tasks WHERE task_id=? AND status=? AND version=?`, taskID, status, version)
+	return oneRow(result, err)
 }
 
 func (s *Store) MarkRunning(ctx context.Context, taskID, upstreamID string) error {

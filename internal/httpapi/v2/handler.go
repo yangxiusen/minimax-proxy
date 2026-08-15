@@ -21,6 +21,7 @@ import (
 	"minimax-h3-tc/internal/callback"
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/inputspool"
 )
 
 type TaskStore interface {
@@ -42,6 +43,10 @@ type BearerAuthenticator interface {
 	Authenticate(token string) (ownerID string, ok bool)
 }
 
+type idempotentTaskFinder interface {
+	FindIdempotentTask(context.Context, string, string, string) (domain.Task, error)
+}
+
 type Dependencies struct {
 	Store           TaskStore
 	APIKeys         []config.APIKeyConfig
@@ -54,6 +59,7 @@ type Dependencies struct {
 	CallbackCipher  callback.URLCipher
 	ActiveProfiles  ActiveProfileStore
 	ArtifactURLs    ArtifactURLSigner
+	InputSpooler    *inputspool.Spooler
 }
 
 type handler struct {
@@ -68,6 +74,7 @@ type handler struct {
 	callbackCipher  callback.URLCipher
 	activeProfiles  ActiveProfileStore
 	artifactURLs    ArtifactURLSigner
+	inputSpooler    *inputspool.Spooler
 }
 
 type authKey struct {
@@ -79,7 +86,7 @@ type contextKey string
 const ownerKey contextKey = "api_key_id"
 
 func NewHandler(dependencies Dependencies) http.Handler {
-	h := &handler{store: dependencies.Store, authenticator: dependencies.Authenticator, profiles: dependencies.Profiles, logger: dependencies.Logger, wake: dependencies.Wake, available: dependencies.Available, callbackService: dependencies.CallbackService, callbackCipher: dependencies.CallbackCipher, activeProfiles: dependencies.ActiveProfiles, artifactURLs: dependencies.ArtifactURLs}
+	h := &handler{store: dependencies.Store, authenticator: dependencies.Authenticator, profiles: dependencies.Profiles, logger: dependencies.Logger, wake: dependencies.Wake, available: dependencies.Available, callbackService: dependencies.CallbackService, callbackCipher: dependencies.CallbackCipher, activeProfiles: dependencies.ActiveProfiles, artifactURLs: dependencies.ArtifactURLs, inputSpooler: dependencies.InputSpooler}
 	if h.logger == nil {
 		h.logger = slog.Default()
 	}
@@ -221,12 +228,39 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 		digest := sha256.Sum256([]byte(idempotency))
 		idempotencyHash = hex.EncodeToString(digest[:])
 	}
+	requestHashHex := hex.EncodeToString(requestHash[:])
+	if idempotencyHash != "" {
+		if finder, ok := h.store.(idempotentTaskFinder); ok {
+			existing, findErr := finder.FindIdempotentTask(r.Context(), owner(r.Context()), idempotencyHash, requestHashHex)
+			switch {
+			case findErr == nil:
+				h.writeJSON(w, http.StatusOK, map[string]string{"task_id": existing.TaskID})
+				return
+			case errors.Is(findErr, domain.ErrIdempotencyConflict):
+				h.storeError(w, r, findErr)
+				return
+			case errors.Is(findErr, domain.ErrTaskNotFound):
+			default:
+				h.internalError(w, r, findErr)
+				return
+			}
+		}
+	}
 	taskID, err := newNumericID()
 	if err != nil {
 		h.internalError(w, r, err)
 		return
 	}
-	newTask := domain.NewTask{TaskID: taskID, APIKeyID: owner(r.Context()), Model: validated.Model, Scenario: validated.Scenario, RequestJSON: string(persistedJSON), RequestHash: hex.EncodeToString(requestHash[:]), Resolution: validated.Resolution, Duration: validated.Duration, Ratio: validated.Ratio, InputImageCount: validated.InputImageCount}
+	var prepared inputspool.PreparedRequest
+	if h.inputSpooler != nil {
+		prepared, err = h.inputSpooler.PrepareRequest(r.Context(), taskID, persistedJSON)
+		if err != nil {
+			h.writeError(w, r, http.StatusBadRequest, "bad_request_error", err.Error()+" (2013)")
+			return
+		}
+		persistedJSON = prepared.JSON
+	}
+	newTask := domain.NewTask{TaskID: taskID, APIKeyID: owner(r.Context()), Model: validated.Model, Scenario: validated.Scenario, RequestJSON: string(persistedJSON), RequestHash: requestHashHex, Resolution: validated.Resolution, Duration: validated.Duration, Ratio: validated.Ratio, InputImageCount: validated.InputImageCount, InputSpoolFiles: prepared.Files}
 	if h.activeProfiles != nil {
 		newTask.ConfigSnapshotJSON = activeProfile.ConfigJSON
 		newTask.ConfigHash = activeProfile.ConfigHash
@@ -250,8 +284,12 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 	}
 	task, err := h.store.Create(r.Context(), newTask, idempotencyHash, h.available)
 	if err != nil {
+		_ = prepared.Cleanup()
 		h.storeError(w, r, err)
 		return
+	}
+	if task.TaskID != newTask.TaskID {
+		_ = prepared.Cleanup()
 	}
 	if h.wake != nil {
 		h.wake()

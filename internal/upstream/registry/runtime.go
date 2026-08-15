@@ -54,6 +54,7 @@ type NodeRuntimeFactory struct {
 	NodeSecrets          NodeSecretOpener
 	ArtifactMigrator     orchestrator.InputArtifactMigrator
 	NodeAPIClientFactory func(*url.URL, string, *http.Client, int64) NodeAPIClient
+	InputSpoolRoot       string
 }
 
 func (f NodeRuntimeFactory) Start(parent context.Context, node domain.ModelNode) (Runtime, error) {
@@ -211,7 +212,7 @@ func (f NodeRuntimeFactory) startNodeAPI(parent context.Context, node domain.Mod
 	maxHealthAge := upstream.RequestTimeout + monitorInterval(f.MonitorInterval)
 	processor := &orchestrator.Processor{
 		Store: f.Store, Client: client, NodeID: node.ID, Migrator: f.ArtifactMigrator,
-		Inputs:        &orchestrator.InputMaterializer{Store: f.Store, Logger: f.Logger},
+		Inputs:        &orchestrator.InputMaterializer{Store: f.Store, Logger: f.Logger, InputSpoolRoot: f.InputSpoolRoot},
 		LeaseDuration: max(f.ExecutionTimeout, 10*time.Minute), PollInterval: input.PollInterval, Logger: f.Logger, Now: f.Now,
 	}
 	dispatcher := scheduler.New([]scheduler.Slot{{

@@ -36,6 +36,7 @@ type Store interface {
 	GetActiveArtifactLocation(context.Context, string, string) (sqlite.ArtifactLocation, error)
 	GetPrimaryArtifactLocation(context.Context, string) (sqlite.ArtifactLocation, error)
 	GetTaskForExecution(context.Context, string) (domain.Task, error)
+	GetInputSpoolFile(context.Context, string, string) (domain.InputSpoolFile, error)
 	RegisterInputArtifact(context.Context, string, string, string, string, string, int64, string, string) error
 }
 

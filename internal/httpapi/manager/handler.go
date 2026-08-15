@@ -15,6 +15,9 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -22,7 +25,9 @@ import (
 	artifactservice "minimax-h3-tc/internal/artifact"
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/inputspool"
 	monitorcache "minimax-h3-tc/internal/monitor"
+	"minimax-h3-tc/internal/upstream/nodeapi"
 )
 
 const (
@@ -36,8 +41,11 @@ const (
 
 type TaskStore interface {
 	ListAdminTasks(context.Context, domain.AdminTaskFilter) ([]domain.AdminTaskSummary, int, error)
+	GetAdminTaskDetail(context.Context, string) (domain.AdminTaskDetail, error)
+	EnsureTaskPurgeReady(context.Context, string) error
+	ListTaskArtifactLocations(context.Context, string) ([]domain.TaskArtifactLocation, error)
 	RequestAdminCancel(context.Context, string) error
-	AdminDelete(context.Context, string) error
+	AdminDelete(context.Context, string, ...domain.TaskArtifactLocation) error
 }
 
 type ArtifactURLSigner interface {
@@ -73,6 +81,7 @@ type Dependencies struct {
 	WakeCleanup    func()
 	APIKeyService  APIKeyService
 	ArtifactURLs   ArtifactURLSigner
+	InputSpooler   *inputspool.Spooler
 }
 
 type handler struct {
@@ -92,6 +101,7 @@ type handler struct {
 	probeNode       func(context.Context, NodeProbeInput) NodeProbeResult
 	nodeSecrets     NodeSecretCodec
 	artifactURLs    ArtifactURLSigner
+	inputSpooler    *inputspool.Spooler
 
 	sessionMu          sync.Mutex
 	sessions           map[[sha256.Size]byte]time.Time
@@ -144,6 +154,7 @@ func NewHandler(dependencies Dependencies) http.Handler {
 		probeNode:       dependencies.ProbeNode,
 		nodeSecrets:     dependencies.NodeSecrets,
 		artifactURLs:    dependencies.ArtifactURLs,
+		inputSpooler:    dependencies.InputSpooler,
 		sessions:        make(map[[sha256.Size]byte]time.Time),
 		failures:        make(map[string]loginFailure),
 	}
@@ -153,6 +164,7 @@ func NewHandler(dependencies Dependencies) http.Handler {
 	mux.Handle("DELETE /manager/api/session", h.authenticate(http.HandlerFunc(h.deleteSession)))
 	mux.Handle("GET /manager/api/snapshot", h.authenticate(http.HandlerFunc(h.snapshot)))
 	mux.Handle("GET /manager/api/tasks", h.authenticate(http.HandlerFunc(h.tasks)))
+	mux.Handle("GET /manager/api/tasks/{task_id}", h.authenticate(http.HandlerFunc(h.taskDetail)))
 	mux.Handle("POST /manager/api/tasks/{task_id}/cancel", h.authenticate(http.HandlerFunc(h.cancelTask)))
 	mux.Handle("DELETE /manager/api/tasks/{task_id}", h.authenticate(http.HandlerFunc(h.deleteTask)))
 	mux.Handle("GET /manager/api/nodes", h.authenticate(http.HandlerFunc(h.listNodes)))
@@ -557,6 +569,53 @@ func (h *handler) cancelTask(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, http.StatusAccepted, map[string]string{"action": "cancel_requested", "task_id": taskID})
 }
 
+type taskDetailDTO struct {
+	ID                  string          `json:"id"`
+	APIKeyID            string          `json:"api_key_id"`
+	Status              domain.V2Status `json:"status"`
+	Phase               string          `json:"phase"`
+	Scenario            string          `json:"scenario"`
+	Model               string          `json:"model"`
+	Resolution          string          `json:"resolution"`
+	Ratio               string          `json:"ratio"`
+	Duration            int             `json:"duration"`
+	CreatedAt           int64           `json:"created_at"`
+	UpdatedAt           int64           `json:"updated_at"`
+	Request             any             `json:"request"`
+	Config              any             `json:"config,omitempty"`
+	LegacyBase64Present bool            `json:"legacy_base64_present"`
+}
+
+func (h *handler) taskDetail(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("task_id")
+	if !validTaskID(taskID) {
+		h.writeError(w, http.StatusBadRequest, "bad_request_error", "task_id 无效")
+		return
+	}
+	if h.store == nil {
+		h.internalError(w, r, errors.New("monitor task store is nil"))
+		return
+	}
+	detail, err := h.store.GetAdminTaskDetail(r.Context(), taskID)
+	if err != nil {
+		h.writeTaskActionError(w, r, err)
+		return
+	}
+	requestBody, legacy := sanitizedTaskRequest(detail.Task.RequestJSON, detail.InputSpoolFiles)
+	var config any
+	if detail.Task.ConfigSnapshotJSON != "" {
+		_ = json.Unmarshal([]byte(detail.Task.ConfigSnapshotJSON), &config)
+	}
+	response := taskDetailDTO{
+		ID: detail.Task.TaskID, APIKeyID: detail.Task.APIKeyID, Status: detail.Task.Status.V2(), Phase: taskPhaseFromTask(detail.Task),
+		Scenario: detail.Task.Scenario, Model: detail.Task.Model, Resolution: detail.Task.Resolution,
+		Ratio: detail.Task.RatioRequested, Duration: detail.Task.Duration,
+		CreatedAt: unixTime(detail.Task.CreatedAt), UpdatedAt: unixTime(detail.Task.UpdatedAt),
+		Request: requestBody, Config: config, LegacyBase64Present: detail.LegacyBase64Present || legacy,
+	}
+	h.writeJSON(w, http.StatusOK, response)
+}
+
 func (h *handler) deleteTask(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("task_id")
 	if !validTaskID(taskID) {
@@ -567,18 +626,85 @@ func (h *handler) deleteTask(w http.ResponseWriter, r *http.Request) {
 		h.internalError(w, r, errors.New("monitor task store is nil"))
 		return
 	}
-	if err := h.store.AdminDelete(r.Context(), taskID); err != nil {
+	if err := h.store.EnsureTaskPurgeReady(r.Context(), taskID); err != nil {
 		h.writeTaskActionError(w, r, err)
 		return
 	}
+	purgedLocations, err := h.deleteRemoteTaskArtifacts(r.Context(), taskID)
+	if err != nil {
+		h.writeError(w, http.StatusServiceUnavailable, "task_delete_unavailable", "远端文件删除失败，请稍后重试")
+		return
+	}
+	if err := h.store.AdminDelete(r.Context(), taskID, purgedLocations...); err != nil {
+		h.writeTaskActionError(w, r, err)
+		return
+	}
+	if h.inputSpooler != nil && h.inputSpooler.Root() != "" {
+		taskDir := filepath.Join(h.inputSpooler.Root(), taskID)
+		if err := os.RemoveAll(taskDir); err != nil {
+			h.internalError(w, r, err)
+			return
+		}
+	}
 	h.logger.InfoContext(r.Context(), "管理员已删除任务", "task_id", taskID, "stage", "admin_delete")
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *handler) deleteRemoteTaskArtifacts(ctx context.Context, taskID string) ([]domain.TaskArtifactLocation, error) {
+	locations, err := h.store.ListTaskArtifactLocations(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	if len(locations) == 0 {
+		return locations, nil
+	}
+	if h.nodes == nil || h.nodeSecrets == nil {
+		return nil, errors.New("节点删除依赖未配置")
+	}
+	for _, location := range locations {
+		node, err := h.nodes.GetModelNode(ctx, location.NodeID)
+		if err != nil {
+			return nil, err
+		}
+		if !node.UsesNodeAPI() {
+			return nil, errors.New("节点不支持远端产物删除")
+		}
+		serviceURL, err := url.Parse(node.ServiceURL)
+		if err != nil {
+			return nil, err
+		}
+		key, err := h.nodeSecrets.Open(node.APIKeyNonce, node.APIKeyCiphertext)
+		if err != nil {
+			return nil, err
+		}
+		client := nodeapi.NewClient(serviceURL, key, &http.Client{Timeout: node.RequestTimeout}, 1<<20)
+		result, err := client.DeleteArtifacts(ctx, "purge-"+taskID, nodeapi.DeleteArtifactsRequest{
+			OperationID: "purge-" + taskID + "-" + location.ID,
+			ArtifactIDs: []string{location.NodeArtifactID},
+		})
+		if err != nil {
+			return nil, err
+		}
+		if len(result.Items) == 0 {
+			return nil, errors.New("节点删除结果为空")
+		}
+		for _, item := range result.Items {
+			if item.ArtifactID == location.NodeArtifactID && (item.Status == "deleted" || item.Status == "already_absent") {
+				goto nextLocation
+			}
+		}
+		return nil, errors.New("节点删除未完成")
+	nextLocation:
+	}
+	return locations, nil
 }
 
 func (h *handler) writeTaskActionError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, domain.ErrTaskNotFound):
 		h.writeError(w, http.StatusNotFound, "task_not_found", "任务不存在")
+	case errors.Is(err, domain.ErrCancelReconcilePending):
+		h.writeError(w, http.StatusConflict, "cancel_reconcile_pending", "任务仍在中止对账中，请稍后重试")
 	case errors.Is(err, domain.ErrTaskNotOperable), errors.Is(err, domain.ErrStateConflict):
 		h.writeError(w, http.StatusConflict, "task_not_operable", "任务当前状态不可操作")
 	default:

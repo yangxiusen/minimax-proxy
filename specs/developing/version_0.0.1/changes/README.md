@@ -27,6 +27,7 @@
 | 007-request-profile-simplification | 模型请求配置简化与参数收敛 | 缺陷修复/配置模型与页面优化 | Pending | 待人工填写 | CHANGE_SPEC.md、PRD_DELTA.md、PARAMETER_AUDIT.md、DATABASE_DELTA.md、PROTOTYPE_DELTA.md、TECH_SOLUTION.md、API_DELTA.md、task.md、TEST_ACCEPTANCE.md | `specs/developing/version_0.0.1/changes/007-request-profile-simplification/` | `/s-design` 完成；单 resolution 单配置、保存即生效、支持删除，并修复水印与无效参数问题，待 `/s-develop` 实施 |
 | 008-direct-node-artifact-delivery | 节点直出视频签名链接 | 架构优化/接口与配置调整 | Pending | 待人工填写 | CHANGE_SPEC.md、PRD_DELTA.md、TECH_SOLUTION.md、API_DELTA.md、task.md、TEST_ACCEPTANCE.md | `specs/developing/version_0.0.1/changes/008-direct-node-artifact-delivery/` | 48 小时可重复访问的 Node 签名 URL，复用外部可达 `service_url`，待 `/s-develop` 实施 |
 | 009-running-task-cancellation-consistency | 运行中任务中止一致性与 Node 调度隔离 | 缺陷修复/可靠性 | In Progress | 待人工填写 | CHANGE_SPEC.md、PRD_DELTA.md、TECH_SOLUTION.md、DATABASE_DELTA.md、API_DELTA.md、task.md、TEST_ACCEPTANCE.md | `specs/developing/version_0.0.1/changes/009-running-task-cancellation-consistency/` | 本地实现和自动化验证完成；真实 Node 中断、双 Node 故障演练和重启组合待人工确认 |
+| 010-input-spool-admin-maintenance | 输入临时文件、任务详情查看与自动迁移 | 架构优化/管理后台增强/数据库迁移 | Pending | 待人工填写 | CHANGE_SPEC.md、TECH_SOLUTION.md、DATABASE_DELTA.md、API_DELTA.md、PROTOTYPE_DELTA.md、task.md、TEST_ACCEPTANCE.md | `specs/developing/version_0.0.1/changes/010-input-spool-admin-maintenance/` | 新任务 Base64 不入库，Manager 可查看请求详情，后台删除终态任务改为物理删除，v15 自动迁移待 `/s-develop` 实施 |
 
 ## 维护规则
 

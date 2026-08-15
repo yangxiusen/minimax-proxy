@@ -535,6 +535,9 @@ func (s *stageStoreFake) GetTaskForExecution(context.Context, string) (domain.Ta
 	}
 	return domain.Task{TaskID: s.stage.TaskID, Status: domain.StatusRunning}, nil
 }
+func (s *stageStoreFake) GetInputSpoolFile(context.Context, string, string) (domain.InputSpoolFile, error) {
+	return domain.InputSpoolFile{}, domain.ErrTaskNotFound
+}
 func (s *stageStoreFake) RegisterInputArtifact(context.Context, string, string, string, string, string, int64, string, string) error {
 	return nil
 }

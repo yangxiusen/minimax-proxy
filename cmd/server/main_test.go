@@ -244,5 +244,14 @@ func (*appStore) CancelOrDelete(context.Context, string, string) (domain.Action,
 func (*appStore) ListAdminTasks(context.Context, domain.AdminTaskFilter) ([]domain.AdminTaskSummary, int, error) {
 	return nil, 0, nil
 }
-func (*appStore) RequestAdminCancel(context.Context, string) error { return domain.ErrTaskNotFound }
-func (*appStore) AdminDelete(context.Context, string) error        { return domain.ErrTaskNotFound }
+func (*appStore) GetAdminTaskDetail(context.Context, string) (domain.AdminTaskDetail, error) {
+	return domain.AdminTaskDetail{}, domain.ErrTaskNotFound
+}
+func (*appStore) ListTaskArtifactLocations(context.Context, string) ([]domain.TaskArtifactLocation, error) {
+	return nil, nil
+}
+func (*appStore) EnsureTaskPurgeReady(context.Context, string) error { return nil }
+func (*appStore) RequestAdminCancel(context.Context, string) error   { return domain.ErrTaskNotFound }
+func (*appStore) AdminDelete(context.Context, string, ...domain.TaskArtifactLocation) error {
+	return domain.ErrTaskNotFound
+}

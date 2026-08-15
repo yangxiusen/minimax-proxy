@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +21,7 @@ import (
 
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/inputspool"
 	monitorcache "minimax-h3-tc/internal/monitor"
 )
 
@@ -32,6 +35,9 @@ type taskStoreStub struct {
 	deletedTask   string
 	cancelError   error
 	deleteError   error
+	detail        domain.AdminTaskDetail
+	detailError   error
+	locations     []domain.TaskArtifactLocation
 }
 
 type managerSignerSpy struct {
@@ -51,11 +57,26 @@ func (s *taskStoreStub) RequestAdminCancel(_ context.Context, taskID string) err
 	return s.cancelError
 }
 
-func (s *taskStoreStub) AdminDelete(_ context.Context, taskID string) error {
+func (s *taskStoreStub) AdminDelete(_ context.Context, taskID string, _ ...domain.TaskArtifactLocation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.deletedTask = taskID
 	return s.deleteError
+}
+
+func (s *taskStoreStub) GetAdminTaskDetail(_ context.Context, taskID string) (domain.AdminTaskDetail, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.detail.Task.TaskID != taskID {
+		return domain.AdminTaskDetail{}, domain.ErrTaskNotFound
+	}
+	return s.detail, s.detailError
+}
+func (s *taskStoreStub) ListTaskArtifactLocations(context.Context, string) ([]domain.TaskArtifactLocation, error) {
+	return append([]domain.TaskArtifactLocation(nil), s.locations...), nil
+}
+func (s *taskStoreStub) EnsureTaskPurgeReady(context.Context, string) error {
+	return nil
 }
 
 func TestWebRoutesRedirectAuthenticateAndServeEmbeddedAssets(t *testing.T) {
@@ -163,6 +184,126 @@ func TestManagerPageConfirmsActionsAndPlaysVideoInDialog(t *testing.T) {
 	}
 	if strings.Contains(source, "window.open(item.video_url") {
 		t.Error("manager.js still opens task video in a new window")
+	}
+}
+
+func TestManagerPageIncludesTaskDetailDialog(t *testing.T) {
+	page, err := webAssets.ReadFile("web/manager.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := webAssets.ReadFile("web/manager.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	styles, err := webAssets.ReadFile("web/styles.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{`id="task-detail-dialog"`, `id="task-detail-title"`, `id="task-detail-body"`, `id="task-detail-status"`, `id="close-task-detail"`} {
+		if !strings.Contains(string(page), expected) {
+			t.Errorf("manager.html missing task detail dialog %q", expected)
+		}
+	}
+	for _, expected := range []string{`openTaskDetail(item)`, `/manager/api/tasks/${encodeURIComponent(item.id)}`, `renderTaskDetail(detail)`, `closeTaskDetail()`} {
+		if !strings.Contains(string(script), expected) {
+			t.Errorf("manager.js missing task detail behavior %q", expected)
+		}
+	}
+	for _, expected := range []string{".task-detail-dialog", ".task-detail-grid", ".task-detail-media"} {
+		if !strings.Contains(string(styles), expected) {
+			t.Errorf("styles.css missing task detail style %q", expected)
+		}
+	}
+}
+
+func TestTaskDetailRequiresAuthenticationAndReturnsSanitizedRequest(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0)
+	store := &taskStoreStub{detail: domain.AdminTaskDetail{
+		Task: domain.Task{
+			TaskID: "task-detail", APIKeyID: "key-a", Status: domain.StatusQueuedOpen, Model: "MiniMax-H3",
+			Scenario: "i2va", Resolution: "768P", RatioRequested: "adaptive", Duration: 5,
+			RequestJSON: `{"content":[{"type":"text","text":"hello"},{"type":"image_url","role":"first_frame","image_url":{"url":"proxy-input://task-detail/input_abc"}}],"resolution":"768P","duration":5}`,
+			CreatedAt:   now, UpdatedAt: now,
+		},
+		InputSpoolFiles: []domain.InputSpoolFile{{
+			ID: "input_abc", TaskID: "task-detail", ContentIndex: 1, ContentType: "image_url", Role: "first_frame",
+			SourceKind: "data_uri", MediaType: "image/png", Extension: ".png", RelativePath: "task-detail/input_abc.png",
+			SizeBytes: 12, SHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		}},
+	}}
+	h := testHandler(Dependencies{Admin: config.AdminConfig{Username: "admin", Password: "secret", SessionTTL: time.Hour}, Store: store, Now: func() time.Time { return now }})
+	if response := serve(h, http.MethodGet, "/manager/api/tasks/task-detail", "", "", "", "192.0.2.10:1", false); response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d", response.Code)
+	}
+	cookie := login(t, h, "admin", "secret", "192.0.2.10:1")
+	response := serve(h, http.MethodGet, "/manager/api/tasks/task-detail", "", "", cookie, "192.0.2.10:1", false)
+	if response.Code != http.StatusOK {
+		t.Fatalf("detail status=%d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	for _, expected := range []string{`"id":"task-detail"`, `"text":"hello"`, `"input_ref":"proxy-input://task-detail/input_abc"`, `"file_name":"input_abc.png"`, `"legacy_base64_present":false`} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("detail body missing %q: %s", expected, body)
+		}
+	}
+	if strings.Contains(body, "relative_path") || strings.Contains(body, ";base64,") {
+		t.Fatalf("detail leaked path or base64: %s", body)
+	}
+}
+
+func TestDeleteTaskRemovesLocalInputSpoolDirectoryAfterStoreDelete(t *testing.T) {
+	root := t.TempDir()
+	taskDir := filepath.Join(root, "task-delete")
+	if err := os.MkdirAll(taskDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(taskDir, "input.png"), []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := &taskStoreStub{}
+	h := testHandler(Dependencies{
+		Admin: config.AdminConfig{Username: "admin", Password: "secret", SessionTTL: time.Hour},
+		Store: store, InputSpooler: inputspool.New(root),
+	})
+	cookie := login(t, h, "admin", "secret", "192.0.2.10:1")
+	response := serve(h, http.MethodDelete, "/manager/api/tasks/task-delete", "", "", cookie, "192.0.2.10:1", false)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("delete status=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, err := os.Stat(taskDir); !os.IsNotExist(err) {
+		t.Fatalf("task dir still exists or stat err=%v", err)
+	}
+	if store.deletedTask != "task-delete" {
+		t.Fatalf("deletedTask=%q", store.deletedTask)
+	}
+}
+
+func TestDeleteTaskKeepsDBWhenRemoteArtifactNodeCannotDelete(t *testing.T) {
+	store := &taskStoreStub{locations: []domain.TaskArtifactLocation{{
+		ID:             "loc-1",
+		TaskID:         "task-delete",
+		NodeID:         "legacy-node",
+		NodeArtifactID: "artifact-1",
+		State:          "ready",
+	}}}
+	nodes := &nodeStoreStub{items: []domain.ModelNode{{ModelNodeInput: domain.ModelNodeInput{
+		ID:              "legacy-node",
+		ProtocolVersion: "legacy-gradio-v1",
+	}}}}
+	h := testHandler(Dependencies{
+		Admin:       config.AdminConfig{Username: "admin", Password: "secret", SessionTTL: time.Hour},
+		Store:       store,
+		Nodes:       nodes,
+		NodeSecrets: testNodeSecrets{},
+	})
+	cookie := login(t, h, "admin", "secret", "192.0.2.10:1")
+	response := serve(h, http.MethodDelete, "/manager/api/tasks/task-delete", "", "", cookie, "192.0.2.10:1", false)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("delete status=%d body=%s", response.Code, response.Body.String())
+	}
+	if store.deletedTask != "" {
+		t.Fatalf("DB delete must not run when remote artifact cannot be deleted, got %q", store.deletedTask)
 	}
 }
 

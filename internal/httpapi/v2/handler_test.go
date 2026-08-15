@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,6 +18,7 @@ import (
 
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/inputspool"
 	"minimax-h3-tc/internal/store/sqlite"
 )
 
@@ -125,6 +127,44 @@ func TestCreateRejectsPublicFPSWithoutCreatingTask(t *testing.T) {
 	}
 	if store.createCalls != 0 {
 		t.Fatalf("create calls=%d, want 0", store.createCalls)
+	}
+}
+
+func TestCreateStoresDataURIInInputSpoolInsteadOfRequestJSON(t *testing.T) {
+	store := apiStore(t, 0)
+	spooler := inputspool.New(filepath.Join(t.TempDir(), "temp-inputs"))
+	handler := NewHandler(Dependencies{
+		Store: store, APIKeys: []config.APIKeyConfig{{ID: "owner-a", Key: "key-a", Enabled: true}},
+		Profiles: profiles(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), InputSpooler: spooler,
+	})
+	payload := `{"model":"MiniMax-H3","content":[{"type":"text","text":"海边日落"},{"type":"image_url","role":"first_frame","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}}],"resolution":"768P","duration":5}`
+	created := request(t, handler, http.MethodPost, "/v2/video_generation", []byte(payload), "key-a")
+	if created.Code != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var body struct {
+		TaskID string `json:"task_id"`
+	}
+	decode(t, created, &body)
+	task, err := store.Get(context.Background(), "owner-a", body.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(task.RequestJSON, ";base64,") {
+		t.Fatalf("request_json still contains base64: %s", task.RequestJSON)
+	}
+	if !strings.Contains(task.RequestJSON, "proxy-input://"+body.TaskID+"/input_") {
+		t.Fatalf("request_json missing proxy-input ref: %s", task.RequestJSON)
+	}
+	files, err := store.ListInputSpoolFiles(context.Background(), body.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].Extension != ".png" || files[0].RelativePath == "" {
+		t.Fatalf("spool files=%+v", files)
+	}
+	if _, err := os.Stat(filepath.Join(spooler.Root(), filepath.FromSlash(files[0].RelativePath))); err != nil {
+		t.Fatalf("spooled file missing: %v", err)
 	}
 }
 

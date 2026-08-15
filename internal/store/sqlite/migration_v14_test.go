@@ -17,8 +17,8 @@ func TestOpenMigratesVersionThirteenToNodeDispatchBarriers(t *testing.T) {
 	if err := store.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 14 {
-		t.Fatalf("user_version = %d, want 14", version)
+	if version != 15 {
+		t.Fatalf("user_version = %d, want 15", version)
 	}
 
 	var tableCount int
