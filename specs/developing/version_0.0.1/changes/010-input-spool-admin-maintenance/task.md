@@ -19,6 +19,7 @@
 | ORC-001 | 执行阶段支持 `proxy-input://` | High | Completed | V2-001 | 是 | 已从托管文件读取并继续导入 Node |
 | MGR-001 | 新增 Manager 任务详情接口 | High | Completed | DB-001,V2-001 | 是 | 已返回脱敏请求、媒体元数据和配置摘要 |
 | MGR-002 | Manager 前端新增查看弹窗 | Medium | Completed | MGR-001 | 是 | 已增加任务行查看按钮、弹窗状态和错误提示 |
+| MGR-003 | Manager 媒体输入文件查看与下载 | Medium | Completed | MGR-001,SPL-001 | 是 | 已新增受保护文件内容接口，并在媒体输入行提供“查看/下载”操作 |
 | DEL-001 | 实现终态任务物理删除 | High | Completed | DB-001,SPL-001 | 是 | 已实现无取消屏障且远端产物删除成功后物理删除 DB 和本地目录；真实 Node 行为待人工联调确认 |
 | CLN-001 | 启动孤儿临时目录清理 | Medium | Completed | SPL-001,DB-001 | 是 | 已清理 `.part`、候选目录和无 DB 关联目录，不自动删除合法任务 |
 | TEST-001 | 本地自动化测试 | High | Completed | ORC-001,MGR-002,DEL-001,CLN-001 | 是 | 已覆盖创建、执行、查看、删除、迁移、孤儿清理 |
@@ -45,6 +46,7 @@
 - [x] Data URI 文件按真实格式保存，字节与原始解码结果一致。
 - [x] Proxy 重启后排队任务可继续执行。
 - [x] Manager 可以查看任务请求详情且不泄露 Base64。
+- [x] Manager 任务详情中的本地托管媒体输入可以点击查看和下载，且不泄露本地路径。
 - [x] Manager 删除终态任务后，SQLite 关联行和本地输入目录被物理删除。
 - [x] cancelled 任务仍有 Node 调度屏障时，Manager 删除返回 409 且不删除任何上下文。
 - [x] v14 数据库启动新版本后自动迁移到 v15。
@@ -59,6 +61,7 @@
 | `go test ./...` | 通过 |
 | `go vet ./...` | 通过 |
 | `go build ./cmd/server ./cmd/healthcheck` | 通过 |
+| `go test ./internal/httpapi/manager -run "Test(TaskInputContentRequiresAuthenticationAndSupportsInlineAndDownload\|ManagerPageIncludesTaskDetailDialog\|TaskDetailRequiresAuthenticationAndReturnsSanitizedRequest)"` | 通过 |
 
 ## 6. 人工后续确认
 

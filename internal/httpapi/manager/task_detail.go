@@ -45,6 +45,7 @@ func sanitizedTaskRequest(requestJSON string, files []domain.InputSpoolFile) (an
 			item["media_type"] = file.MediaType
 			item["extension"] = file.Extension
 			item["file_name"] = filepath.Base(filepath.FromSlash(file.RelativePath))
+			item["input_id"] = file.ID
 			item["input_ref"] = "proxy-input://" + file.TaskID + "/" + file.ID
 			item["size_bytes"] = file.SizeBytes
 			item["sha256"] = file.SHA256

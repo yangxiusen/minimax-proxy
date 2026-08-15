@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,6 +45,7 @@ type TaskStore interface {
 	GetAdminTaskDetail(context.Context, string) (domain.AdminTaskDetail, error)
 	EnsureTaskPurgeReady(context.Context, string) error
 	ListTaskArtifactLocations(context.Context, string) ([]domain.TaskArtifactLocation, error)
+	GetInputSpoolFile(context.Context, string, string) (domain.InputSpoolFile, error)
 	RequestAdminCancel(context.Context, string) error
 	AdminDelete(context.Context, string, ...domain.TaskArtifactLocation) error
 }
@@ -164,6 +166,7 @@ func NewHandler(dependencies Dependencies) http.Handler {
 	mux.Handle("DELETE /manager/api/session", h.authenticate(http.HandlerFunc(h.deleteSession)))
 	mux.Handle("GET /manager/api/snapshot", h.authenticate(http.HandlerFunc(h.snapshot)))
 	mux.Handle("GET /manager/api/tasks", h.authenticate(http.HandlerFunc(h.tasks)))
+	mux.Handle("GET /manager/api/tasks/{task_id}/inputs/{input_id}/content", h.authenticate(http.HandlerFunc(h.taskInputContent)))
 	mux.Handle("GET /manager/api/tasks/{task_id}", h.authenticate(http.HandlerFunc(h.taskDetail)))
 	mux.Handle("POST /manager/api/tasks/{task_id}/cancel", h.authenticate(http.HandlerFunc(h.cancelTask)))
 	mux.Handle("DELETE /manager/api/tasks/{task_id}", h.authenticate(http.HandlerFunc(h.deleteTask)))
@@ -614,6 +617,94 @@ func (h *handler) taskDetail(w http.ResponseWriter, r *http.Request) {
 		Request: requestBody, Config: config, LegacyBase64Present: detail.LegacyBase64Present || legacy,
 	}
 	h.writeJSON(w, http.StatusOK, response)
+}
+
+func (h *handler) taskInputContent(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("task_id")
+	inputID := r.PathValue("input_id")
+	if !validTaskID(taskID) || !validTaskID(inputID) {
+		h.writeError(w, http.StatusBadRequest, "bad_request_error", "输入文件标识无效")
+		return
+	}
+	if h.store == nil {
+		h.internalError(w, r, errors.New("monitor task store is nil"))
+		return
+	}
+	if h.inputSpooler == nil || h.inputSpooler.Root() == "" {
+		h.internalError(w, r, errors.New("input spooler is nil"))
+		return
+	}
+	fileMeta, err := h.store.GetInputSpoolFile(r.Context(), taskID, inputID)
+	if err != nil {
+		h.writeTaskActionError(w, r, err)
+		return
+	}
+	absolutePath, err := h.inputSpoolPath(fileMeta)
+	if err != nil {
+		h.internalError(w, r, err)
+		return
+	}
+	file, err := os.Open(absolutePath)
+	if errors.Is(err, os.ErrNotExist) {
+		h.writeError(w, http.StatusNotFound, "task_not_found", "输入文件不存在")
+		return
+	}
+	if err != nil {
+		h.internalError(w, r, err)
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if errors.Is(err, os.ErrNotExist) {
+		h.writeError(w, http.StatusNotFound, "task_not_found", "输入文件不存在")
+		return
+	}
+	if err != nil {
+		h.internalError(w, r, err)
+		return
+	}
+	if info.IsDir() {
+		h.writeError(w, http.StatusNotFound, "task_not_found", "输入文件不存在")
+		return
+	}
+	contentType := fileMeta.MediaType
+	if contentType == "" {
+		contentType = mime.TypeByExtension(fileMeta.Extension)
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	disposition := "inline"
+	if r.URL.Query().Get("download") == "1" {
+		disposition = "attachment"
+	}
+	fileName := filepath.Base(filepath.FromSlash(fileMeta.RelativePath))
+	if fileName == "." || fileName == string(filepath.Separator) || fileName == "" {
+		fileName = inputID + fileMeta.Extension
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": fileName}))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	http.ServeContent(w, r, fileName, info.ModTime(), file)
+}
+
+func (h *handler) inputSpoolPath(fileMeta domain.InputSpoolFile) (string, error) {
+	root, err := filepath.Abs(h.inputSpooler.Root())
+	if err != nil {
+		return "", err
+	}
+	relativePath := filepath.Clean(filepath.FromSlash(fileMeta.RelativePath))
+	if relativePath == "." || filepath.IsAbs(relativePath) || relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(filepath.Separator)) {
+		return "", errors.New("输入文件路径无效")
+	}
+	absolutePath, err := filepath.Abs(filepath.Join(root, relativePath))
+	if err != nil {
+		return "", err
+	}
+	if absolutePath != root && !strings.HasPrefix(absolutePath, root+string(filepath.Separator)) {
+		return "", errors.New("输入文件路径越界")
+	}
+	return absolutePath, nil
 }
 
 func (h *handler) deleteTask(w http.ResponseWriter, r *http.Request) {

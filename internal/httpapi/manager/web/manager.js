@@ -660,6 +660,25 @@ function detailRow(label, value) {
   return row;
 }
 
+function mediaFileURL(taskID, inputID, download = false) {
+  const url = `/manager/api/tasks/${encodeURIComponent(taskID)}/inputs/${encodeURIComponent(inputID)}/content`;
+  return download ? `${url}?download=1` : url;
+}
+
+function mediaFileActions(detail, item) {
+  if (!detail?.id || !item?.input_id) return null;
+  const actions = makeElement("div", "task-detail-actions");
+  const view = makeElement("a", "task-detail-action", "查看");
+  view.href = mediaFileURL(detail.id, item.input_id);
+  view.target = "_blank";
+  view.rel = "noopener";
+  const download = makeElement("a", "task-detail-action", "下载");
+  download.href = mediaFileURL(detail.id, item.input_id, true);
+  download.setAttribute("download", item.file_name || "");
+  actions.append(view, download);
+  return actions;
+}
+
 function renderTaskDetail(detail) {
   elements.taskDetailStatus.textContent = detail.legacy_base64_present ? "历史任务含 Base64，后台已隐藏正文。" : "";
   const summary = makeElement("section", "task-detail-grid");
@@ -699,6 +718,8 @@ function renderTaskDetail(detail) {
         detailRow("大小", item.size_bytes ? `${item.size_bytes} B` : "--"),
         detailRow("SHA256", item.sha256 ? `${String(item.sha256).slice(0, 16)}...` : "--")
       );
+      const actions = mediaFileActions(detail, item);
+      if (actions) box.append(actions);
       mediaSection.append(box);
     });
   }

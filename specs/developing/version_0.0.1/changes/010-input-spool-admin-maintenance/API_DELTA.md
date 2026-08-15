@@ -6,6 +6,7 @@
 | --- | --- | --- | --- | --- |
 | V2 视频生成 | 创建任务 | POST | `/v2/video_generation` | 路径和请求响应不变，内部不再把新任务 Base64 正文写入 DB |
 | Manager 任务管理 | 任务详情 | GET | `/manager/api/tasks/{task_id}` | 新增，用于查看用户提交请求内容 |
+| Manager 任务管理 | 输入文件内容 | GET | `/manager/api/tasks/{task_id}/inputs/{input_id}/content` | 新增，用于在任务详情中查看或下载本地托管的媒体输入文件 |
 | Manager 任务管理 | 删除任务 | DELETE | `/manager/api/tasks/{task_id}` | 路径不变，语义改为终态任务物理删除 |
 
 ## 2. V2 创建任务内部语义
@@ -97,6 +98,7 @@ Path 参数：
         "media_type": "image/png",
         "extension": ".png",
         "file_name": "input_abcd1234.png",
+        "input_id": "input_abcd1234",
         "input_ref": "proxy-input://895567577569093972/input_abcd1234",
         "size_bytes": 123456,
         "sha256": "abcdef123456...",
@@ -158,7 +160,47 @@ Path 参数：
 人工联调准备：
 
 - 请求详情弹窗需验证长文案换行、媒体多行、缺失文件提示、历史 Base64 隐藏提示。
+- 媒体输入为本地托管文件时，弹窗中的“查看”应新标签打开受保护内容接口，“下载”应触发附件下载。
 - 后台接口日志不得输出请求正文。
+
+## 3.1 Manager 输入文件内容
+
+接口名称：查看或下载任务输入文件
+
+URL：
+`GET /manager/api/tasks/{task_id}/inputs/{input_id}/content`
+
+认证与权限：
+Manager 管理员会话 Cookie。普通 V2 API Key 不可调用。
+
+Query 参数：
+
+| 参数名 | 类型 | 必填 | 描述 | 示例 |
+| --- | --- | --- | --- | --- |
+| `download` | string | 否 | 等于 `1` 时返回附件下载；缺省时返回 inline 预览 | `1` |
+
+成功响应：
+
+- `HTTP 200`
+- `Content-Type` 使用托管文件元数据中的媒体类型，例如 `image/png`、`audio/mpeg`。
+- 缺省 `Content-Disposition: inline; filename="..."`。
+- `download=1` 时 `Content-Disposition: attachment; filename="..."`。
+- 响应体为原始媒体文件字节，不返回本地绝对路径。
+
+错误响应：
+
+| 场景 | HTTP | error.type | message |
+| --- | --- | --- | --- |
+| 未登录或会话过期 | 401 | `authentication_error` | `未登录或会话已过期` |
+| `task_id/input_id` 无效 | 400 | `bad_request_error` | `输入文件标识无效` |
+| 元数据或本地文件不存在 | 404 | `task_not_found` | `任务不存在` 或 `输入文件不存在` |
+| 输入文件服务未配置或路径异常 | 500 | `server_error` | `服务内部错误` |
+
+安全约束：
+
+- 只通过 `task_id + input_id` 定位 `task_input_spool_files` 元数据。
+- 真实文件路径由服务端根据 `temp-inputs` 根目录和 DB 相对路径拼接。
+- 服务端校验相对路径不得越界，不向浏览器返回相对路径或绝对路径。
 
 ## 4. Manager 删除任务
 

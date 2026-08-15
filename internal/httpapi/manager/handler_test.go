@@ -38,6 +38,8 @@ type taskStoreStub struct {
 	detail        domain.AdminTaskDetail
 	detailError   error
 	locations     []domain.TaskArtifactLocation
+	inputFile     domain.InputSpoolFile
+	inputFileErr  error
 }
 
 type managerSignerSpy struct {
@@ -77,6 +79,15 @@ func (s *taskStoreStub) ListTaskArtifactLocations(context.Context, string) ([]do
 }
 func (s *taskStoreStub) EnsureTaskPurgeReady(context.Context, string) error {
 	return nil
+}
+func (s *taskStoreStub) GetInputSpoolFile(_ context.Context, taskID, inputID string) (domain.InputSpoolFile, error) {
+	if s.inputFileErr != nil {
+		return domain.InputSpoolFile{}, s.inputFileErr
+	}
+	if s.inputFile.TaskID == taskID && s.inputFile.ID == inputID {
+		return s.inputFile, nil
+	}
+	return domain.InputSpoolFile{}, domain.ErrTaskNotFound
 }
 
 func TestWebRoutesRedirectAuthenticateAndServeEmbeddedAssets(t *testing.T) {
@@ -205,12 +216,12 @@ func TestManagerPageIncludesTaskDetailDialog(t *testing.T) {
 			t.Errorf("manager.html missing task detail dialog %q", expected)
 		}
 	}
-	for _, expected := range []string{`openTaskDetail(item)`, `/manager/api/tasks/${encodeURIComponent(item.id)}`, `renderTaskDetail(detail)`, `closeTaskDetail()`} {
+	for _, expected := range []string{`openTaskDetail(item)`, `/manager/api/tasks/${encodeURIComponent(item.id)}`, `renderTaskDetail(detail)`, `closeTaskDetail()`, `mediaFileURL(detail.id, item.input_id)`, `download=1`, `查看`, `下载`} {
 		if !strings.Contains(string(script), expected) {
 			t.Errorf("manager.js missing task detail behavior %q", expected)
 		}
 	}
-	for _, expected := range []string{".task-detail-dialog", ".task-detail-grid", ".task-detail-media"} {
+	for _, expected := range []string{".task-detail-dialog", ".task-detail-grid", ".task-detail-media", ".task-detail-actions"} {
 		if !strings.Contains(string(styles), expected) {
 			t.Errorf("styles.css missing task detail style %q", expected)
 		}
@@ -304,6 +315,53 @@ func TestDeleteTaskKeepsDBWhenRemoteArtifactNodeCannotDelete(t *testing.T) {
 	}
 	if store.deletedTask != "" {
 		t.Fatalf("DB delete must not run when remote artifact cannot be deleted, got %q", store.deletedTask)
+	}
+}
+
+func TestTaskInputContentRequiresAuthenticationAndSupportsInlineAndDownload(t *testing.T) {
+	root := t.TempDir()
+	taskID := "task-media"
+	inputID := "input_media"
+	relativePath := filepath.ToSlash(filepath.Join(taskID, inputID+".png"))
+	absolutePath := filepath.Join(root, filepath.FromSlash(relativePath))
+	if err := os.MkdirAll(filepath.Dir(absolutePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+	if err := os.WriteFile(absolutePath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := &taskStoreStub{inputFile: domain.InputSpoolFile{
+		ID: inputID, TaskID: taskID, ContentIndex: 1, ContentType: "image_url", Role: "reference",
+		MediaType: "image/png", Extension: ".png", RelativePath: relativePath, SizeBytes: int64(len(body)),
+		SHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+	}}
+	h := testHandler(Dependencies{
+		Admin:        config.AdminConfig{Username: "admin", Password: "secret", SessionTTL: time.Hour},
+		Store:        store,
+		InputSpooler: inputspool.New(root),
+	})
+	path := "/manager/api/tasks/task-media/inputs/input_media/content"
+	if response := serve(h, http.MethodGet, path, "", "", "", "192.0.2.10:1", false); response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d", response.Code)
+	}
+	cookie := login(t, h, "admin", "secret", "192.0.2.10:1")
+	inline := serve(h, http.MethodGet, path, "", "", cookie, "192.0.2.10:1", false)
+	if inline.Code != http.StatusOK || !bytes.Equal(inline.Body.Bytes(), body) {
+		t.Fatalf("inline status=%d body=%x", inline.Code, inline.Body.Bytes())
+	}
+	if contentType := inline.Header().Get("Content-Type"); contentType != "image/png" {
+		t.Fatalf("inline content-type=%q", contentType)
+	}
+	if disposition := inline.Header().Get("Content-Disposition"); !strings.Contains(disposition, "inline") || !strings.Contains(disposition, "input_media.png") {
+		t.Fatalf("inline disposition=%q", disposition)
+	}
+	download := serve(h, http.MethodGet, path+"?download=1", "", "", cookie, "192.0.2.10:1", false)
+	if download.Code != http.StatusOK || !bytes.Equal(download.Body.Bytes(), body) {
+		t.Fatalf("download status=%d body=%x", download.Code, download.Body.Bytes())
+	}
+	if disposition := download.Header().Get("Content-Disposition"); !strings.Contains(disposition, "attachment") || !strings.Contains(disposition, "input_media.png") {
+		t.Fatalf("download disposition=%q", disposition)
 	}
 }
 

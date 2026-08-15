@@ -195,6 +195,9 @@ h3 { margin-bottom: 3px; font-size: 17px; }
 .task-detail-row strong { min-width: 0; overflow-wrap: anywhere; font-weight: 600; }
 .task-detail-text, .task-detail-json { max-height: 220px; margin: 0; padding: 10px; overflow: auto; border: 1px solid var(--line); border-radius: 4px; background: #f7f9fb; white-space: pre-wrap; overflow-wrap: anywhere; }
 .task-detail-media { margin-top: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 4px; background: #fbfcfd; }
+.task-detail-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
+.task-detail-action { min-width: 58px; padding: 5px 9px; border: 1px solid #cbd5df; border-radius: 4px; color: var(--blue); text-align: center; text-decoration: none; background: var(--surface); }
+.task-detail-action:hover { border-color: var(--blue); background: var(--blue-bg); }
 @media (max-width: 800px) {
   .topbar { padding: 10px 12px; align-items: flex-start; }
   .session-info { flex-wrap: wrap; justify-content: flex-end; gap: 7px 10px; }

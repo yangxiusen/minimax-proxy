@@ -250,6 +250,9 @@ func (*appStore) GetAdminTaskDetail(context.Context, string) (domain.AdminTaskDe
 func (*appStore) ListTaskArtifactLocations(context.Context, string) ([]domain.TaskArtifactLocation, error) {
 	return nil, nil
 }
+func (*appStore) GetInputSpoolFile(context.Context, string, string) (domain.InputSpoolFile, error) {
+	return domain.InputSpoolFile{}, domain.ErrTaskNotFound
+}
 func (*appStore) EnsureTaskPurgeReady(context.Context, string) error { return nil }
 func (*appStore) RequestAdminCancel(context.Context, string) error   { return domain.ErrTaskNotFound }
 func (*appStore) AdminDelete(context.Context, string, ...domain.TaskArtifactLocation) error {
