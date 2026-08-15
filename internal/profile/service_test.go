@@ -52,6 +52,24 @@ func TestNormalizeConfigRequiresAllSevenRatios(t *testing.T) {
 	}
 }
 
+func TestNormalizeConfigAcceptsAlignedApproximateRatioDimensions(t *testing.T) {
+	config := validConfig()
+	base := map[string][2]int{
+		"adaptive": {928, 544}, "21:9": {1280, 544}, "16:9": {928, 544}, "4:3": {736, 544},
+		"1:1": {544, 544}, "3:4": {544, 736}, "9:16": {544, 928},
+	}
+	for ratio, size := range base {
+		config.Ratios[ratio] = domain.RatioMapping{
+			BaseWidth: size[0], BaseHeight: size[1],
+			TargetWidth: size[0] * 3, TargetHeight: size[1] * 3,
+		}
+	}
+
+	if _, err := NormalizeConfig(config); err != nil {
+		t.Fatalf("NormalizeConfig() error = %v", err)
+	}
+}
+
 func TestNormalizeConfigRejectsUnsupportedFeatureSettings(t *testing.T) {
 	tests := []struct {
 		name   string

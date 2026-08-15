@@ -235,7 +235,9 @@ func ratioMatchesDimensions(ratio string, width, height int) bool {
 	if errLeft != nil || errRight != nil {
 		return false
 	}
-	return math.Abs(float64(width)/float64(height)-float64(left)/float64(right)) <= 0.05
+	actual := float64(width) / float64(height)
+	expected := float64(left) / float64(right)
+	return math.Abs(actual-expected)/expected <= 0.05
 }
 
 func strconvAtoi(value string) (int, error) {
