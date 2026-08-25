@@ -170,7 +170,10 @@ func validateImageSource(value string) error {
 		return nil
 	}
 	if strings.HasPrefix(value, "mm_file://") {
-		return fmt.Errorf("该媒体来源暂不支持")
+		if strings.TrimSpace(strings.TrimPrefix(value, "mm_file://")) == "" {
+			return fmt.Errorf("mm_file 媒体地址缺少文件标识")
+		}
+		return nil
 	}
 	parsed, err := url.Parse(value)
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil {
@@ -180,6 +183,12 @@ func validateImageSource(value string) error {
 }
 
 func validateAccessibleMediaURL(value string) error {
+	if strings.HasPrefix(value, "mm_file://") {
+		if strings.TrimSpace(strings.TrimPrefix(value, "mm_file://")) == "" {
+			return fmt.Errorf("mm_file 媒体地址缺少文件标识")
+		}
+		return nil
+	}
 	parsed, err := url.Parse(value)
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil {
 		return fmt.Errorf("音频视频必须要上传可以访问的url。")

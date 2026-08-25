@@ -218,7 +218,7 @@ func TestValidateCreateRejectsUnsupportedAndInvalidInputs(t *testing.T) {
 		want string
 	}{
 		{name: "adaptive t2va", req: CreateRequest{Model: "MiniMax-H3", Content: text(), Resolution: "2K", Duration: 5, Ratio: "adaptive"}, want: "ratio"},
-		{name: "mm file", req: CreateRequest{Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: "x"}, image("mm_file://123", "first_frame")}, Resolution: "2K", Duration: 5}, want: "媒体来源"},
+		{name: "empty mm file", req: CreateRequest{Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: "x"}, image("mm_file://", "reference_image")}, Resolution: "2K", Duration: 5, Ratio: "16:9"}, want: "媒体"},
 		{name: "mixed roles", req: CreateRequest{Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: "x"}, image("https://a.example/x.png", "first_frame"), image("https://a.example/y.png", "reference_image")}, Resolution: "2K", Duration: 5}, want: "互斥"},
 	}
 	for _, tt := range tests {
@@ -228,6 +228,23 @@ func TestValidateCreateRejectsUnsupportedAndInvalidInputs(t *testing.T) {
 				t.Fatalf("error = %v, want contains %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestValidateCreateAcceptsMMFileMedia(t *testing.T) {
+	items := []ContentItem{
+		image("mm_file://image-1", "reference_image"),
+		video("mm_file://video-1", "reference_video"),
+		audio("mm_file://audio-1", "reference_audio"),
+	}
+	for _, item := range items {
+		request := CreateRequest{
+			Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: "保持一致"}, item},
+			Resolution: "2K", Duration: 5, Ratio: "16:9",
+		}
+		if _, err := ValidateCreate(request, profiles()); err != nil {
+			t.Fatalf("type=%s error=%v", item.Type, err)
+		}
 	}
 }
 

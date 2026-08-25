@@ -37,30 +37,108 @@ func TestClaimNextOfficialHonorsConfiguredCapacity(t *testing.T) {
 	}
 }
 
-func TestClaimNextOfficialSkipsLocalOnlyTasks(t *testing.T) {
+func TestClaimNextOfficialIgnoresInternalConfiguration(t *testing.T) {
 	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 100, GlobalLimit: 100})
 	ctx := context.Background()
 	node, err := store.CreateModelNode(ctx, officialNodeInput("official", 3, false))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, input := range []domain.NewTask{
-		officialTask("with-lora", true, false),
-		officialTask("with-restoration", false, true),
-		func() domain.NewTask {
-			value := officialTask("unsupported-resolution", false, false)
-			value.Resolution = "480P"
-			return value
-		}(),
-		officialTask("compatible", false, false),
-	} {
-		if _, err := store.Create(ctx, input, "", nil); err != nil {
+	if _, err := store.Create(ctx, officialTask("with-internal-config", true, true), "", nil); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimNextOfficial(ctx, node.ID, node.Version, node.MaxConcurrency)
+	if err != nil || claimed.TaskID != "with-internal-config" {
+		t.Fatalf("claimed=%+v err=%v", claimed, err)
+	}
+	if err := store.BindOfficialTask(ctx, claimed.TaskID, node.ID, "upstream-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkOfficialGenerated(ctx, claimed.TaskID, node.ID, "https://result.example.com/video.mp4", "16:9", nil); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.db.QueryContext(ctx, `SELECT stage_type,status FROM task_stages WHERE task_id=?`, claimed.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	statuses := map[string]string{}
+	for rows.Next() {
+		var stageType, status string
+		if err := rows.Scan(&stageType, &status); err != nil {
+			t.Fatal(err)
+		}
+		statuses[stageType] = status
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if statuses["generation"] != "succeeded" || statuses["interpolation"] != "skipped" || statuses["restoration"] != "skipped" {
+		t.Fatalf("stage statuses=%v", statuses)
+	}
+}
+
+func TestClaimNextOfficialOnlyAcceptsPublicOrMMFileMediaURLs(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 100, GlobalLimit: 100})
+	ctx := context.Background()
+	node, err := store.CreateModelNode(ctx, officialNodeInput("official", 2, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks := []domain.NewTask{
+		officialTaskWithContent("data-url", `[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]`),
+		officialTaskWithContent("proxy-input", `[{"type":"video_url","video_url":{"url":"proxy-input://video-1"}}]`),
+		officialTaskWithContent("ftp-url", `[{"type":"audio_url","audio_url":{"url":"ftp://files.example.com/audio.mp3"}}]`),
+		officialTaskWithContent("empty-url", `[{"type":"image_url","image_url":{"url":""}}]`),
+		officialTaskWithContent("lookalike-scheme", `[{"type":"video_url","video_url":{"url":"mmXfile://video-1"}}]`),
+		officialTaskWithContent("public-url", `[{"type":"image_url","image_url":{"url":"HTTPS://files.example.com/image.png"}}]`),
+		officialTaskWithContent("mm-file", `[{"type":"video_url","video_url":{"url":"mm_file://video-1"}}]`),
+	}
+	for _, task := range tasks {
+		if _, err := store.Create(ctx, task, "", nil); err != nil {
 			t.Fatal(err)
 		}
 	}
-	claimed, err := store.ClaimNextOfficial(ctx, node.ID, node.Version, node.MaxConcurrency)
-	if err != nil || claimed.TaskID != "compatible" {
-		t.Fatalf("claimed=%+v err=%v", claimed, err)
+	for index, wantID := range []string{"public-url", "mm-file"} {
+		claimed, err := store.ClaimNextOfficial(ctx, node.ID, node.Version, node.MaxConcurrency)
+		if err != nil || claimed.TaskID != wantID {
+			t.Fatalf("claim %d=%+v err=%v want=%s", index+1, claimed, err, wantID)
+		}
+	}
+}
+
+func TestClaimNextInternalSkipsMMFileMedia(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 100, GlobalLimit: 100})
+	ctx := context.Background()
+	for _, task := range []domain.NewTask{
+		officialTaskWithContent("official-only", `[{"type":"video_url","video_url":{"url":"mm_file://video-1"}}]`),
+		officialTask("internal-compatible", false, false),
+	} {
+		if _, err := store.Create(ctx, task, "", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claimed, err := store.ClaimNext(ctx, "internal-node")
+	if err != nil || claimed.TaskID != "internal-compatible" {
+		t.Fatalf("claim=%+v err=%v", claimed, err)
+	}
+}
+
+func TestClaimStageInternalSkipsMMFileMedia(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 100, GlobalLimit: 100})
+	ctx := context.Background()
+	insertNodeAPINode(t, store, "internal-node")
+	for _, task := range []domain.NewTask{
+		officialTaskWithContent("official-stage-only", `[{"type":"video_url","video_url":{"url":"mm_file://video-1"}}]`),
+		officialTask("internal-stage-compatible", false, false),
+	} {
+		if _, err := store.Create(ctx, task, "", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stage, err := store.ClaimStage(ctx, "internal-node", "lease-1", time.Minute)
+	if err != nil || stage.TaskID != "internal-stage-compatible" {
+		t.Fatalf("stage=%+v err=%v", stage, err)
 	}
 }
 
@@ -131,7 +209,10 @@ func officialTask(id string, withLoRA, withRestoration bool) domain.NewTask {
 		ConfigSnapshotJSON: `{"stage_type":"generation","parameters":{"loras":` + loras + `}}`,
 	}}
 	if withRestoration {
-		stages = append(stages, domain.NewTaskStage{ID: "restoration-" + id, StageType: "restoration", StageOrder: 20, MaxAttempts: 3, ConfigSnapshotJSON: `{}`})
+		stages = append(stages,
+			domain.NewTaskStage{ID: "interpolation-" + id, StageType: "interpolation", StageOrder: 20, MaxAttempts: 3, ConfigSnapshotJSON: `{}`},
+			domain.NewTaskStage{ID: "restoration-" + id, StageType: "restoration", StageOrder: 30, MaxAttempts: 3, ConfigSnapshotJSON: `{}`},
+		)
 	}
 	return domain.NewTask{
 		TaskID: id, APIKeyID: "owner", Model: "MiniMax-H3", Scenario: "t2va",
@@ -139,4 +220,10 @@ func officialTask(id string, withLoRA, withRestoration bool) domain.NewTask {
 		RequestHash: id, Resolution: "2K", Duration: 5, Ratio: "16:9", Stages: stages,
 		ConfigSnapshotJSON: `{}`, ConfigHash: "hash-" + id,
 	}
+}
+
+func officialTaskWithContent(id, content string) domain.NewTask {
+	task := officialTask(id, false, false)
+	task.RequestJSON = fmt.Sprintf(`{"model":"MiniMax-H3","content":%s,"resolution":"2K","duration":5,"ratio":"16:9"}`, content)
+	return task
 }

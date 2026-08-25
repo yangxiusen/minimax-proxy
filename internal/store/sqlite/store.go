@@ -405,7 +405,21 @@ func (s *Store) ClaimNext(ctx context.Context, upstreamID string, expectedVersio
 		wanted = domain.StatusQueuedLocked
 	}
 	var taskID, owner string
-	err = conn.QueryRowContext(ctx, `SELECT task_id,api_key_id FROM video_tasks WHERE status=? AND deleted_at IS NULL ORDER BY queue_seq LIMIT 1`, wanted).Scan(&taskID, &owner)
+	err = conn.QueryRowContext(ctx, `
+		SELECT task.task_id,task.api_key_id
+		FROM video_tasks task
+		WHERE task.status=? AND task.deleted_at IS NULL
+		  AND NOT EXISTS (
+		    SELECT 1 FROM json_each(task.request_json,'$.content') content
+		    WHERE json_extract(content.value,'$.type') IN ('image_url','video_url','audio_url')
+		      AND substr(lower(COALESCE(
+		        json_extract(content.value,'$.image_url.url'),
+		        json_extract(content.value,'$.video_url.url'),
+		        json_extract(content.value,'$.audio_url.url'),
+		        ''
+		      )),1,10) = 'mm_file://'
+		  )
+		ORDER BY task.queue_seq LIMIT 1`, wanted).Scan(&taskID, &owner)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Task{}, domain.ErrQueueEmpty
 	}

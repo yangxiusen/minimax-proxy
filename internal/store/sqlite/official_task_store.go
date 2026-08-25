@@ -81,10 +81,26 @@ func (s *Store) ClaimNextOfficial(ctx context.Context, nodeID string, nodeVersio
 		  AND task.resolution IN ('768P','2K') AND task.duration BETWEEN 4 AND 15
 		  AND NOT EXISTS (SELECT 1 FROM task_input_spool_files input WHERE input.task_id=task.task_id)
 		  AND NOT EXISTS (
-		    SELECT 1 FROM task_stages stage
-		    WHERE stage.task_id=task.task_id
-		      AND (stage.stage_type IN ('interpolation','restoration')
-		        OR (stage.stage_type='generation' AND COALESCE(json_array_length(json_extract(stage.config_snapshot_json,'$.parameters.loras')),0)>0))
+		    SELECT 1 FROM json_each(task.request_json,'$.content') content
+		    WHERE json_extract(content.value,'$.type') IN ('image_url','video_url','audio_url')
+		      AND lower(COALESCE(
+		        json_extract(content.value,'$.image_url.url'),
+		        json_extract(content.value,'$.video_url.url'),
+		        json_extract(content.value,'$.audio_url.url'),
+		        ''
+		      )) NOT LIKE 'http://%'
+		      AND lower(COALESCE(
+		        json_extract(content.value,'$.image_url.url'),
+		        json_extract(content.value,'$.video_url.url'),
+		        json_extract(content.value,'$.audio_url.url'),
+		        ''
+		      )) NOT LIKE 'https://%'
+		      AND substr(lower(COALESCE(
+		        json_extract(content.value,'$.image_url.url'),
+		        json_extract(content.value,'$.video_url.url'),
+		        json_extract(content.value,'$.audio_url.url'),
+		        ''
+		      )),1,10) <> 'mm_file://'
 		  )
 		ORDER BY task.queue_seq LIMIT 1`, wanted).Scan(&taskID, &owner)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -127,7 +143,7 @@ func (s *Store) MarkOfficialGenerated(ctx context.Context, taskID, nodeID, origi
 	if err := oneRow(updated, err); err != nil {
 		return err
 	}
-	if _, err := conn.ExecContext(ctx, `UPDATE task_stages SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,updated_at=?,finished_at=COALESCE(finished_at,?),row_version=row_version+1 WHERE task_id=? AND status NOT IN ('succeeded','skipped')`, nowMS, nowMS, taskID); err != nil {
+	if _, err := conn.ExecContext(ctx, `UPDATE task_stages SET status=CASE WHEN stage_type='generation' THEN 'succeeded' ELSE 'skipped' END,lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,updated_at=?,finished_at=COALESCE(finished_at,?),row_version=row_version+1 WHERE task_id=? AND status NOT IN ('succeeded','skipped')`, nowMS, nowMS, taskID); err != nil {
 		return err
 	}
 	if uploadJob != nil {

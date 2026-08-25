@@ -22,8 +22,13 @@ func TestClientSubmitsOfficialV2RequestWithoutCallback(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
-		if body["model"] != "configured-model" || body["callback_url"] != nil || body["resolution"] != "2K" {
+		if body["model"] != "configured-model" || body["resolution"] != "2K" || body["ratio"] != "16:9" {
 			t.Fatalf("body=%v", body)
+		}
+		for _, field := range []string{"callback_url", "width", "height", "steps", "loras", "interpolation", "restoration", "profile_id"} {
+			if _, exists := body[field]; exists {
+				t.Fatalf("official request contains internal field %q: %v", field, body)
+			}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]string{"task_id": "upstream-1"})
 	}))
@@ -31,7 +36,7 @@ func TestClientSubmitsOfficialV2RequestWithoutCallback(t *testing.T) {
 	base, _ := url.Parse(server.URL)
 	client := NewClient(base, "official-key", "configured-model", server.Client(), 1<<20)
 
-	taskID, err := client.Submit(context.Background(), []byte(`{"model":"north-model","content":[{"type":"text","text":"hello"}],"resolution":"2K","duration":5,"ratio":"16:9","callback_url":"https://callback.example.com","aigc_watermark":true}`))
+	taskID, err := client.Submit(context.Background(), []byte(`{"model":"north-model","content":[{"type":"text","text":"hello"}],"resolution":"2K","duration":5,"ratio":"16:9","callback_url":"https://callback.example.com","aigc_watermark":true,"width":2048,"height":1152,"steps":30,"loras":[{"name":"style"}],"interpolation":{"enabled":true},"restoration":{"enabled":true},"profile_id":"internal-profile"}`))
 	if err != nil || taskID != "upstream-1" {
 		t.Fatalf("Submit()=%q,%v", taskID, err)
 	}
