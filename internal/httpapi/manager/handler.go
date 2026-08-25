@@ -50,6 +50,11 @@ type TaskStore interface {
 	AdminDelete(context.Context, string, ...domain.TaskArtifactLocation) error
 }
 
+type ResultDeliveryStore interface {
+	GetResultUploadJob(context.Context, string) (domain.ResultUploadJob, error)
+	RetryResultUpload(context.Context, string) error
+}
+
 type ArtifactURLSigner interface {
 	SignURL(context.Context, string, string) (string, error)
 }
@@ -62,48 +67,62 @@ type NodeStore interface {
 	DeleteModelNode(context.Context, string, int64) error
 }
 
+type OfficialNodeActivityStore interface {
+	ActiveOfficialCount(context.Context, string) (int, error)
+}
+
 type NodeSecretCodec interface {
 	Seal(string) ([]byte, []byte, string, error)
 	Open([]byte, []byte) (string, error)
 }
 
+type ObjectStorageStore interface {
+	GetObjectStorageConfig(context.Context) (domain.ObjectStorageConfig, error)
+	PutObjectStorageConfig(context.Context, int64, domain.ObjectStorageConfig) (domain.ObjectStorageConfig, error)
+	MarkObjectStorageTest(context.Context, int64, bool) error
+}
+
 type Dependencies struct {
-	Admin          config.AdminConfig
-	Cache          *monitorcache.Cache
-	Store          TaskStore
-	Nodes          NodeStore
-	Logger         *slog.Logger
-	Now            func() time.Time
-	Rand           io.Reader
-	Wake           func()
-	ProbeNode      func(context.Context, NodeProbeInput) NodeProbeResult
-	NodeSecrets    NodeSecretCodec
-	ProfileService ProfileService
-	Cleanups       CleanupStore
-	WakeCleanup    func()
-	APIKeyService  APIKeyService
-	ArtifactURLs   ArtifactURLSigner
-	InputSpooler   *inputspool.Spooler
+	Admin              config.AdminConfig
+	Cache              *monitorcache.Cache
+	Store              TaskStore
+	Nodes              NodeStore
+	Logger             *slog.Logger
+	Now                func() time.Time
+	Rand               io.Reader
+	Wake               func()
+	ProbeNode          func(context.Context, NodeProbeInput) NodeProbeResult
+	NodeSecrets        NodeSecretCodec
+	ObjectStorage      ObjectStorageStore
+	ProbeObjectStorage func(context.Context, ObjectStorageProbeInput) ObjectStorageProbeResult
+	ProfileService     ProfileService
+	Cleanups           CleanupStore
+	WakeCleanup        func()
+	APIKeyService      APIKeyService
+	ArtifactURLs       ArtifactURLSigner
+	InputSpooler       *inputspool.Spooler
 }
 
 type handler struct {
-	root            http.Handler
-	cache           *monitorcache.Cache
-	store           TaskStore
-	nodes           NodeStore
-	logger          *slog.Logger
-	now             func() time.Time
-	random          io.Reader
-	usernameDigest  [sha256.Size]byte
-	passwordDigest  [sha256.Size]byte
-	sessionTTL      time.Duration
-	secureCookie    bool
-	monitorInterval time.Duration
-	wake            func()
-	probeNode       func(context.Context, NodeProbeInput) NodeProbeResult
-	nodeSecrets     NodeSecretCodec
-	artifactURLs    ArtifactURLSigner
-	inputSpooler    *inputspool.Spooler
+	root               http.Handler
+	cache              *monitorcache.Cache
+	store              TaskStore
+	nodes              NodeStore
+	logger             *slog.Logger
+	now                func() time.Time
+	random             io.Reader
+	usernameDigest     [sha256.Size]byte
+	passwordDigest     [sha256.Size]byte
+	sessionTTL         time.Duration
+	secureCookie       bool
+	monitorInterval    time.Duration
+	wake               func()
+	probeNode          func(context.Context, NodeProbeInput) NodeProbeResult
+	nodeSecrets        NodeSecretCodec
+	objectStorage      ObjectStorageStore
+	probeObjectStorage func(context.Context, ObjectStorageProbeInput) ObjectStorageProbeResult
+	artifactURLs       ArtifactURLSigner
+	inputSpooler       *inputspool.Spooler
 
 	sessionMu          sync.Mutex
 	sessions           map[[sha256.Size]byte]time.Time
@@ -141,24 +160,26 @@ func NewHandler(dependencies Dependencies) http.Handler {
 		monitorInterval = 5 * time.Second
 	}
 	h := &handler{
-		cache:           cache,
-		store:           dependencies.Store,
-		nodes:           dependencies.Nodes,
-		logger:          logger,
-		now:             now,
-		random:          random,
-		usernameDigest:  sha256.Sum256([]byte(dependencies.Admin.Username)),
-		passwordDigest:  sha256.Sum256([]byte(dependencies.Admin.Password)),
-		sessionTTL:      dependencies.Admin.SessionTTL,
-		secureCookie:    dependencies.Admin.SecureCookie,
-		monitorInterval: monitorInterval,
-		wake:            dependencies.Wake,
-		probeNode:       dependencies.ProbeNode,
-		nodeSecrets:     dependencies.NodeSecrets,
-		artifactURLs:    dependencies.ArtifactURLs,
-		inputSpooler:    dependencies.InputSpooler,
-		sessions:        make(map[[sha256.Size]byte]time.Time),
-		failures:        make(map[string]loginFailure),
+		cache:              cache,
+		store:              dependencies.Store,
+		nodes:              dependencies.Nodes,
+		logger:             logger,
+		now:                now,
+		random:             random,
+		usernameDigest:     sha256.Sum256([]byte(dependencies.Admin.Username)),
+		passwordDigest:     sha256.Sum256([]byte(dependencies.Admin.Password)),
+		sessionTTL:         dependencies.Admin.SessionTTL,
+		secureCookie:       dependencies.Admin.SecureCookie,
+		monitorInterval:    monitorInterval,
+		wake:               dependencies.Wake,
+		probeNode:          dependencies.ProbeNode,
+		nodeSecrets:        dependencies.NodeSecrets,
+		objectStorage:      dependencies.ObjectStorage,
+		probeObjectStorage: dependencies.ProbeObjectStorage,
+		artifactURLs:       dependencies.ArtifactURLs,
+		inputSpooler:       dependencies.InputSpooler,
+		sessions:           make(map[[sha256.Size]byte]time.Time),
+		failures:           make(map[string]loginFailure),
 	}
 
 	mux := http.NewServeMux()
@@ -169,12 +190,16 @@ func NewHandler(dependencies Dependencies) http.Handler {
 	mux.Handle("GET /manager/api/tasks/{task_id}/inputs/{input_id}/content", h.authenticate(http.HandlerFunc(h.taskInputContent)))
 	mux.Handle("GET /manager/api/tasks/{task_id}", h.authenticate(http.HandlerFunc(h.taskDetail)))
 	mux.Handle("POST /manager/api/tasks/{task_id}/cancel", h.authenticate(http.HandlerFunc(h.cancelTask)))
+	mux.Handle("POST /manager/api/tasks/{task_id}/result-upload/retry", h.authenticate(http.HandlerFunc(h.retryResultUpload)))
 	mux.Handle("DELETE /manager/api/tasks/{task_id}", h.authenticate(http.HandlerFunc(h.deleteTask)))
 	mux.Handle("GET /manager/api/nodes", h.authenticate(http.HandlerFunc(h.listNodes)))
 	mux.Handle("POST /manager/api/nodes", h.authenticate(http.HandlerFunc(h.createNode)))
 	mux.Handle("PUT /manager/api/nodes/{node_id}", h.authenticate(http.HandlerFunc(h.updateNode)))
 	mux.Handle("DELETE /manager/api/nodes/{node_id}", h.authenticate(http.HandlerFunc(h.deleteNode)))
 	mux.Handle("POST /manager/api/nodes/test", h.authenticate(http.HandlerFunc(h.testNode)))
+	mux.Handle("GET /manager/api/object-storage", h.authenticate(http.HandlerFunc(h.getObjectStorage)))
+	mux.Handle("PUT /manager/api/object-storage", h.authenticate(http.HandlerFunc(h.putObjectStorage)))
+	mux.Handle("POST /manager/api/object-storage/test", h.authenticate(http.HandlerFunc(h.testObjectStorage)))
 	RegisterProfileRoutes(mux, h.authenticate, dependencies.ProfileService, dependencies.Admin.Username, logger)
 	registerCleanupRoutes(mux, h.authenticate, dependencies.Cleanups, dependencies.Admin.Username, dependencies.WakeCleanup, now, h.writeJSON, h.writeError)
 	registerAPIKeyRoutes(mux, h.authenticate, dependencies.APIKeyService, logger)
@@ -400,6 +425,9 @@ type snapshotSummary struct {
 type upstreamDTO struct {
 	ID                 string                     `json:"id"`
 	Address            string                     `json:"address"`
+	ProtocolVersion    string                     `json:"protocol_version"`
+	ActiveTasks        int                        `json:"active_tasks"`
+	MaxConcurrency     int                        `json:"max_concurrency"`
 	Enabled            bool                       `json:"enabled"`
 	Applying           bool                       `json:"applying"`
 	Health             monitorcache.HealthStatus  `json:"health"`
@@ -436,16 +464,44 @@ type errorDTO struct {
 	Summary string `json:"summary"`
 }
 
-func (h *handler) snapshot(w http.ResponseWriter, _ *http.Request) {
+func (h *handler) snapshot(w http.ResponseWriter, r *http.Request) {
 	nodes := h.cache.List()
+	configuredNodes := make(map[string]domain.ModelNode)
+	if h.nodes != nil {
+		items, err := h.nodes.ListModelNodes(r.Context())
+		if err != nil {
+			h.internalError(w, r, err)
+			return
+		}
+		for _, node := range items {
+			configuredNodes[node.ID] = node
+		}
+	}
 	staleAfter := int64((3*h.monitorInterval + time.Second - 1) / time.Second)
 	response := snapshotResponse{StaleAfterSecond: staleAfter, Upstreams: make([]upstreamDTO, 0, len(nodes))}
 	for _, node := range nodes {
 		item := upstreamDTO{
 			ID: node.ID, Address: node.Address, Enabled: !node.Disabled, Applying: node.Applying, Health: node.Health, Runtime: node.Runtime,
-			PrivateQueue: node.PrivateQueue, CPUPercent: node.CPUPercent, MemoryPercent: node.MemoryPercent,
+			MaxConcurrency: 1,
+			PrivateQueue:   node.PrivateQueue, CPUPercent: node.CPUPercent, MemoryPercent: node.MemoryPercent,
 			GPUPercent: node.GPUPercent, VRAMPercent: node.VRAMPercent, CheckedAt: unixTime(node.CheckedAt),
 			LastHealthyAt: unixTime(node.LastHealthyAt), UpdatedAt: unixTime(node.UpdatedAt),
+		}
+		if configured, ok := configuredNodes[node.ID]; ok {
+			item.ProtocolVersion = configured.ProtocolVersion
+			if configured.UsesOfficialV2() {
+				if configured.MaxConcurrency > 0 {
+					item.MaxConcurrency = configured.MaxConcurrency
+				}
+				if activity, ok := h.nodes.(OfficialNodeActivityStore); ok {
+					activeTasks, err := activity.ActiveOfficialCount(r.Context(), node.ID)
+					if err != nil {
+						h.internalError(w, r, err)
+						return
+					}
+					item.ActiveTasks = activeTasks
+				}
+			}
 		}
 		if !node.Disabled {
 			switch node.Health {
@@ -485,19 +541,24 @@ type tasksResponse struct {
 }
 
 type taskDTO struct {
-	ID              string          `json:"id"`
-	APIKeyID        string          `json:"api_key_id"`
-	Status          domain.V2Status `json:"status"`
-	UpstreamID      string          `json:"upstream_id"`
-	Scenario        string          `json:"scenario"`
-	Resolution      string          `json:"resolution"`
-	DurationSeconds *int64          `json:"duration_seconds,omitempty"`
-	CreatedAt       int64           `json:"created_at"`
-	Phase           string          `json:"phase"`
-	RetryCount      int             `json:"retry_count"`
-	CanCancel       bool            `json:"can_cancel"`
-	CanDelete       bool            `json:"can_delete"`
-	VideoURL        *string         `json:"video_url"`
+	ID                   string          `json:"id"`
+	APIKeyID             string          `json:"api_key_id"`
+	Status               domain.V2Status `json:"status"`
+	UpstreamID           string          `json:"upstream_id"`
+	Scenario             string          `json:"scenario"`
+	Resolution           string          `json:"resolution"`
+	DurationSeconds      *int64          `json:"duration_seconds,omitempty"`
+	CreatedAt            int64           `json:"created_at"`
+	Phase                string          `json:"phase"`
+	RetryCount           int             `json:"retry_count"`
+	CanCancel            bool            `json:"can_cancel"`
+	CanDelete            bool            `json:"can_delete"`
+	VideoURL             *string         `json:"video_url"`
+	ResultDeliveryStatus string          `json:"result_delivery_status"`
+	ResultUploadRound    int             `json:"result_upload_round"`
+	ResultUploadAttempts int             `json:"result_upload_attempts"`
+	CanRetryUpload       bool            `json:"can_retry_upload"`
+	ResultUploadError    *errorDTO       `json:"result_upload_error"`
 }
 
 func (h *handler) tasks(w http.ResponseWriter, r *http.Request) {
@@ -546,7 +607,12 @@ func (h *handler) tasks(w http.ResponseWriter, r *http.Request) {
 			h.internalError(w, r, err)
 			return
 		}
-		response.Items = append(response.Items, taskDTO{ID: item.TaskID, APIKeyID: item.APIKeyID, Status: item.Status, UpstreamID: item.UpstreamID, Scenario: item.Scenario, Resolution: item.Resolution, DurationSeconds: taskDurationSeconds(item, now), CreatedAt: unixTime(item.CreatedAt), Phase: taskPhase(item), RetryCount: item.RetryCount, CanCancel: item.InternalStatus.AdminCanCancel(), CanDelete: item.InternalStatus.AdminCanDelete(), VideoURL: videoURL})
+		canCancel := item.InternalStatus.AdminCanCancel()
+		if item.UpstreamProtocol == "minimax-v2" && (item.InternalStatus == domain.StatusDispatching || item.InternalStatus == domain.StatusRunning || item.InternalStatus == domain.StatusReconciling) {
+			canCancel = false
+		}
+		delivery := h.resultDeliverySummary(r.Context(), item.TaskID)
+		response.Items = append(response.Items, taskDTO{ID: item.TaskID, APIKeyID: item.APIKeyID, Status: item.Status, UpstreamID: item.UpstreamID, Scenario: item.Scenario, Resolution: item.Resolution, DurationSeconds: taskDurationSeconds(item, now), CreatedAt: unixTime(item.CreatedAt), Phase: taskPhase(item), RetryCount: item.RetryCount, CanCancel: canCancel, CanDelete: item.InternalStatus.AdminCanDelete(), VideoURL: videoURL, ResultDeliveryStatus: delivery.Status, ResultUploadRound: delivery.Round, ResultUploadAttempts: delivery.Attempts, CanRetryUpload: delivery.CanRetry, ResultUploadError: delivery.Error})
 	}
 	h.writeJSON(w, http.StatusOK, response)
 }
@@ -573,20 +639,25 @@ func (h *handler) cancelTask(w http.ResponseWriter, r *http.Request) {
 }
 
 type taskDetailDTO struct {
-	ID                  string          `json:"id"`
-	APIKeyID            string          `json:"api_key_id"`
-	Status              domain.V2Status `json:"status"`
-	Phase               string          `json:"phase"`
-	Scenario            string          `json:"scenario"`
-	Model               string          `json:"model"`
-	Resolution          string          `json:"resolution"`
-	Ratio               string          `json:"ratio"`
-	Duration            int             `json:"duration"`
-	CreatedAt           int64           `json:"created_at"`
-	UpdatedAt           int64           `json:"updated_at"`
-	Request             any             `json:"request"`
-	Config              any             `json:"config,omitempty"`
-	LegacyBase64Present bool            `json:"legacy_base64_present"`
+	ID                   string          `json:"id"`
+	APIKeyID             string          `json:"api_key_id"`
+	Status               domain.V2Status `json:"status"`
+	Phase                string          `json:"phase"`
+	Scenario             string          `json:"scenario"`
+	Model                string          `json:"model"`
+	Resolution           string          `json:"resolution"`
+	Ratio                string          `json:"ratio"`
+	Duration             int             `json:"duration"`
+	CreatedAt            int64           `json:"created_at"`
+	UpdatedAt            int64           `json:"updated_at"`
+	Request              any             `json:"request"`
+	Config               any             `json:"config,omitempty"`
+	LegacyBase64Present  bool            `json:"legacy_base64_present"`
+	ResultDeliveryStatus string          `json:"result_delivery_status"`
+	ResultUploadRound    int             `json:"result_upload_round"`
+	ResultUploadAttempts int             `json:"result_upload_attempts"`
+	CanRetryUpload       bool            `json:"can_retry_upload"`
+	ResultUploadError    *errorDTO       `json:"result_upload_error"`
 }
 
 func (h *handler) taskDetail(w http.ResponseWriter, r *http.Request) {
@@ -616,7 +687,72 @@ func (h *handler) taskDetail(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: unixTime(detail.Task.CreatedAt), UpdatedAt: unixTime(detail.Task.UpdatedAt),
 		Request: requestBody, Config: config, LegacyBase64Present: detail.LegacyBase64Present || legacy,
 	}
+	delivery := h.resultDeliverySummary(r.Context(), taskID)
+	response.ResultDeliveryStatus, response.ResultUploadRound, response.ResultUploadAttempts = delivery.Status, delivery.Round, delivery.Attempts
+	response.CanRetryUpload, response.ResultUploadError = delivery.CanRetry, delivery.Error
 	h.writeJSON(w, http.StatusOK, response)
+}
+
+type resultDeliverySummary struct {
+	Status          string
+	Round, Attempts int
+	CanRetry        bool
+	Error           *errorDTO
+}
+
+func (h *handler) resultDeliverySummary(ctx context.Context, taskID string) resultDeliverySummary {
+	store, ok := h.store.(ResultDeliveryStore)
+	if !ok {
+		return resultDeliverySummary{Status: "not_required"}
+	}
+	job, err := store.GetResultUploadJob(ctx, taskID)
+	if errors.Is(err, domain.ErrResultUploadNotFound) {
+		return resultDeliverySummary{Status: "not_required"}
+	}
+	if err != nil {
+		return resultDeliverySummary{Status: "unknown"}
+	}
+	status := string(job.Status)
+	if job.Status == domain.UploadRetryWait {
+		status = "pending"
+	}
+	result := resultDeliverySummary{Status: status, Round: job.RoundNo, Attempts: job.AttemptNo, CanRetry: job.CanRetry()}
+	if job.LastErrorCode != "" {
+		result.Error = &errorDTO{Code: job.LastErrorCode, Summary: job.LastErrorMessage}
+	}
+	return result
+}
+
+func (h *handler) retryResultUpload(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("task_id")
+	if !validTaskID(taskID) {
+		h.writeError(w, http.StatusBadRequest, "bad_request_error", "task_id 无效")
+		return
+	}
+	store, ok := h.store.(ResultDeliveryStore)
+	if !ok {
+		h.internalError(w, r, errors.New("result delivery store is nil"))
+		return
+	}
+	if err := store.RetryResultUpload(r.Context(), taskID); err != nil {
+		if errors.Is(err, domain.ErrResultUploadNotRetryable) || errors.Is(err, domain.ErrStateConflict) {
+			h.writeError(w, http.StatusConflict, "result_upload_not_retryable", "结果上传当前不可重试")
+			return
+		}
+		if errors.Is(err, domain.ErrTaskNotFound) {
+			h.writeError(w, http.StatusNotFound, "task_not_found", "任务不存在")
+			return
+		}
+		h.internalError(w, r, err)
+		return
+	}
+	job, err := store.GetResultUploadJob(r.Context(), taskID)
+	if err != nil {
+		h.internalError(w, r, err)
+		return
+	}
+	h.logger.InfoContext(r.Context(), "管理员已重新提交结果上传", "task_id", taskID, "round", job.RoundNo, "stage", "result_delivery_retry")
+	h.writeJSON(w, http.StatusAccepted, map[string]any{"task_id": taskID, "result_delivery_status": "pending", "result_upload_round": job.RoundNo, "result_upload_attempts": job.AttemptNo})
 }
 
 func (h *handler) taskInputContent(w http.ResponseWriter, r *http.Request) {
@@ -796,6 +932,8 @@ func (h *handler) writeTaskActionError(w http.ResponseWriter, r *http.Request, e
 		h.writeError(w, http.StatusNotFound, "task_not_found", "任务不存在")
 	case errors.Is(err, domain.ErrCancelReconcilePending):
 		h.writeError(w, http.StatusConflict, "cancel_reconcile_pending", "任务仍在中止对账中，请稍后重试")
+	case errors.Is(err, domain.ErrOfficialRunningNotCancellable):
+		h.writeError(w, http.StatusConflict, "official_running_not_cancellable", "官方协议运行中任务不支持取消")
 	case errors.Is(err, domain.ErrTaskNotOperable), errors.Is(err, domain.ErrStateConflict):
 		h.writeError(w, http.StatusConflict, "task_not_operable", "任务当前状态不可操作")
 	default:

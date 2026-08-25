@@ -10,7 +10,7 @@ import (
 	"minimax-h3-tc/internal/domain"
 )
 
-const modelNodeSelect = `SELECT id,service_url,protocol_version,COALESCE(api_key_ciphertext,X''),COALESCE(api_key_nonce,X''),COALESCE(api_key_fingerprint,''),COALESCE(api_key_id,''),base_url,jobs_base_url,public_base_url,health_path,submit_api_name,check_api_name,poll_interval_ms,request_timeout_ms,enabled,version,created_at,updated_at FROM model_service_nodes`
+const modelNodeSelect = `SELECT id,service_url,protocol_version,COALESCE(api_key_ciphertext,X''),COALESCE(api_key_nonce,X''),COALESCE(api_key_fingerprint,''),COALESCE(api_key_id,''),base_url,jobs_base_url,public_base_url,health_path,submit_api_name,check_api_name,poll_interval_ms,request_timeout_ms,enabled,upstream_model,max_concurrency,replace_result_url,version,created_at,updated_at FROM model_service_nodes`
 
 func (s *Store) ListModelNodes(ctx context.Context) ([]domain.ModelNode, error) {
 	rows, err := s.db.QueryContext(ctx, modelNodeSelect+` WHERE deleted_at IS NULL ORDER BY id`)
@@ -52,10 +52,10 @@ func (s *Store) CreateModelNode(ctx context.Context, input domain.ModelNodeInput
 	}
 	now := s.nowUnix()
 	values := nodePersistenceValues(input)
-	if _, err := conn.ExecContext(ctx, `INSERT INTO model_service_nodes(id,service_url,protocol_version,api_key_ciphertext,api_key_nonce,api_key_fingerprint,api_key_id,base_url,jobs_base_url,public_base_url,health_path,submit_api_name,check_api_name,poll_interval_ms,request_timeout_ms,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	if _, err := conn.ExecContext(ctx, `INSERT INTO model_service_nodes(id,service_url,protocol_version,api_key_ciphertext,api_key_nonce,api_key_fingerprint,api_key_id,base_url,jobs_base_url,public_base_url,health_path,submit_api_name,check_api_name,poll_interval_ms,request_timeout_ms,enabled,upstream_model,max_concurrency,replace_result_url,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		input.ID, values.serviceURL, values.protocolVersion, values.ciphertext, values.nonce, values.fingerprint, values.apiKeyID,
 		values.baseURL, values.jobsBaseURL, values.publicBaseURL, values.healthPath, values.submitAPIName, values.checkAPIName,
-		input.PollInterval.Milliseconds(), input.RequestTimeout.Milliseconds(), boolInt(input.Enabled), now, now); err != nil {
+		input.PollInterval.Milliseconds(), input.RequestTimeout.Milliseconds(), boolInt(input.Enabled), values.upstreamModel, values.maxConcurrency, boolInt(values.replaceResultURL), now, now); err != nil {
 		return domain.ModelNode{}, err
 	}
 	return scanModelNode(conn.QueryRowContext(ctx, modelNodeSelect+` WHERE id=? AND deleted_at IS NULL`, input.ID))
@@ -81,15 +81,19 @@ func (s *Store) UpdateModelNode(ctx context.Context, id string, expectedVersion 
 	if err != nil {
 		return domain.ModelNode{}, err
 	}
-	if active > 0 && !(current.Enabled && !input.Enabled && sameNodeConnection(current.ModelNodeInput, input)) {
+	allowedWhileActive := current.Enabled && !input.Enabled && sameNodeConnection(current.ModelNodeInput, input)
+	if active > 0 && current.Enabled && input.Enabled && current.UsesOfficialV2() && input.UsesOfficialV2() && sameOfficialConnectionExceptCapacity(current.ModelNodeInput, input) && input.MaxConcurrency > current.MaxConcurrency {
+		allowedWhileActive = true
+	}
+	if active > 0 && !allowedWhileActive {
 		return domain.ModelNode{}, domain.ErrNodeHasActiveTask
 	}
 	now := s.nowUnix()
 	values := nodePersistenceValues(input)
-	result, err := conn.ExecContext(ctx, `UPDATE model_service_nodes SET service_url=?,protocol_version=?,api_key_ciphertext=?,api_key_nonce=?,api_key_fingerprint=?,api_key_id=?,base_url=?,jobs_base_url=?,public_base_url=?,health_path=?,submit_api_name=?,check_api_name=?,poll_interval_ms=?,request_timeout_ms=?,enabled=?,version=version+1,updated_at=? WHERE id=? AND version=? AND deleted_at IS NULL`,
+	result, err := conn.ExecContext(ctx, `UPDATE model_service_nodes SET service_url=?,protocol_version=?,api_key_ciphertext=?,api_key_nonce=?,api_key_fingerprint=?,api_key_id=?,base_url=?,jobs_base_url=?,public_base_url=?,health_path=?,submit_api_name=?,check_api_name=?,poll_interval_ms=?,request_timeout_ms=?,enabled=?,upstream_model=?,max_concurrency=?,replace_result_url=?,version=version+1,updated_at=? WHERE id=? AND version=? AND deleted_at IS NULL`,
 		values.serviceURL, values.protocolVersion, values.ciphertext, values.nonce, values.fingerprint, values.apiKeyID,
 		values.baseURL, values.jobsBaseURL, values.publicBaseURL, values.healthPath, values.submitAPIName, values.checkAPIName,
-		input.PollInterval.Milliseconds(), input.RequestTimeout.Milliseconds(), boolInt(input.Enabled), now, id, expectedVersion)
+		input.PollInterval.Milliseconds(), input.RequestTimeout.Milliseconds(), boolInt(input.Enabled), values.upstreamModel, values.maxConcurrency, boolInt(values.replaceResultURL), now, id, expectedVersion)
 	if err := oneRow(result, err); err != nil {
 		if errors.Is(err, domain.ErrStateConflict) {
 			return domain.ModelNode{}, domain.ErrNodeVersionConflict
@@ -166,10 +170,10 @@ func (s *Store) ImportLegacyNodes(ctx context.Context, inputs []domain.ModelNode
 		now := s.nowUnix()
 		for _, input := range sorted {
 			values := nodePersistenceValues(input)
-			if _, err := conn.ExecContext(ctx, `INSERT INTO model_service_nodes(id,service_url,protocol_version,api_key_ciphertext,api_key_nonce,api_key_fingerprint,api_key_id,base_url,jobs_base_url,public_base_url,health_path,submit_api_name,check_api_name,poll_interval_ms,request_timeout_ms,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			if _, err := conn.ExecContext(ctx, `INSERT INTO model_service_nodes(id,service_url,protocol_version,api_key_ciphertext,api_key_nonce,api_key_fingerprint,api_key_id,base_url,jobs_base_url,public_base_url,health_path,submit_api_name,check_api_name,poll_interval_ms,request_timeout_ms,enabled,upstream_model,max_concurrency,replace_result_url,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 				input.ID, values.serviceURL, values.protocolVersion, values.ciphertext, values.nonce, values.fingerprint, values.apiKeyID,
 				values.baseURL, values.jobsBaseURL, values.publicBaseURL, values.healthPath, values.submitAPIName, values.checkAPIName,
-				input.PollInterval.Milliseconds(), input.RequestTimeout.Milliseconds(), boolInt(input.Enabled), now, now); err != nil {
+				input.PollInterval.Milliseconds(), input.RequestTimeout.Milliseconds(), boolInt(input.Enabled), values.upstreamModel, values.maxConcurrency, boolInt(values.replaceResultURL), now, now); err != nil {
 				return 0, false, err
 			}
 		}
@@ -195,24 +199,36 @@ func sameNodeConnection(left, right domain.ModelNodeInput) bool {
 			left.HealthPath == right.HealthPath && left.SubmitAPIName == right.SubmitAPIName && left.CheckAPIName == right.CheckAPIName &&
 			left.PollInterval == right.PollInterval && left.RequestTimeout == right.RequestTimeout
 	}
+	if left.ServiceURL != right.ServiceURL || left.ProtocolVersion != right.ProtocolVersion ||
+		left.APIKeyFingerprint != right.APIKeyFingerprint || left.PollInterval != right.PollInterval || left.RequestTimeout != right.RequestTimeout {
+		return false
+	}
+	if left.UsesOfficialV2() || right.UsesOfficialV2() {
+		return left.UpstreamModel == right.UpstreamModel && left.MaxConcurrency == right.MaxConcurrency && left.ReplaceResultURL == right.ReplaceResultURL
+	}
+	return true
+}
+
+func sameOfficialConnectionExceptCapacity(left, right domain.ModelNodeInput) bool {
 	return left.ServiceURL == right.ServiceURL && left.ProtocolVersion == right.ProtocolVersion &&
-		left.APIKeyFingerprint == right.APIKeyFingerprint &&
-		left.PollInterval == right.PollInterval && left.RequestTimeout == right.RequestTimeout
+		left.APIKeyFingerprint == right.APIKeyFingerprint && left.PollInterval == right.PollInterval && left.RequestTimeout == right.RequestTimeout &&
+		left.UpstreamModel == right.UpstreamModel && left.ReplaceResultURL == right.ReplaceResultURL
 }
 
 func scanModelNode(scanner rowScanner) (domain.ModelNode, error) {
 	var node domain.ModelNode
 	var compatibilityAPIKeyID string
-	var pollMS, timeoutMS, enabled, created, updated int64
+	var pollMS, timeoutMS, enabled, replaceResultURL, created, updated int64
 	err := scanner.Scan(&node.ID, &node.ServiceURL, &node.ProtocolVersion, &node.APIKeyCiphertext, &node.APIKeyNonce, &node.APIKeyFingerprint, &compatibilityAPIKeyID,
 		&node.BaseURL, &node.JobsBaseURL, &node.PublicBaseURL, &node.HealthPath, &node.SubmitAPIName, &node.CheckAPIName,
-		&pollMS, &timeoutMS, &enabled, &node.Version, &created, &updated)
+		&pollMS, &timeoutMS, &enabled, &node.UpstreamModel, &node.MaxConcurrency, &replaceResultURL, &node.Version, &created, &updated)
 	if err != nil {
 		return domain.ModelNode{}, err
 	}
 	node.PollInterval = durationMilliseconds(pollMS)
 	node.RequestTimeout = durationMilliseconds(timeoutMS)
 	node.Enabled = enabled == 1
+	node.ReplaceResultURL = replaceResultURL == 1
 	node.CreatedAt = unix(created)
 	node.UpdatedAt = unix(updated)
 	return node, nil
@@ -222,22 +238,34 @@ type persistedNodeValues struct {
 	serviceURL, protocolVersion                     string
 	baseURL, jobsBaseURL, publicBaseURL, healthPath string
 	submitAPIName, checkAPIName                     string
+	upstreamModel                                   string
+	maxConcurrency                                  int
+	replaceResultURL                                bool
 	ciphertext, nonce, fingerprint, apiKeyID        any
 }
 
 func nodePersistenceValues(input domain.ModelNodeInput) persistedNodeValues {
-	if input.UsesNodeAPI() {
+	if input.UsesNodeAPI() || input.UsesOfficialV2() {
+		maxConcurrency := input.MaxConcurrency
+		if input.UsesNodeAPI() || maxConcurrency == 0 {
+			maxConcurrency = 1
+		}
+		healthPath, apiName := "/internal/v1/health", "node_v1"
+		if input.UsesOfficialV2() {
+			healthPath, apiName = "/v2/query/video_generation", "minimax_v2"
+		}
 		return persistedNodeValues{
 			serviceURL: input.ServiceURL, protocolVersion: input.ProtocolVersion,
 			ciphertext: input.APIKeyCiphertext, nonce: input.APIKeyNonce, fingerprint: input.APIKeyFingerprint, apiKeyID: "",
 			baseURL: input.ServiceURL, jobsBaseURL: input.ServiceURL, publicBaseURL: input.ServiceURL,
-			healthPath: "/internal/v1/health", submitAPIName: "node_v1", checkAPIName: "node_v1",
+			healthPath: healthPath, submitAPIName: apiName, checkAPIName: apiName,
+			upstreamModel: input.UpstreamModel, maxConcurrency: maxConcurrency, replaceResultURL: input.ReplaceResultURL,
 		}
 	}
 	return persistedNodeValues{
 		serviceURL: input.BaseURL, protocolVersion: "legacy-gradio-v1",
 		ciphertext: nil, nonce: nil, baseURL: input.BaseURL, jobsBaseURL: input.JobsBaseURL, publicBaseURL: input.PublicBaseURL,
-		healthPath: input.HealthPath, submitAPIName: input.SubmitAPIName, checkAPIName: input.CheckAPIName,
+		healthPath: input.HealthPath, submitAPIName: input.SubmitAPIName, checkAPIName: input.CheckAPIName, maxConcurrency: 1,
 	}
 }
 

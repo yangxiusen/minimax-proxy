@@ -21,6 +21,9 @@ type ModelNodeInput struct {
 	APIKeyCiphertext  []byte
 	APIKeyNonce       []byte
 	APIKeyFingerprint string
+	UpstreamModel     string
+	MaxConcurrency    int
+	ReplaceResultURL  bool
 
 	// Legacy 字段只用于读取和运行升级前的 gradio-v1 节点。
 	ID             string
@@ -37,6 +40,10 @@ type ModelNodeInput struct {
 
 func (input ModelNodeInput) UsesNodeAPI() bool {
 	return input.ProtocolVersion == "h3-node-v1"
+}
+
+func (input ModelNodeInput) UsesOfficialV2() bool {
+	return input.ProtocolVersion == "minimax-v2"
 }
 
 type ModelNode struct {

@@ -12,9 +12,11 @@ import (
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
 	"minimax-h3-tc/internal/monitor"
+	"minimax-h3-tc/internal/official"
 	"minimax-h3-tc/internal/orchestrator"
 	"minimax-h3-tc/internal/scheduler"
 	"minimax-h3-tc/internal/upstream/gradio"
+	"minimax-h3-tc/internal/upstream/minimaxv2"
 	"minimax-h3-tc/internal/upstream/nodeapi"
 	"minimax-h3-tc/internal/worker"
 )
@@ -37,24 +39,32 @@ type NodeAPIClient interface {
 	CancelExecution(context.Context, string, string, string) (nodeapi.ExecutionReference, error)
 }
 
+type OfficialV2Client interface {
+	official.Client
+	List(context.Context) ([]minimaxv2.Task, error)
+}
+
 type RuntimeStore interface {
 	worker.Store
 	orchestrator.Store
+	official.Store
+	ListActiveOfficialTasks(context.Context, string) ([]domain.Task, error)
 }
 
 type NodeRuntimeFactory struct {
-	Store                RuntimeStore
-	Cache                *monitor.Cache
-	Profiles             map[string]config.GenerationProfile
-	ExecutionTimeout     time.Duration
-	MonitorInterval      time.Duration
-	Logger               *slog.Logger
-	Now                  func() time.Time
-	ClientFactory        func(config.UpstreamConfig) RuntimeClient
-	NodeSecrets          NodeSecretOpener
-	ArtifactMigrator     orchestrator.InputArtifactMigrator
-	NodeAPIClientFactory func(*url.URL, string, *http.Client, int64) NodeAPIClient
-	InputSpoolRoot       string
+	Store                 RuntimeStore
+	Cache                 *monitor.Cache
+	Profiles              map[string]config.GenerationProfile
+	ExecutionTimeout      time.Duration
+	MonitorInterval       time.Duration
+	Logger                *slog.Logger
+	Now                   func() time.Time
+	ClientFactory         func(config.UpstreamConfig) RuntimeClient
+	NodeSecrets           NodeSecretOpener
+	ArtifactMigrator      orchestrator.InputArtifactMigrator
+	NodeAPIClientFactory  func(*url.URL, string, *http.Client, int64) NodeAPIClient
+	OfficialClientFactory func(*url.URL, string, string, *http.Client, int64) OfficialV2Client
+	InputSpoolRoot        string
 }
 
 func (f NodeRuntimeFactory) Start(parent context.Context, node domain.ModelNode) (Runtime, error) {
@@ -70,6 +80,9 @@ func (f NodeRuntimeFactory) Start(parent context.Context, node domain.ModelNode)
 	}
 	if normalized.UsesNodeAPI() {
 		return f.startNodeAPI(parent, node, normalized, upstream)
+	}
+	if normalized.UsesOfficialV2() {
+		return f.startOfficialV2(parent, node, normalized, upstream)
 	}
 	logger := f.Logger
 	if logger == nil {
@@ -132,6 +145,131 @@ func (f NodeRuntimeFactory) Start(parent context.Context, node domain.ModelNode)
 		close(done)
 	}()
 	return &nodeRuntime{cancel: cancel, done: done, wake: dispatcher.Wake}, nil
+}
+
+func (f NodeRuntimeFactory) startOfficialV2(parent context.Context, node domain.ModelNode, input domain.ModelNodeInput, upstream config.UpstreamConfig) (Runtime, error) {
+	if f.NodeSecrets == nil {
+		return nil, errors.New("官方节点 API Key 解密器未配置")
+	}
+	apiKey, err := f.NodeSecrets.Open(input.APIKeyNonce, input.APIKeyCiphertext)
+	if err != nil {
+		return nil, errors.New("官方节点 API Key 解密失败")
+	}
+	if err := f.initializeSnapshot(parent, node, input, upstream); err != nil {
+		return nil, err
+	}
+	factory := f.OfficialClientFactory
+	if factory == nil {
+		factory = func(serviceURL *url.URL, apiKey, model string, client *http.Client, maxBody int64) OfficialV2Client {
+			return minimaxv2.NewClient(serviceURL, apiKey, model, client, maxBody)
+		}
+	}
+	client := factory(upstream.ServiceURL, apiKey, input.UpstreamModel, &http.Client{Timeout: upstream.RequestTimeout}, 1<<20)
+	if client == nil {
+		return nil, errors.New("官方节点 API 客户端未创建")
+	}
+	processor := &official.Processor{
+		Store: f.Store, Client: client, NodeID: node.ID, NodeVersion: node.Version,
+		Capacity: input.MaxConcurrency, PollInterval: input.PollInterval, Now: f.Now,
+	}
+	maxHealthAge := upstream.RequestTimeout + monitorInterval(f.MonitorInterval)
+	slots := make([]scheduler.Slot, input.MaxConcurrency)
+	for index := range slots {
+		slots[index] = scheduler.Slot{
+			ID: node.ID, Processor: processor,
+			Health: func(context.Context) error {
+				if !input.Enabled {
+					return domain.ErrNodeDisabled
+				}
+				return cachedOfficialSchedulable(f.Cache, node.ID, runtimeNow(f.Now), maxHealthAge)
+			},
+		}
+	}
+	dispatcher := scheduler.New(slots, time.Second, f.Logger)
+	nodeCtx, cancel := context.WithCancel(parent)
+	probeWake := make(chan struct{}, 1)
+	done := make(chan struct{})
+	active, err := f.Store.ListActiveOfficialTasks(parent, node.ID)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	var group sync.WaitGroup
+	group.Add(2 + len(active))
+	go func() { defer group.Done(); dispatcher.Run(nodeCtx) }()
+	go func() { defer group.Done(); f.runOfficialProbe(nodeCtx, node.ID, input.Enabled, client, probeWake) }()
+	for _, current := range active {
+		task := current
+		go func() {
+			defer group.Done()
+			if err := processor.ProcessTask(nodeCtx, task); err != nil && nodeCtx.Err() == nil {
+				logger := f.Logger
+				if logger == nil {
+					logger = slog.Default()
+				}
+				logger.ErrorContext(nodeCtx, "恢复官方任务失败", "upstream_id", node.ID, "task_id", task.TaskID, "error_code", "official_recovery_failed")
+			}
+		}()
+	}
+	go func() { group.Wait(); close(done) }()
+	return &nodeRuntime{cancel: cancel, done: done, wake: func() {
+		select {
+		case probeWake <- struct{}{}:
+		default:
+		}
+		dispatcher.Wake()
+	}}, nil
+}
+
+func (f NodeRuntimeFactory) runOfficialProbe(ctx context.Context, nodeID string, enabled bool, client OfficialV2Client, wake <-chan struct{}) {
+	interval := monitorInterval(f.MonitorInterval)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		f.probeOfficial(ctx, nodeID, enabled, client)
+		select {
+		case <-ctx.Done():
+			return
+		case <-wake:
+		case <-ticker.C:
+		}
+	}
+}
+
+func (f NodeRuntimeFactory) probeOfficial(parent context.Context, nodeID string, enabled bool, client OfficialV2Client) {
+	if parent.Err() != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(parent, monitorInterval(f.MonitorInterval))
+	defer cancel()
+	_, err := client.List(ctx)
+	active, activeErr := f.Store.ListActiveOfficialTasks(ctx, nodeID)
+	if err == nil {
+		err = activeErr
+	}
+	now := runtimeNow(f.Now)
+	f.Cache.Update(nodeID, func(snapshot *monitor.NodeSnapshot) {
+		snapshot.Applying = false
+		snapshot.Disabled = !enabled
+		snapshot.CheckedAt = now
+		snapshot.UpdatedAt = now
+		snapshot.CurrentTask = nil
+		if err != nil {
+			snapshot.Health = monitor.HealthUnhealthy
+			snapshot.Runtime = monitor.RuntimeUnknown
+			snapshot.LastError = &monitor.ErrorSnapshot{Code: "official_api_unhealthy"}
+			return
+		}
+		snapshot.Health = monitor.HealthHealthy
+		snapshot.LastHealthyAt = now
+		snapshot.LastError = nil
+		snapshot.Runtime = monitor.RuntimeIdle
+		if len(active) > 0 {
+			snapshot.Runtime = monitor.RuntimeRunning
+			task := active[0]
+			snapshot.CurrentTask = &monitor.CurrentTaskSnapshot{ID: task.TaskID, Status: string(task.Status.V2()), StartedAt: task.StartedAt}
+		}
+	})
 }
 
 func (f NodeRuntimeFactory) initializeSnapshot(ctx context.Context, node domain.ModelNode, input domain.ModelNodeInput, upstream config.UpstreamConfig) error {
@@ -453,6 +591,14 @@ func cachedSchedulable(cache *monitor.Cache, id string, now time.Time, maxAge ti
 	}
 	if node.SchedulingBlocked || node.Runtime == monitor.RuntimeRunning || node.PrivateQueue != nil && *node.PrivateQueue > 0 {
 		return errors.New("私有实例仍有任务运行")
+	}
+	return nil
+}
+
+func cachedOfficialSchedulable(cache *monitor.Cache, id string, now time.Time, maxAge time.Duration) error {
+	node, ok := cache.Get(id)
+	if !ok || node.Disabled || node.Applying || node.Health != monitor.HealthHealthy || node.CheckedAt.IsZero() || node.CheckedAt.Before(now.Add(-maxAge)) {
+		return errors.New("官方节点健康状态不可用或已过期")
 	}
 	return nil
 }

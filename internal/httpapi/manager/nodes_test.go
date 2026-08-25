@@ -26,12 +26,19 @@ type nodeStoreStub struct {
 	updateErr   error
 	deleteErr   error
 	createCalls int
+	activeTasks map[string]int
 }
 
 func (s *nodeStoreStub) ListModelNodes(context.Context) ([]domain.ModelNode, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]domain.ModelNode(nil), s.items...), nil
+}
+
+func (s *nodeStoreStub) ActiveOfficialCount(_ context.Context, nodeID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.activeTasks[nodeID], nil
 }
 
 func (s *nodeStoreStub) GetModelNode(_ context.Context, id string) (domain.ModelNode, error) {
@@ -279,6 +286,42 @@ func TestDeprecatedNodeAPIKeyIDIsRejected(t *testing.T) {
 	cookie := login(t, h, "admin", "secret", "192.0.2.5:1")
 	response := serve(h, http.MethodPost, "/manager/api/nodes", `{"id":"node-1","api_key_id":"proxy"}`, "application/json", cookie, "192.0.2.5:1", false)
 	assertManagerError(t, response, http.StatusBadRequest, "bad_request_error")
+}
+
+func TestOfficialV2NodeAcceptsProtocolSpecificFieldsAndKey(t *testing.T) {
+	store := &nodeStoreStub{}
+	h := testHandler(Dependencies{
+		Admin: config.AdminConfig{Username: "admin", Password: "secret", SessionTTL: time.Hour}, Nodes: store, NodeSecrets: testNodeSecrets{},
+	})
+	cookie := login(t, h, "admin", "secret", "192.0.2.9:1")
+	body := `{"id":"official-1","service_url":"https://api.example.com","protocol_version":"minimax-v2","api_key":"sk-official-key-with-symbols._-","upstream_model":"MiniMax-H3-Custom","max_concurrency":3,"replace_result_url":false,"poll_interval":"3s","request_timeout":"30s","enabled":true}`
+	response := serve(h, http.MethodPost, "/manager/api/nodes", body, "application/json", cookie, "192.0.2.9:1", false)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if store.created.ProtocolVersion != "minimax-v2" || store.created.UpstreamModel != "MiniMax-H3-Custom" || store.created.MaxConcurrency != 3 || store.created.ReplaceResultURL {
+		t.Fatalf("created=%+v", store.created)
+	}
+	var dto nodeDTO
+	decodeResponse(t, response, &dto)
+	if dto.UpstreamModel != "MiniMax-H3-Custom" || dto.MaxConcurrency != 3 || dto.ReplaceResultURL {
+		t.Fatalf("dto=%+v", dto)
+	}
+}
+
+func TestOfficialV2NodeRejectsEmptyOrControlKey(t *testing.T) {
+	h := testHandler(Dependencies{Admin: config.AdminConfig{Username: "admin", Password: "secret", SessionTTL: time.Hour}, Nodes: &nodeStoreStub{}, NodeSecrets: testNodeSecrets{}})
+	cookie := login(t, h, "admin", "secret", "192.0.2.10:1")
+	for _, key := range []string{"", "bad\nkey"} {
+		value := map[string]any{
+			"id": "official-1", "service_url": "https://api.example.com", "protocol_version": "minimax-v2", "api_key": key,
+			"upstream_model": "MiniMax-H3", "max_concurrency": 3, "replace_result_url": false,
+			"poll_interval": "3s", "request_timeout": "30s", "enabled": true,
+		}
+		data, _ := json.Marshal(value)
+		response := serve(h, http.MethodPost, "/manager/api/nodes", string(data), "application/json", cookie, "192.0.2.10:1", false)
+		assertManagerError(t, response, http.StatusBadRequest, "bad_request_error")
+	}
 }
 
 func assertManagerError(t *testing.T, response interface{ Result() *http.Response }, status int, kind string) {

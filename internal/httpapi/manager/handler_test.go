@@ -26,20 +26,23 @@ import (
 )
 
 type taskStoreStub struct {
-	mu            sync.Mutex
-	filter        domain.AdminTaskFilter
-	items         []domain.AdminTaskSummary
-	total         int
-	err           error
-	cancelledTask string
-	deletedTask   string
-	cancelError   error
-	deleteError   error
-	detail        domain.AdminTaskDetail
-	detailError   error
-	locations     []domain.TaskArtifactLocation
-	inputFile     domain.InputSpoolFile
-	inputFileErr  error
+	mu               sync.Mutex
+	filter           domain.AdminTaskFilter
+	items            []domain.AdminTaskSummary
+	total            int
+	err              error
+	cancelledTask    string
+	deletedTask      string
+	cancelError      error
+	deleteError      error
+	detail           domain.AdminTaskDetail
+	detailError      error
+	locations        []domain.TaskArtifactLocation
+	inputFile        domain.InputSpoolFile
+	inputFileErr     error
+	uploadJob        domain.ResultUploadJob
+	uploadRetryError error
+	uploadRetryTask  string
 }
 
 type managerSignerSpy struct {
@@ -154,6 +157,31 @@ func TestManagerScriptGuardsTaskRenderingWithRequestGeneration(t *testing.T) {
 		if !strings.Contains(source, expected) {
 			t.Errorf("manager.js missing stale task response guard %q", expected)
 		}
+	}
+}
+
+func TestManagerScriptUsesCapacityOnlyDetailForOfficialNodes(t *testing.T) {
+	script, err := webAssets.ReadFile("web/manager.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	styles, err := webAssets.ReadFile("web/styles.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(script)
+	for _, expected := range []string{
+		`node.protocol_version === "minimax-v2"`,
+		`官方节点 · ${nodeCapacityText(node)}`,
+		`makeElement("span", "box-label", "运行任务")`,
+		`elements.nodeDetail.replaceChildren(head, capacity)`,
+	} {
+		if !strings.Contains(source, expected) {
+			t.Errorf("manager.js missing official capacity behavior %q", expected)
+		}
+	}
+	if !strings.Contains(string(styles), ".official-capacity") {
+		t.Error("styles.css missing official capacity style")
 	}
 }
 
@@ -494,6 +522,24 @@ func (s *taskStoreStub) ListAdminTasks(_ context.Context, filter domain.AdminTas
 	return s.items, s.total, s.err
 }
 
+func (s *taskStoreStub) GetResultUploadJob(context.Context, string) (domain.ResultUploadJob, error) {
+	if s.uploadJob.ID == "" {
+		return domain.ResultUploadJob{}, domain.ErrResultUploadNotFound
+	}
+	return s.uploadJob, nil
+}
+
+func (s *taskStoreStub) RetryResultUpload(_ context.Context, taskID string) error {
+	s.uploadRetryTask = taskID
+	if s.uploadRetryError != nil {
+		return s.uploadRetryError
+	}
+	s.uploadJob.Status = domain.UploadPending
+	s.uploadJob.RoundNo++
+	s.uploadJob.AttemptNo = 0
+	return nil
+}
+
 func TestSessionLoginIsStrictAndLogoutInvalidatesCookie(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0)
 	h := testHandler(Dependencies{
@@ -757,6 +803,43 @@ func TestSnapshotMapsOnlyWhitelistedFieldsAndSummarizesNodes(t *testing.T) {
 	}
 }
 
+func TestSnapshotIncludesOfficialNodeProtocolAndCapacity(t *testing.T) {
+	updated := time.Unix(2_000_000_100, 0)
+	cache := monitorcache.NewCache([]monitorcache.NodeSnapshot{
+		{ID: "internal-1", Health: monitorcache.HealthHealthy, Runtime: monitorcache.RuntimeIdle, UpdatedAt: updated},
+		{ID: "official-1", Health: monitorcache.HealthHealthy, Runtime: monitorcache.RuntimeRunning, UpdatedAt: updated},
+	})
+	nodes := &nodeStoreStub{
+		items: []domain.ModelNode{
+			{ModelNodeInput: domain.ModelNodeInput{ID: "internal-1", ProtocolVersion: "h3-node-v1", MaxConcurrency: 1}},
+			{ModelNodeInput: domain.ModelNodeInput{ID: "official-1", ProtocolVersion: "minimax-v2", MaxConcurrency: 3}},
+		},
+		activeTasks: map[string]int{"official-1": 1},
+	}
+	h := testHandler(Dependencies{Admin: config.AdminConfig{Username: "a", Password: "b", SessionTTL: time.Hour}, Cache: cache, Nodes: nodes})
+	cookie := login(t, h, "a", "b", "198.51.100.2:1")
+	response := serve(h, http.MethodGet, "/manager/api/snapshot", "", "", cookie, "198.51.100.2:1", false)
+
+	var body struct {
+		Upstreams []struct {
+			ID              string `json:"id"`
+			ProtocolVersion string `json:"protocol_version"`
+			ActiveTasks     int    `json:"active_tasks"`
+			MaxConcurrency  int    `json:"max_concurrency"`
+		} `json:"upstreams"`
+	}
+	decodeResponse(t, response, &body)
+	if response.Code != http.StatusOK || len(body.Upstreams) != 2 {
+		t.Fatalf("status=%d body=%+v", response.Code, body)
+	}
+	if body.Upstreams[0].ProtocolVersion != "h3-node-v1" || body.Upstreams[0].ActiveTasks != 0 || body.Upstreams[0].MaxConcurrency != 1 {
+		t.Fatalf("internal=%+v", body.Upstreams[0])
+	}
+	if body.Upstreams[1].ProtocolVersion != "minimax-v2" || body.Upstreams[1].ActiveTasks != 1 || body.Upstreams[1].MaxConcurrency != 3 {
+		t.Fatalf("official=%+v", body.Upstreams[1])
+	}
+}
+
 func TestTasksValidatesFiltersAndReturnsMinimalShape(t *testing.T) {
 	created := time.Unix(2_000_000_000, 0)
 	started := created.Add(10 * time.Minute)
@@ -777,7 +860,7 @@ func TestTasksValidatesFiltersAndReturnsMinimalShape(t *testing.T) {
 	decodeResponse(t, response, &raw)
 	items := raw["items"].([]any)
 	item := items[0].(map[string]any)
-	if len(item) != 13 || item["id"] != "task-1" || item["created_at"] != float64(created.Unix()) || item["duration_seconds"] != float64(65) || item["phase"] != "retrying" || item["retry_count"] != float64(1) || item["can_cancel"] != true || item["can_delete"] != false || item["video_url"] != nil || raw["page_num"] != float64(2) || raw["page_size"] != float64(20) {
+	if len(item) != 18 || item["id"] != "task-1" || item["created_at"] != float64(created.Unix()) || item["duration_seconds"] != float64(65) || item["phase"] != "retrying" || item["retry_count"] != float64(1) || item["can_cancel"] != true || item["can_delete"] != false || item["video_url"] != nil || item["result_delivery_status"] != "not_required" || item["can_retry_upload"] != false || raw["page_num"] != float64(2) || raw["page_size"] != float64(20) {
 		t.Fatalf("body=%v", raw)
 	}
 	for _, forbidden := range []string{"duration", "started_at", "finished_at", "request_json", "result_internal_url"} {
@@ -908,6 +991,27 @@ func TestTaskActionsRequireSessionAndMapStoreResults(t *testing.T) {
 	store.deleteError = domain.ErrTaskNotFound
 	if response := serve(h, http.MethodDelete, "/manager/api/tasks/task-2", "", "", cookie, "203.0.113.2:1", false); response.Code != http.StatusNotFound {
 		t.Fatalf("not found status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestRetryResultUploadStartsNewRound(t *testing.T) {
+	store := &taskStoreStub{uploadJob: domain.ResultUploadJob{ID: "upload-1", TaskID: "task-1", Status: domain.UploadFailed, RoundNo: 1, AttemptNo: 3}}
+	h := testHandler(Dependencies{Admin: config.AdminConfig{Username: "a", Password: "b", SessionTTL: time.Hour}, Store: store})
+	cookie := login(t, h, "a", "b", "203.0.113.21:1")
+	response := serve(h, http.MethodPost, "/manager/api/tasks/task-1/result-upload/retry", "", "", cookie, "203.0.113.21:1", false)
+	if response.Code != http.StatusAccepted || store.uploadRetryTask != "task-1" {
+		t.Fatalf("status=%d task=%q body=%s", response.Code, store.uploadRetryTask, response.Body.String())
+	}
+	var body map[string]any
+	decodeResponse(t, response, &body)
+	if body["result_delivery_status"] != "pending" || body["result_upload_round"] != float64(2) || body["result_upload_attempts"] != float64(0) {
+		t.Fatalf("body=%v", body)
+	}
+
+	store.uploadRetryError = domain.ErrResultUploadNotRetryable
+	conflict := serve(h, http.MethodPost, "/manager/api/tasks/task-1/result-upload/retry", "", "", cookie, "203.0.113.21:1", false)
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", conflict.Code, conflict.Body.String())
 	}
 }
 

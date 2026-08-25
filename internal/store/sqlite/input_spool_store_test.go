@@ -15,8 +15,8 @@ func TestMigrationV15CreatesInputSpoolFiles(t *testing.T) {
 	if err := store.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil {
 		t.Fatalf("query user_version: %v", err)
 	}
-	if userVersion != 15 {
-		t.Fatalf("user_version=%d, want 15", userVersion)
+	if userVersion != 16 {
+		t.Fatalf("user_version=%d, want 16", userVersion)
 	}
 	var migrationCount int
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=15`).Scan(&migrationCount); err != nil {

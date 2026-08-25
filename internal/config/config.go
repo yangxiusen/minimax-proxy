@@ -92,17 +92,20 @@ func (key *APIKeyConfig) UnmarshalYAML(node *yaml.Node) error {
 }
 
 type UpstreamConfig struct {
-	ID              string
-	ServiceURL      *url.URL
-	ProtocolVersion string
-	BaseURL         *url.URL
-	JobsBaseURL     *url.URL
-	PublicBaseURL   *url.URL
-	HealthPath      string
-	SubmitAPIName   string
-	CheckAPIName    string
-	PollInterval    time.Duration
-	RequestTimeout  time.Duration
+	ID               string
+	ServiceURL       *url.URL
+	ProtocolVersion  string
+	BaseURL          *url.URL
+	JobsBaseURL      *url.URL
+	PublicBaseURL    *url.URL
+	HealthPath       string
+	SubmitAPIName    string
+	CheckAPIName     string
+	PollInterval     time.Duration
+	RequestTimeout   time.Duration
+	UpstreamModel    string
+	MaxConcurrency   int
+	ReplaceResultURL bool
 }
 
 type LegacyUpstreamConfig struct {

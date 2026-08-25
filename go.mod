@@ -3,6 +3,7 @@ module minimax-h3-tc
 go 1.26
 
 require (
+	github.com/ufilesdk-dev/ufile-gosdk v1.0.7
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.54.0
 )

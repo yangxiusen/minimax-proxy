@@ -10,7 +10,7 @@
 <body>
   <header class="topbar">
     <strong class="brand">MiniMax H3 管理后台</strong>
-    <div class="session-info"><span id="freshness" class="freshness loading">正在加载</span><span>管理员</span><button id="open-api-keys" type="button">密钥管理</button><button id="open-profile-config" type="button">模型请求参数</button><button id="open-cleanup" type="button">视频清理</button><button id="open-node-config" type="button">节点配置</button><button id="logout" class="link-button" type="button">退出</button></div>
+    <div class="session-info"><span id="freshness" class="freshness loading">正在加载</span><span>管理员</span><button id="open-object-storage" type="button">对象存储</button><button id="open-api-keys" type="button">密钥管理</button><button id="open-profile-config" type="button">模型请求参数</button><button id="open-cleanup" type="button">视频清理</button><button id="open-node-config" type="button">节点配置</button><button id="logout" class="link-button" type="button">退出</button></div>
   </header>
   <main class="console">
     <p class="section-label">全部任务</p>
@@ -94,9 +94,14 @@
           <label><span>节点 ID</span><input name="id" maxlength="64" pattern="[A-Za-z0-9._\-]{1,64}" title="节点 ID 仅支持 1 至 64 位字母、数字、点、下划线或短横线" placeholder="gpu-1" autocomplete="off" required></label>
           <label><span>模型服务地址</span><input name="service_url" type="url" placeholder="https://model.example.com:7860" autocomplete="off" required></label>
           <div class="form-grid">
-            <label><span>协议版本</span><select name="protocol_version"><option value="h3-node-v1">h3-node-v1</option></select></label>
+            <label><span>协议版本</span><select name="protocol_version"><option value="h3-node-v1">内部节点协议</option><option value="minimax-v2">官方 V2 协议</option></select></label>
             <label><span>轮询间隔</span><input name="poll_interval" value="3s" required></label>
             <label><span>请求超时</span><input name="request_timeout" value="30s" required></label>
+          </div>
+          <div id="official-node-fields" class="official-node-fields" hidden>
+            <label><span>官方模型</span><input name="upstream_model" maxlength="128" value="MiniMax-H3" autocomplete="off"></label>
+            <label><span>并发数</span><input name="max_concurrency" type="number" min="1" max="100" value="1" inputmode="numeric"></label>
+            <label class="toggle-control"><input name="replace_result_url" type="checkbox"><span>使用 UCloud 替换生成地址</span></label>
           </div>
           <label><span>API Key</span><input name="api_key" type="password" minlength="32" maxlength="32" pattern="[A-Za-z0-9]{32}" autocomplete="new-password" placeholder="编辑时留空表示沿用已保存 Key" required></label>
           <label class="toggle-control"><input name="enabled" type="checkbox" checked><span>启用节点</span></label>
@@ -109,6 +114,25 @@
           </footer>
         </form>
       </div>
+    </div>
+  </dialog>
+
+  <dialog id="object-storage-dialog" class="config-dialog storage-dialog">
+    <div class="dialog-shell">
+      <header class="dialog-head"><h2>UCloud 对象存储</h2><button id="close-object-storage" class="icon-button" type="button" title="关闭" aria-label="关闭">×</button></header>
+      <form id="object-storage-form" class="storage-form" novalidate>
+        <input name="version" type="hidden">
+        <div class="form-grid">
+          <label><span>Bucket</span><input name="bucket_name" maxlength="63" autocomplete="off" required></label>
+          <label><span>请求超时</span><input name="request_timeout" value="30m" required></label>
+        </div>
+        <label><span>File Host</span><input name="file_host" type="url" placeholder="https://bucket.region.ufileos.com" autocomplete="off" required></label>
+        <label><span>公开访问地址</span><input name="public_base_url" type="url" placeholder="https://cdn.example.com" autocomplete="off" required></label>
+        <label><span>Public Key</span><input name="public_key" type="password" autocomplete="new-password" placeholder="编辑时留空表示沿用已保存 Key"></label>
+        <label><span>Private Key</span><input name="private_key" type="password" autocomplete="new-password" placeholder="编辑时留空表示沿用已保存 Key"></label>
+        <p id="object-storage-status" class="form-status" aria-live="polite"></p>
+        <footer class="form-actions"><span class="action-spacer"></span><button id="test-object-storage" type="button">测试连接</button><button id="save-object-storage" class="primary-button" type="submit">保存</button></footer>
+      </form>
     </div>
   </dialog>
 

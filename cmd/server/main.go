@@ -22,10 +22,14 @@ import (
 	"minimax-h3-tc/internal/httpapi/v2"
 	"minimax-h3-tc/internal/inputspool"
 	monitorcache "minimax-h3-tc/internal/monitor"
+	"minimax-h3-tc/internal/objectstore"
+	objectucloud "minimax-h3-tc/internal/objectstore/ucloud"
 	"minimax-h3-tc/internal/orchestrator"
 	profileservice "minimax-h3-tc/internal/profile"
+	"minimax-h3-tc/internal/resultdelivery"
 	"minimax-h3-tc/internal/secretbox"
 	storepkg "minimax-h3-tc/internal/store/sqlite"
+	"minimax-h3-tc/internal/upstream/minimaxv2"
 	upstreamregistry "minimax-h3-tc/internal/upstream/registry"
 )
 
@@ -143,12 +147,25 @@ func run(configPath string, logger *slog.Logger) error {
 	profileService := profileservice.New(store, profileservice.CapabilityMatcher{Source: profileservice.RuntimeCapabilitySource{Nodes: store, Cache: cache}}, nil)
 	managerHandler := managerapi.NewHandler(managerapi.Dependencies{
 		Admin: cfg.Admin, Cache: cache, Store: store, Nodes: store, Logger: logger, Wake: nodeRegistry.Wake, NodeSecrets: nodeSecrets,
+		ObjectStorage:  store,
 		ProfileService: profileService,
 		Cleanups:       store,
 		APIKeyService:  apiKeyService,
 		ArtifactURLs:   artifactService,
 		InputSpooler:   inputSpooler,
 		ProbeNode: func(ctx context.Context, input managerapi.NodeProbeInput) managerapi.NodeProbeResult {
+			if input.Node.UsesOfficialV2() {
+				_, upstream, err := config.NormalizeModelNode(input.Node)
+				if err != nil {
+					return managerapi.NodeProbeResult{Checks: []managerapi.NodeCheck{{Name: "official_api", Status: "failed", ErrorCode: "node_config_invalid"}}}
+				}
+				client := minimaxv2.NewClient(upstream.ServiceURL, input.APIKey, input.Node.UpstreamModel, &http.Client{Timeout: upstream.RequestTimeout}, 1<<20)
+				_, err = client.List(ctx)
+				if err != nil {
+					return managerapi.NodeProbeResult{ProtocolVersion: minimaxv2.ProtocolVersion, Checks: []managerapi.NodeCheck{{Name: "official_api", Status: "failed", ErrorCode: "official_api_unhealthy"}}}
+				}
+				return managerapi.NodeProbeResult{Reachable: true, Authenticated: true, ProtocolVersion: minimaxv2.ProtocolVersion, Checks: []managerapi.NodeCheck{{Name: "official_api", Status: "passed"}}, Capabilities: map[string]any{"model": input.Node.UpstreamModel, "max_concurrency": input.Node.MaxConcurrency}}
+			}
 			result := prober.ProbeNodeAPI(ctx, input.Node, input.APIKey)
 			checks := []managerapi.NodeCheck{
 				{Name: "health", Status: probeCheckStatus(result.HealthErrorCode), ErrorCode: result.HealthErrorCode},
@@ -158,6 +175,17 @@ func run(configPath string, logger *slog.Logger) error {
 				Reachable: result.Reachable, Authenticated: result.Authenticated, ProtocolVersion: result.ProtocolVersion,
 				Checks: checks, Capabilities: result.Capabilities,
 			}
+		},
+		ProbeObjectStorage: func(ctx context.Context, input managerapi.ObjectStorageProbeInput) managerapi.ObjectStorageProbeResult {
+			client := &http.Client{Timeout: input.Config.RequestTimeout}
+			store, err := objectucloud.New(objectucloud.Config{BucketName: input.Config.BucketName, FileHost: input.Config.FileHost, PublicBaseURL: input.Config.PublicBaseURL, PublicKey: input.PublicKey, PrivateKey: input.PrivateKey, Client: client})
+			if err == nil {
+				err = store.Probe(ctx)
+			}
+			if err != nil {
+				return managerapi.ObjectStorageProbeResult{Checks: []managerapi.NodeCheck{{Name: "public_read", Status: "failed", ErrorCode: "object_storage_probe_failed"}}}
+			}
+			return managerapi.ObjectStorageProbeResult{Passed: true, Checks: []managerapi.NodeCheck{{Name: "public_read", Status: "passed"}}}
 		},
 	})
 	v2Handler := v2.NewHandler(v2.Dependencies{Store: store, Authenticator: keyAuthenticator, Profiles: cfg.GenerationProfiles, Logger: logger, Wake: nodeRegistry.Wake, Available: available, CallbackService: callbackService, CallbackCipher: nodeSecrets, ActiveProfiles: store, ArtifactURLs: artifactService, InputSpooler: inputSpooler})
@@ -173,6 +201,18 @@ func run(configPath string, logger *slog.Logger) error {
 	go (cleaner.Cleaner{Store: store, Interval: time.Hour, BatchSize: 100, Logger: logger}).Run(ctx)
 	go (cleanupworker.Worker{Store: store, Secrets: nodeSecrets, Logger: logger}).Run(ctx)
 	go apiKeyService.Run(ctx, time.Second)
+	go func() {
+		uploadWorker := resultdelivery.Worker{
+			Store: store, Secrets: nodeSecrets, Logger: logger,
+			Downloader: resultdelivery.Downloader{MaxBytes: resultdelivery.DefaultMaxVideoBytes},
+			ObjectStoreFactory: func(storage domain.ObjectStorageConfig, publicKey, privateKey string) (objectstore.Store, error) {
+				return objectucloud.New(objectucloud.Config{BucketName: storage.BucketName, FileHost: storage.FileHost, PublicBaseURL: storage.PublicBaseURL, PublicKey: publicKey, PrivateKey: privateKey, Client: &http.Client{Timeout: storage.RequestTimeout}})
+			},
+		}
+		if err := uploadWorker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("结果上传工作器已停止", "stage", "result_delivery", "error_code", "result_delivery_worker_stopped")
+		}
+	}()
 	go func() {
 		worker := callbackservice.Worker{Store: callbackStore, Service: callbackService, Logger: logger}
 		if err := worker.Run(ctx, time.Second); err != nil && !errors.Is(err, context.Canceled) {

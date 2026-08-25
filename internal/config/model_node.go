@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"minimax-h3-tc/internal/domain"
 )
@@ -33,8 +35,27 @@ func normalizeNodeAPIModelNode(input domain.ModelNodeInput) (domain.ModelNodeInp
 	if input.ProtocolVersion == "" {
 		input.ProtocolVersion = "h3-node-v1"
 	}
-	if input.ProtocolVersion != "h3-node-v1" {
-		return domain.ModelNodeInput{}, UpstreamConfig{}, fmt.Errorf("protocol_version 仅支持 h3-node-v1")
+	if input.ProtocolVersion != "h3-node-v1" && input.ProtocolVersion != "minimax-v2" {
+		return domain.ModelNodeInput{}, UpstreamConfig{}, fmt.Errorf("protocol_version 仅支持 h3-node-v1 或 minimax-v2")
+	}
+	if input.ProtocolVersion == "minimax-v2" && serviceURL.Scheme != "https" {
+		return domain.ModelNodeInput{}, UpstreamConfig{}, fmt.Errorf("minimax-v2 service_url 必须使用 HTTPS")
+	}
+	if input.ProtocolVersion == "h3-node-v1" {
+		if strings.TrimSpace(input.UpstreamModel) != "" || input.MaxConcurrency > 1 || input.ReplaceResultURL {
+			return domain.ModelNodeInput{}, UpstreamConfig{}, fmt.Errorf("官方协议专属字段不能用于 h3-node-v1")
+		}
+		input.UpstreamModel = ""
+		input.MaxConcurrency = 1
+		input.ReplaceResultURL = false
+	} else {
+		input.UpstreamModel = strings.TrimSpace(input.UpstreamModel)
+		if count := utf8.RuneCountInString(input.UpstreamModel); count < 1 || count > 128 || strings.IndexFunc(input.UpstreamModel, unicode.IsControl) >= 0 {
+			return domain.ModelNodeInput{}, UpstreamConfig{}, fmt.Errorf("upstream_model 必须是 1 至 128 个无控制字符的文本")
+		}
+		if input.MaxConcurrency < 1 || input.MaxConcurrency > 100 {
+			return domain.ModelNodeInput{}, UpstreamConfig{}, fmt.Errorf("max_concurrency 必须在 1 到 100 之间")
+		}
 	}
 	if err := validateNodeDurations(input); err != nil {
 		return domain.ModelNodeInput{}, UpstreamConfig{}, err
@@ -43,6 +64,7 @@ func normalizeNodeAPIModelNode(input domain.ModelNodeInput) (domain.ModelNodeInp
 	return input, UpstreamConfig{
 		ID: input.ID, ServiceURL: serviceURL, ProtocolVersion: input.ProtocolVersion,
 		PollInterval: input.PollInterval, RequestTimeout: input.RequestTimeout,
+		UpstreamModel: input.UpstreamModel, MaxConcurrency: input.MaxConcurrency, ReplaceResultURL: input.ReplaceResultURL,
 	}, nil
 }
 

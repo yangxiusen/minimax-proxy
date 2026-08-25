@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
@@ -20,15 +21,18 @@ import (
 const nodeRequestBodyLimit = 64 << 10
 
 type nodeRequest struct {
-	ID              string  `json:"id"`
-	ServiceURL      string  `json:"service_url"`
-	ProtocolVersion string  `json:"protocol_version"`
-	APIKey          *string `json:"api_key,omitempty"`
-	UseStoredAPIKey bool    `json:"use_stored_api_key,omitempty"`
-	PollInterval    string  `json:"poll_interval"`
-	RequestTimeout  string  `json:"request_timeout"`
-	Enabled         *bool   `json:"enabled"`
-	Version         *int64  `json:"version"`
+	ID               string  `json:"id"`
+	ServiceURL       string  `json:"service_url"`
+	ProtocolVersion  string  `json:"protocol_version"`
+	APIKey           *string `json:"api_key,omitempty"`
+	UpstreamModel    string  `json:"upstream_model,omitempty"`
+	MaxConcurrency   *int    `json:"max_concurrency,omitempty"`
+	ReplaceResultURL *bool   `json:"replace_result_url,omitempty"`
+	UseStoredAPIKey  bool    `json:"use_stored_api_key,omitempty"`
+	PollInterval     string  `json:"poll_interval"`
+	RequestTimeout   string  `json:"request_timeout"`
+	Enabled          *bool   `json:"enabled"`
+	Version          *int64  `json:"version"`
 }
 
 type nodeDTO struct {
@@ -37,6 +41,10 @@ type nodeDTO struct {
 	ProtocolVersion   string `json:"protocol_version"`
 	APIKeyFingerprint string `json:"api_key_fingerprint,omitempty"`
 	APIKeyConfigured  bool   `json:"api_key_configured"`
+	UpstreamModel     string `json:"upstream_model,omitempty"`
+	MaxConcurrency    int    `json:"max_concurrency"`
+	ActiveTasks       int    `json:"active_tasks"`
+	ReplaceResultURL  bool   `json:"replace_result_url"`
 	PollInterval      string `json:"poll_interval"`
 	RequestTimeout    string `json:"request_timeout"`
 	Enabled           bool   `json:"enabled"`
@@ -76,7 +84,17 @@ func (h *handler) listNodes(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]nodeDTO, 0, len(nodes))
 	for _, node := range nodes {
-		items = append(items, makeNodeDTO(node))
+		item := makeNodeDTO(node)
+		if node.UsesOfficialV2() {
+			if activity, ok := h.nodes.(OfficialNodeActivityStore); ok {
+				item.ActiveTasks, err = activity.ActiveOfficialCount(r.Context(), node.ID)
+				if err != nil {
+					h.internalError(w, r, err)
+					return
+				}
+			}
+		}
+		items = append(items, item)
 	}
 	h.writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
@@ -91,7 +109,7 @@ func (h *handler) createNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	input, ok := h.normalizeNodeRequest(w, request, true)
-	if !ok || !h.encryptNodeKey(w, r, request.APIKey, &input) {
+	if !ok || !h.ensureObjectStorageReady(w, r, input) || !h.encryptNodeKey(w, r, request.APIKey, &input) {
 		return
 	}
 	if h.nodes == nil {
@@ -125,7 +143,7 @@ func (h *handler) updateNode(w http.ResponseWriter, r *http.Request) {
 	}
 	request.ID = id
 	input, ok := h.normalizeNodeRequest(w, request, false)
-	if !ok {
+	if !ok || !h.ensureObjectStorageReady(w, r, input) {
 		return
 	}
 	if request.APIKey != nil && *request.APIKey != "" {
@@ -158,6 +176,22 @@ func (h *handler) updateNode(w http.ResponseWriter, r *http.Request) {
 	h.wakeRegistry()
 	h.logger.InfoContext(r.Context(), "管理员已更新模型服务节点", "node_id", node.ID, "key_fingerprint", node.APIKeyFingerprint, "stage", "node_update")
 	h.writeJSON(w, http.StatusOK, makeNodeDTO(node))
+}
+
+func (h *handler) ensureObjectStorageReady(w http.ResponseWriter, r *http.Request, input domain.ModelNodeInput) bool {
+	if !input.UsesOfficialV2() || !input.ReplaceResultURL {
+		return true
+	}
+	if h.objectStorage == nil {
+		h.writeError(w, http.StatusConflict, "object_storage_not_ready", "请先配置并测试通过对象存储")
+		return false
+	}
+	config, err := h.objectStorage.GetObjectStorageConfig(r.Context())
+	if err != nil || config.LastTestStatus != "passed" {
+		h.writeError(w, http.StatusConflict, "object_storage_not_ready", "请先配置并测试通过对象存储")
+		return false
+	}
+	return true
 }
 
 func (h *handler) deleteNode(w http.ResponseWriter, r *http.Request) {
@@ -213,7 +247,7 @@ func (h *handler) testNode(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), input.RequestTimeout)
 	defer cancel()
 	checks := h.probeNode(ctx, NodeProbeInput{Node: input, APIKey: apiKey})
-	if checks.Reachable && checks.Authenticated && checks.ProtocolVersion == "h3-node-v1" {
+	if checks.Reachable && checks.Authenticated && checks.ProtocolVersion == input.ProtocolVersion {
 		h.writeJSON(w, http.StatusOK, checks)
 		return
 	}
@@ -228,8 +262,8 @@ func (h *handler) testNode(w http.ResponseWriter, r *http.Request) {
 
 func (h *handler) resolveProbeKey(w http.ResponseWriter, r *http.Request, request nodeRequest, input *domain.ModelNodeInput) (string, bool) {
 	if !request.UseStoredAPIKey {
-		if request.APIKey == nil || !validNodeAPIKey(*request.APIKey) {
-			h.writeError(w, http.StatusBadRequest, "bad_request_error", "api_key 必须是 32 位字母或数字")
+		if request.APIKey == nil || !validNodeAPIKey(input.ProtocolVersion, *request.APIKey) {
+			h.writeError(w, http.StatusBadRequest, "bad_request_error", nodeAPIKeyValidationMessage(input.ProtocolVersion))
 			return "", false
 		}
 		return *request.APIKey, true
@@ -260,8 +294,8 @@ func (h *handler) resolveProbeKey(w http.ResponseWriter, r *http.Request, reques
 }
 
 func (h *handler) encryptNodeKey(w http.ResponseWriter, r *http.Request, apiKey *string, input *domain.ModelNodeInput) bool {
-	if apiKey == nil || !validNodeAPIKey(*apiKey) {
-		h.writeError(w, http.StatusBadRequest, "bad_request_error", "api_key 必须是 32 位字母或数字")
+	if apiKey == nil || !validNodeAPIKey(input.ProtocolVersion, *apiKey) {
+		h.writeError(w, http.StatusBadRequest, "bad_request_error", nodeAPIKeyValidationMessage(input.ProtocolVersion))
 		return false
 	}
 	if h.nodeSecrets == nil {
@@ -281,7 +315,28 @@ func (h *handler) encryptNodeKey(w http.ResponseWriter, r *http.Request, apiKey 
 
 var nodeAPIKeyPattern = regexp.MustCompile(`^[A-Za-z0-9]{32}$`)
 
-func validNodeAPIKey(value string) bool { return nodeAPIKeyPattern.MatchString(value) }
+func validNodeAPIKey(protocol, value string) bool {
+	if protocol == "minimax-v2" {
+		trimmed := strings.TrimSpace(value)
+		if len(trimmed) < 1 || len(trimmed) > 512 {
+			return false
+		}
+		for _, character := range trimmed {
+			if unicode.IsControl(character) {
+				return false
+			}
+		}
+		return true
+	}
+	return nodeAPIKeyPattern.MatchString(value)
+}
+
+func nodeAPIKeyValidationMessage(protocol string) string {
+	if protocol == "minimax-v2" {
+		return "api_key 必须是 1 至 512 位且不含控制字符"
+	}
+	return "api_key 必须是 32 位字母或数字"
+}
 
 func (h *handler) readNodeRequest(w http.ResponseWriter, r *http.Request) (nodeRequest, bool) {
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -349,9 +404,24 @@ func (h *handler) normalizeNodeRequest(w http.ResponseWriter, request nodeReques
 		h.writeError(w, http.StatusBadRequest, "bad_request_error", "request_timeout 无效")
 		return domain.ModelNodeInput{}, false
 	}
+	protocol := strings.TrimSpace(request.ProtocolVersion)
+	if protocol == "minimax-v2" {
+		if request.MaxConcurrency == nil || request.ReplaceResultURL == nil {
+			h.writeError(w, http.StatusBadRequest, "bad_request_error", "minimax-v2 必须提供 max_concurrency 和 replace_result_url")
+			return domain.ModelNodeInput{}, false
+		}
+	} else if request.UpstreamModel != "" || request.MaxConcurrency != nil || request.ReplaceResultURL != nil {
+		h.writeError(w, http.StatusBadRequest, "bad_request_error", "官方协议专属字段不能用于当前协议")
+		return domain.ModelNodeInput{}, false
+	}
 	input := domain.ModelNodeInput{
-		ID: strings.TrimSpace(request.ID), ServiceURL: request.ServiceURL, ProtocolVersion: request.ProtocolVersion,
+		ID: strings.TrimSpace(request.ID), ServiceURL: request.ServiceURL, ProtocolVersion: protocol,
 		PollInterval: pollInterval, RequestTimeout: requestTimeout, Enabled: request.Enabled != nil && *request.Enabled,
+	}
+	if protocol == "minimax-v2" {
+		input.UpstreamModel = request.UpstreamModel
+		input.MaxConcurrency = *request.MaxConcurrency
+		input.ReplaceResultURL = *request.ReplaceResultURL
 	}
 	normalized, _, err := config.NormalizeModelNode(input)
 	if err != nil {
@@ -396,7 +466,15 @@ func makeNodeDTO(node domain.ModelNode) nodeDTO {
 	return nodeDTO{
 		ID: node.ID, ServiceURL: serviceURL, ProtocolVersion: protocol,
 		APIKeyFingerprint: node.APIKeyFingerprint, APIKeyConfigured: len(node.APIKeyCiphertext) > 0,
+		UpstreamModel: node.UpstreamModel, MaxConcurrency: effectiveNodeConcurrency(node), ReplaceResultURL: node.ReplaceResultURL,
 		PollInterval: node.PollInterval.String(), RequestTimeout: node.RequestTimeout.String(), Enabled: node.Enabled,
 		Version: node.Version, CreatedAt: unixTime(node.CreatedAt), UpdatedAt: unixTime(node.UpdatedAt),
 	}
+}
+
+func effectiveNodeConcurrency(node domain.ModelNode) int {
+	if node.UsesOfficialV2() && node.MaxConcurrency > 0 {
+		return node.MaxConcurrency
+	}
+	return 1
 }

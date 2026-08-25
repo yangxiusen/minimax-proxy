@@ -52,7 +52,13 @@ const elements = {
   taskDetailDialog: document.getElementById("task-detail-dialog"),
   taskDetailTitle: document.getElementById("task-detail-title"),
   taskDetailStatus: document.getElementById("task-detail-status"),
-  taskDetailBody: document.getElementById("task-detail-body")
+  taskDetailBody: document.getElementById("task-detail-body"),
+  officialNodeFields: document.getElementById("official-node-fields"),
+  storageDialog: document.getElementById("object-storage-dialog"),
+  storageForm: document.getElementById("object-storage-form"),
+  storageStatus: document.getElementById("object-storage-status"),
+  testObjectStorage: document.getElementById("test-object-storage"),
+  saveObjectStorage: document.getElementById("save-object-storage")
 };
 
 const state = {
@@ -77,7 +83,9 @@ const state = {
   cleanupTimer: null,
   apiKeys: [],
   apiKeyBusy: false,
-  visibleAPIKey: null
+  visibleAPIKey: null,
+  storageConfig: null,
+  storageBusy: false
 };
 let taskRequestGeneration = 0;
 let apiKeyRequestGeneration = 0;
@@ -185,7 +193,18 @@ function renderHealthSummary(summary) {
 function nodeStatusText(node) {
   if (node.applying) return "配置应用中";
   if (node.enabled === false) return "已停用";
+  if (node.protocol_version === "minimax-v2") {
+    if (node.health === "healthy") return "连接正常";
+    if (node.health === "unhealthy") return "连接异常";
+    return "等待检查";
+  }
   return `${healthLabels[node.health] || "未知"} · ${runtimeLabels[node.runtime] || "状态未知"}`;
+}
+
+function nodeCapacityText(node) {
+  const active = Math.max(0, Math.trunc(Number(node.active_tasks) || 0));
+  const maximum = Math.max(1, Math.trunc(Number(node.max_concurrency) || 1));
+  return `${active} / ${maximum}`;
 }
 
 function renderNodes(upstreams) {
@@ -202,7 +221,7 @@ function renderNodes(upstreams) {
     button.append(
       makeElement("span", "node-name", node.id || "未命名实例"),
       makeElement("span", `node-state summary-${node.health || "unknown"}`, `● ${nodeStatusText(node)}`),
-      makeElement("span", "node-meta", node.private_queue == null ? "私有队列未知" : `私有队列 ${node.private_queue}`)
+      makeElement("span", "node-meta", node.protocol_version === "minimax-v2" ? `官方节点 · ${nodeCapacityText(node)}` : node.private_queue == null ? "私有队列未知" : `私有队列 ${node.private_queue}`)
     );
     button.addEventListener("click", () => {
       state.selectedNodeID = node.id;
@@ -295,6 +314,12 @@ function renderNodeDetail(node) {
     makeElement("div", "detail-subtitle", `${node.address || "地址未知"} · 最后检查 ${localTime(node.checked_at)}`)
   );
   head.append(identity, statusPill(node.enabled === false ? "idle" : node.applying ? "queued" : node.health, nodeStatusText(node)));
+  if (node.protocol_version === "minimax-v2") {
+    const capacity = makeElement("div", "official-capacity");
+    capacity.append(makeElement("span", "box-label", "运行任务"), makeElement("strong", "official-capacity-value", nodeCapacityText(node)));
+    elements.nodeDetail.replaceChildren(head, capacity);
+    return;
+  }
   const metrics = makeElement("div", "metrics");
   metrics.append(metric("CPU", node.cpu_percent), metric("内存", node.memory_percent), metric("GPU", node.gpu_percent), metric("显存", node.vram_percent));
   const tasks = makeElement("div", "node-tasks");
@@ -336,7 +361,9 @@ function renderTasks(response) {
   const rows = items.map((item) => {
     const row = makeElement("div", "task-row");
     row.setAttribute("role", "row");
-    const phaseLabel = phaseLabels[item.phase];
+    let phaseLabel = phaseLabels[item.phase];
+    if (item.result_delivery_status === "pending" || item.result_delivery_status === "uploading") phaseLabel = "上传结果";
+    if (item.result_delivery_status === "failed") phaseLabel = "上传失败";
     const actions = makeElement("span", "task-actions");
     const view = makeElement("button", "task-action", "查看");
     view.type = "button";
@@ -367,6 +394,14 @@ function renderTasks(response) {
       remove.addEventListener("click", () => runTaskAction(item, "delete", remove));
       actions.append(remove);
     }
+    if (item.can_retry_upload) {
+      const retry = makeElement("button", "task-action retry-action", "重新上传");
+      retry.type = "button";
+      retry.title = item.result_upload_error?.summary || "重新上传结果";
+      retry.disabled = state.taskActions.has(item.id);
+      retry.addEventListener("click", () => retryResultUpload(item, retry));
+      actions.append(retry);
+    }
     if (!actions.childElementCount) actions.append(makeElement("span", "muted", "--"));
     row.append(
       makeElement("span", "", item.id || "--"),
@@ -382,6 +417,22 @@ function renderTasks(response) {
     return row;
   });
   elements.taskRows.replaceChildren(...rows);
+}
+
+async function retryResultUpload(item, button) {
+  state.taskActions.add(item.id);
+  button.disabled = true;
+  button.textContent = "提交中";
+  try {
+    await requestJSON(`/manager/api/tasks/${encodeURIComponent(item.id)}/result-upload/retry`, { method: "POST" });
+    await loadTasks();
+  } catch (error) {
+    if (error.message !== "unauthorized") window.alert(error.payload?.error?.message || "重新上传失败，请刷新后重试");
+  } finally {
+    state.taskActions.delete(item.id);
+    button.disabled = false;
+    button.textContent = "重新上传";
+  }
 }
 
 async function runTaskAction(item, action, button) {
@@ -439,7 +490,7 @@ function formField(name) {
 
 function setNodeBusy(busy) {
   state.nodeBusy = busy;
-  elements.configForm.querySelectorAll("input, button").forEach((control) => { control.disabled = busy; });
+  elements.configForm.querySelectorAll("input, button, select").forEach((control) => { control.disabled = busy; });
   formField("id").disabled = busy || Boolean(state.editingNode);
   document.getElementById("new-node").disabled = busy;
   document.getElementById("close-node-config").disabled = busy;
@@ -462,6 +513,7 @@ function resetNodeForm() {
   elements.deleteNode.hidden = true;
   state.editingNode = null;
   state.formDirty = false;
+  syncNodeProtocolFields();
   setNodeFormStatus("");
 }
 
@@ -473,10 +525,14 @@ function fillNodeForm(node) {
   formField("api_key").value = "";
   formField("api_key").required = false;
   formField("enabled").checked = Boolean(node.enabled);
+  formField("upstream_model").value = node.upstream_model || "MiniMax-H3";
+  formField("max_concurrency").value = Number(node.max_concurrency) || 1;
+  formField("replace_result_url").checked = Boolean(node.replace_result_url);
   formField("id").disabled = true;
   elements.deleteNode.hidden = false;
   state.editingNode = node;
   state.formDirty = false;
+  syncNodeProtocolFields();
   setNodeFormStatus("");
 }
 
@@ -491,7 +547,8 @@ function renderConfiguredNodes() {
     button.type = "button";
     button.append(
       makeElement("strong", "", node.id),
-      makeElement("span", node.enabled ? "summary-healthy" : "muted", node.enabled ? "已启用" : "已停用")
+      makeElement("span", node.enabled ? "summary-healthy" : "muted", node.enabled ? "已启用" : "已停用"),
+      makeElement("span", "muted", node.protocol_version === "minimax-v2" ? `${node.upstream_model || "MiniMax-H3"} · ${node.active_tasks || 0} / ${node.max_concurrency || 1}` : "内部节点 · 0 / 1")
     );
     button.addEventListener("click", () => {
       if (selected || !confirmDiscard()) return;
@@ -523,10 +580,27 @@ function nodePayload(includeVersion) {
     request_timeout: formField("request_timeout").value.trim(),
     enabled: formField("enabled").checked
   };
+  if (payload.protocol_version === "minimax-v2") {
+    payload.upstream_model = formField("upstream_model").value.trim();
+    payload.max_concurrency = Number(formField("max_concurrency").value);
+    payload.replace_result_url = formField("replace_result_url").checked;
+  }
   const apiKey = formField("api_key").value;
   if (apiKey) payload.api_key = apiKey;
   if (includeVersion) payload.version = Number(formField("version").value);
   return payload;
+}
+
+function syncNodeProtocolFields() {
+  const official = formField("protocol_version").value === "minimax-v2";
+  elements.officialNodeFields.hidden = !official;
+  elements.officialNodeFields.querySelectorAll("input").forEach((input) => { input.disabled = !official || state.nodeBusy; });
+  formField("upstream_model").required = official;
+  formField("max_concurrency").required = official;
+  const key = formField("api_key");
+  key.minLength = official ? 1 : 32;
+  key.maxLength = official ? 512 : 32;
+  if (official) key.removeAttribute("pattern"); else key.setAttribute("pattern", "[A-Za-z0-9]{32}");
 }
 
 function validateNodeForm() {
@@ -728,7 +802,107 @@ function renderTaskDetail(detail) {
   configSection.append(makeElement("pre", "task-detail-json", JSON.stringify(detail.config || {
     model: detail.model, resolution: detail.resolution, ratio: detail.ratio, duration: detail.duration
   }, null, 2)));
-  elements.taskDetailBody.replaceChildren(summary, textSection, mediaSection, configSection);
+  const deliverySection = makeElement("section", "task-detail-section");
+  deliverySection.append(makeElement("h3", "", "结果交付"));
+  deliverySection.append(
+    detailRow("状态", detail.result_delivery_status || "not_required"),
+    detailRow("上传轮次", detail.result_upload_round || 0),
+    detailRow("尝试次数", detail.result_upload_attempts || 0)
+  );
+  if (detail.result_upload_error) deliverySection.append(detailRow("失败原因", `${detail.result_upload_error.code}：${detail.result_upload_error.summary || "上传失败"}`));
+  elements.taskDetailBody.replaceChildren(summary, textSection, mediaSection, deliverySection, configSection);
+}
+
+function storageField(name) { return elements.storageForm.elements.namedItem(name); }
+
+function setStorageStatus(message, kind = "") {
+  elements.storageStatus.className = `form-status${kind ? ` ${kind}` : ""}`;
+  elements.storageStatus.textContent = message;
+}
+
+function setStorageBusy(busy) {
+  state.storageBusy = busy;
+  elements.storageForm.querySelectorAll("input, button").forEach((control) => { control.disabled = busy; });
+  document.getElementById("close-object-storage").disabled = busy;
+}
+
+function fillStorageForm(config) {
+  elements.storageForm.reset();
+  state.storageConfig = config?.configured ? config : null;
+  storageField("version").value = config?.version || "";
+  storageField("bucket_name").value = config?.bucket_name || "";
+  storageField("file_host").value = config?.file_host || "";
+  storageField("public_base_url").value = config?.public_base_url || "";
+  storageField("request_timeout").value = config?.request_timeout || "30m";
+  storageField("public_key").value = "";
+  storageField("private_key").value = "";
+}
+
+async function openObjectStorage() {
+  elements.storageDialog.showModal();
+  setStorageBusy(true);
+  setStorageStatus("正在加载配置...");
+  try {
+    const config = await requestJSON("/manager/api/object-storage");
+    fillStorageForm(config);
+    setStorageStatus(config.configured ? `已配置，最近测试：${config.last_test_status || "未测试"}` : "尚未配置对象存储");
+  } catch (error) {
+    if (error.message !== "unauthorized") setStorageStatus(error.message, "error");
+  } finally { setStorageBusy(false); }
+}
+
+function storagePayload(forTest = false) {
+  if (forTest && state.storageConfig && !storageField("public_key").value && !storageField("private_key").value) {
+    return { use_stored_config: true, version: Number(storageField("version").value) };
+  }
+  const payload = {
+    provider: "ucloud-us3",
+    bucket_name: storageField("bucket_name").value.trim(),
+    file_host: storageField("file_host").value.trim(),
+    public_base_url: storageField("public_base_url").value.trim(),
+    public_key: storageField("public_key").value,
+    private_key: storageField("private_key").value,
+    request_timeout: storageField("request_timeout").value.trim()
+  };
+  if (state.storageConfig) {
+    payload.version = Number(storageField("version").value);
+    if (!payload.private_key) {
+      delete payload.private_key;
+      payload.use_stored_private_key = true;
+    }
+    if (!payload.public_key) delete payload.public_key;
+  }
+  return payload;
+}
+
+async function testObjectStorage() {
+  if (state.storageBusy || !elements.storageForm.reportValidity()) return;
+  setStorageBusy(true); setStorageStatus("正在执行上传与公开读取测试...");
+  try {
+    await requestJSON("/manager/api/object-storage/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(storagePayload(true)) });
+    setStorageStatus("连接测试通过", "success");
+  } catch (error) {
+    if (error.message !== "unauthorized") setStorageStatus(error.message, "error");
+  } finally { setStorageBusy(false); }
+}
+
+async function saveObjectStorage(event) {
+  event.preventDefault();
+  if (state.storageBusy || !elements.storageForm.reportValidity()) return;
+  setStorageBusy(true); setStorageStatus("正在保存...");
+  try {
+    const saved = await requestJSON("/manager/api/object-storage", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(storagePayload(false)) });
+    fillStorageForm(saved);
+    try {
+      await requestJSON("/manager/api/object-storage/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ use_stored_config: true, version: saved.version }) });
+      state.storageConfig.last_test_status = "passed";
+      setStorageStatus("对象存储配置已保存并测试通过", "success");
+    } catch (probeError) {
+      setStorageStatus(`配置已保存，但连接测试失败：${probeError.message}`, "error");
+    }
+  } catch (error) {
+    if (error.message !== "unauthorized") setStorageStatus(error.message, "error");
+  } finally { setStorageBusy(false); }
 }
 
 function viewStoredAPIKey(item) {
@@ -1115,6 +1289,7 @@ elements.searchFilter.addEventListener("input", () => {
   searchTimer = window.setTimeout(resetAndLoadTasks, 350);
 });
 elements.configForm.addEventListener("input", () => { state.formDirty = true; });
+formField("protocol_version").addEventListener("change", () => { syncNodeProtocolFields(); state.formDirty = true; });
 elements.configForm.addEventListener("submit", saveNode);
 elements.testNode.addEventListener("click", testNodeConnection);
 elements.deleteNode.addEventListener("click", deleteConfiguredNode);
@@ -1130,6 +1305,11 @@ elements.configDialog.addEventListener("cancel", (event) => {
   event.preventDefault();
   closeNodeConfiguration();
 });
+document.getElementById("open-object-storage").addEventListener("click", openObjectStorage);
+document.getElementById("close-object-storage").addEventListener("click", () => { if (!state.storageBusy) elements.storageDialog.close(); });
+elements.storageDialog.addEventListener("cancel", (event) => { if (state.storageBusy) event.preventDefault(); });
+elements.storageForm.addEventListener("submit", saveObjectStorage);
+elements.testObjectStorage.addEventListener("click", testObjectStorage);
 document.getElementById("logout").addEventListener("click", async () => {
   try { await fetch("/manager/api/session", { method: "DELETE" }); } finally { window.location.replace("/manager/login"); }
 });

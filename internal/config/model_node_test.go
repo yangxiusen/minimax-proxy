@@ -80,3 +80,59 @@ func TestNormalizeNodeAPIModelNodeRejectsUIPageAsServiceRoot(t *testing.T) {
 		t.Fatalf("NormalizeModelNode() error = %v, want /ui validation error", err)
 	}
 }
+
+func TestNormalizeOfficialV2Node(t *testing.T) {
+	input := domain.ModelNodeInput{
+		ID: "official-1", ServiceURL: "https://api.example.com/", ProtocolVersion: "minimax-v2",
+		UpstreamModel: "  MiniMax-H3-Custom  ", MaxConcurrency: 3, ReplaceResultURL: true,
+		PollInterval: time.Second, RequestTimeout: 5 * time.Minute, Enabled: true,
+	}
+	normalized, upstream, err := NormalizeModelNode(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.ServiceURL != "https://api.example.com" || normalized.UpstreamModel != "MiniMax-H3-Custom" || normalized.MaxConcurrency != 3 || !normalized.ReplaceResultURL {
+		t.Fatalf("normalized=%+v", normalized)
+	}
+	if upstream.ProtocolVersion != "minimax-v2" || upstream.UpstreamModel != normalized.UpstreamModel || upstream.MaxConcurrency != 3 {
+		t.Fatalf("upstream=%+v", upstream)
+	}
+}
+
+func TestNormalizeOfficialV2NodeRejectsInvalidConditionalFields(t *testing.T) {
+	valid := domain.ModelNodeInput{
+		ID: "official-1", ServiceURL: "https://api.example.com", ProtocolVersion: "minimax-v2",
+		UpstreamModel: "MiniMax-H3", MaxConcurrency: 3,
+		PollInterval: 3 * time.Second, RequestTimeout: 30 * time.Second, Enabled: true,
+	}
+	tests := []struct {
+		name string
+		edit func(*domain.ModelNodeInput)
+		want string
+	}{
+		{name: "model empty", edit: func(v *domain.ModelNodeInput) { v.UpstreamModel = " " }, want: "upstream_model"},
+		{name: "model control", edit: func(v *domain.ModelNodeInput) { v.UpstreamModel = "bad\nmodel" }, want: "upstream_model"},
+		{name: "concurrency zero", edit: func(v *domain.ModelNodeInput) { v.MaxConcurrency = 0 }, want: "max_concurrency"},
+		{name: "concurrency high", edit: func(v *domain.ModelNodeInput) { v.MaxConcurrency = 101 }, want: "max_concurrency"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := valid
+			test.edit(&input)
+			if _, _, err := NormalizeModelNode(input); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v, want %s", err, test.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeH3NodeRejectsOfficialOnlyFields(t *testing.T) {
+	input := domain.ModelNodeInput{
+		ID: "h3-1", ServiceURL: "http://127.0.0.1:7860", ProtocolVersion: "h3-node-v1",
+		UpstreamModel: "MiniMax-H3", MaxConcurrency: 3,
+		PollInterval: 3 * time.Second, RequestTimeout: 30 * time.Second, Enabled: true,
+	}
+	if _, _, err := NormalizeModelNode(input); err == nil || !strings.Contains(err.Error(), "官方协议") {
+		t.Fatalf("error=%v", err)
+	}
+}

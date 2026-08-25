@@ -71,3 +71,8 @@ var NodeDispatchBarriers string
 //
 //go:embed 015_input_spool_admin_maintenance.sql
 var InputSpoolAdminMaintenance string
+
+// MiniMaxV2ResultDelivery 增加官方 V2 节点容量、对象存储配置与结果上传作业。
+//
+//go:embed 016_minimax_v2_result_delivery.sql
+var MiniMaxV2ResultDelivery string
