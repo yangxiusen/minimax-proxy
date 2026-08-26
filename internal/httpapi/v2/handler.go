@@ -21,6 +21,7 @@ import (
 	"minimax-h3-tc/internal/callback"
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/inputobject"
 	"minimax-h3-tc/internal/inputspool"
 )
 
@@ -47,6 +48,10 @@ type idempotentTaskFinder interface {
 	FindIdempotentTask(context.Context, string, string, string) (domain.Task, error)
 }
 
+type InputObjectPreparer interface {
+	Prepare(context.Context, string, []byte) (inputobject.PreparedRequest, error)
+}
+
 type Dependencies struct {
 	Store           TaskStore
 	APIKeys         []config.APIKeyConfig
@@ -60,6 +65,7 @@ type Dependencies struct {
 	ActiveProfiles  ActiveProfileStore
 	ArtifactURLs    ArtifactURLSigner
 	InputSpooler    *inputspool.Spooler
+	InputObjects    InputObjectPreparer
 }
 
 type handler struct {
@@ -75,6 +81,7 @@ type handler struct {
 	activeProfiles  ActiveProfileStore
 	artifactURLs    ArtifactURLSigner
 	inputSpooler    *inputspool.Spooler
+	inputObjects    InputObjectPreparer
 }
 
 type authKey struct {
@@ -86,7 +93,7 @@ type contextKey string
 const ownerKey contextKey = "api_key_id"
 
 func NewHandler(dependencies Dependencies) http.Handler {
-	h := &handler{store: dependencies.Store, authenticator: dependencies.Authenticator, profiles: dependencies.Profiles, logger: dependencies.Logger, wake: dependencies.Wake, available: dependencies.Available, callbackService: dependencies.CallbackService, callbackCipher: dependencies.CallbackCipher, activeProfiles: dependencies.ActiveProfiles, artifactURLs: dependencies.ArtifactURLs, inputSpooler: dependencies.InputSpooler}
+	h := &handler{store: dependencies.Store, authenticator: dependencies.Authenticator, profiles: dependencies.Profiles, logger: dependencies.Logger, wake: dependencies.Wake, available: dependencies.Available, callbackService: dependencies.CallbackService, callbackCipher: dependencies.CallbackCipher, activeProfiles: dependencies.ActiveProfiles, artifactURLs: dependencies.ArtifactURLs, inputSpooler: dependencies.InputSpooler, inputObjects: dependencies.InputObjects}
 	if h.logger == nil {
 		h.logger = slog.Default()
 	}
@@ -252,7 +259,23 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var prepared inputspool.PreparedRequest
-	if h.inputSpooler != nil {
+	objectInputsEnabled := false
+	if h.inputObjects != nil {
+		objectPrepared, prepareErr := h.inputObjects.Prepare(r.Context(), inputObjectNamespace(owner(r.Context()), requestHashHex), persistedJSON)
+		if prepareErr != nil {
+			if errors.Is(prepareErr, inputobject.ErrNotReady) {
+				h.writeError(w, r, http.StatusServiceUnavailable, "object_storage_not_ready", "对象存储暂不可用")
+			} else {
+				h.writeError(w, r, http.StatusBadGateway, "input_object_upload_failed", "输入素材上传对象存储失败")
+			}
+			return
+		}
+		objectInputsEnabled = objectPrepared.Enabled
+		if objectInputsEnabled {
+			persistedJSON = objectPrepared.JSON
+		}
+	}
+	if !objectInputsEnabled && h.inputSpooler != nil {
 		prepared, err = h.inputSpooler.PrepareRequest(r.Context(), taskID, persistedJSON)
 		if err != nil {
 			h.writeError(w, r, http.StatusBadRequest, "bad_request_error", err.Error()+" (2013)")
@@ -296,6 +319,11 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 	}
 	h.logger.InfoContext(r.Context(), "视频生成任务已入队", "request_id", requestID(r.Context()), "task_id", task.TaskID, "api_key_id", task.APIKeyID, "scenario", task.Scenario)
 	h.writeJSON(w, http.StatusOK, map[string]string{"task_id": task.TaskID})
+}
+
+func inputObjectNamespace(ownerID, requestHash string) string {
+	digest := sha256.Sum256([]byte(ownerID + "\x00" + requestHash))
+	return hex.EncodeToString(digest[:])
 }
 
 func freezeStages(taskID string, request ValidatedRequest, configJSON string) ([]domain.NewTaskStage, error) {

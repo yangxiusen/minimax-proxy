@@ -130,6 +130,7 @@
         <label><span>公开访问地址</span><input name="public_base_url" type="url" placeholder="https://cdn.example.com" autocomplete="off" required></label>
         <label><span>Public Key</span><input name="public_key" type="password" autocomplete="new-password" placeholder="编辑时留空表示沿用已保存 Key"></label>
         <label><span>Private Key</span><input name="private_key" type="password" autocomplete="new-password" placeholder="编辑时留空表示沿用已保存 Key"></label>
+        <label class="toggle-control"><input name="upload_base64_inputs" type="checkbox"><span>Base64 输入直接上传对象存储</span></label>
         <p id="object-storage-status" class="form-status" aria-live="polite"></p>
         <footer class="form-actions"><span class="action-spacer"></span><button id="test-object-storage" type="button">测试连接</button><button id="save-object-storage" class="primary-button" type="submit">保存</button></footer>
       </form>

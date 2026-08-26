@@ -16,7 +16,7 @@ type Store interface {
 	ClaimNextOfficial(context.Context, string, int64, int) (domain.Task, error)
 	BindOfficialTask(context.Context, string, string, string) error
 	MarkOfficialGenerated(context.Context, string, string, string, string, *domain.ResultUploadJob) error
-	MarkOfficialFailed(context.Context, string, string, string, string) error
+	MarkOfficialFailed(context.Context, string, string, string, string, *domain.UpstreamFeedback) error
 	SaveOfficialSubmissionBaseline(context.Context, string, string, []string) error
 }
 
@@ -53,10 +53,10 @@ func (p *Processor) ProcessTask(ctx context.Context, task domain.Task) error {
 	upstreamTaskID := task.UpstreamJobID
 	if upstreamTaskID == "" {
 		baseline := make(map[string]struct{})
-		if task.UpstreamJobsBeforeJSON != "" {
+		if task.OfficialSubmissionBaselineSaved {
 			var ids []string
 			if err := json.Unmarshal([]byte(task.UpstreamJobsBeforeJSON), &ids); err != nil {
-				return p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, "official_reconcile_invalid", "官方任务对账快照无效")
+				return p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, "official_reconcile_invalid", "官方任务对账快照无效", nil)
 			}
 			for _, id := range ids {
 				baseline[id] = struct{}{}
@@ -69,7 +69,7 @@ func (p *Processor) ProcessTask(ctx context.Context, task domain.Task) error {
 					return err
 				}
 			} else {
-				return p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, "official_submit_uncertain", "官方任务提交结果无法确认，已停止自动重提")
+				return p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, "official_submit_uncertain", "官方任务提交结果无法确认，已停止自动重提", nil)
 			}
 		}
 		if upstreamTaskID == "" {
@@ -80,7 +80,7 @@ func (p *Processor) ProcessTask(ctx context.Context, task domain.Task) error {
 					if ctx.Err() != nil {
 						return restoreErr
 					}
-					return p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, "official_input_materialization_failed", "官方任务输入素材还原失败")
+					return p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, "official_input_materialization_failed", "官方任务输入素材还原失败", nil)
 				}
 				requestBody = restored
 			}
@@ -96,12 +96,12 @@ func (p *Processor) ProcessTask(ctx context.Context, task domain.Task) error {
 			if err := p.Store.SaveOfficialSubmissionBaseline(ctx, task.TaskID, p.NodeID, ids); err != nil {
 				return err
 			}
-			created, err := p.Client.Submit(ctx, requestBody)
+			created, err := p.Client.Submit(minimaxv2.WithProxyTaskID(ctx, task.TaskID), requestBody)
 			if err != nil {
 				if reconciled, ok, reconcileErr := p.reconcileSubmissionWithRetry(ctx, task, baseline); reconcileErr == nil && ok {
 					created = reconciled
 				} else if reconcileErr != nil {
-					return p.failUnlessStopping(ctx, task, "official_reconcile_failed", reconcileErr)
+					return p.failUnlessStoppingWithFeedback(ctx, task, "official_reconcile_failed", reconcileErr, upstreamFeedback(err))
 				} else {
 					return p.failUnlessStopping(ctx, task, "official_submit_failed", err)
 				}
@@ -145,10 +145,12 @@ func (p *Processor) ProcessTask(ctx context.Context, task domain.Task) error {
 			return p.Store.MarkOfficialGenerated(ctx, task.TaskID, p.NodeID, result.Content.URL, result.Ratio, job)
 		case minimaxv2.StatusFailed, minimaxv2.StatusCancelled:
 			code, message := "official_generation_failed", "官方视频生成任务失败"
+			var feedback *domain.UpstreamFeedback
 			if result.Status == minimaxv2.StatusCancelled {
 				code, message = "official_task_cancelled", "官方视频生成任务已取消"
 			}
 			if result.Error != nil {
+				feedback = &domain.UpstreamFeedback{Code: result.Error.Code, Message: result.Error.Message}
 				if result.Error.Code != "" {
 					code = result.Error.Code
 				}
@@ -156,9 +158,9 @@ func (p *Processor) ProcessTask(ctx context.Context, task domain.Task) error {
 					message = result.Error.Message
 				}
 			}
-			return p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, code, message)
+			return p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, code, message, feedback)
 		default:
-			return p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, "official_status_invalid", "官方任务返回未知状态")
+			return p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, "official_status_invalid", "官方任务返回未知状态", nil)
 		}
 	}
 }
@@ -229,13 +231,28 @@ func retryableQueryError(err error) bool {
 }
 
 func (p *Processor) failUnlessStopping(ctx context.Context, task domain.Task, code string, cause error) error {
+	return p.failUnlessStoppingWithFeedback(ctx, task, code, cause, upstreamFeedback(cause))
+}
+
+func (p *Processor) failUnlessStoppingWithFeedback(ctx context.Context, task domain.Task, code string, cause error, feedback *domain.UpstreamFeedback) error {
 	if ctx.Err() != nil {
 		return cause
 	}
-	if err := p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, code, officialFailureMessage(code)); err != nil {
+	if err := p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, code, officialFailureMessage(code), feedback); err != nil {
 		return errors.Join(cause, err)
 	}
 	return nil
+}
+
+func upstreamFeedback(cause error) *domain.UpstreamFeedback {
+	var httpError *minimaxv2.HTTPError
+	if !errors.As(cause, &httpError) {
+		return nil
+	}
+	return &domain.UpstreamFeedback{
+		HTTPStatus: httpError.StatusCode, Code: httpError.Code, Type: httpError.Type,
+		Message: httpError.Message, ResourceType: httpError.ResourceType, RequestID: httpError.RequestID,
+	}
 }
 
 func officialFailureMessage(code string) string {

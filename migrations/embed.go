@@ -81,3 +81,18 @@ var MiniMaxV2ResultDelivery string
 //
 //go:embed 017_official_v2_base64_inputs.sql
 var OfficialV2Base64Inputs string
+
+// OSSDirectBase64Inputs 增加 Base64 输入直接上传对象存储配置。
+//
+//go:embed 018_oss_direct_base64_inputs.sql
+var OSSDirectBase64Inputs string
+
+// OfficialSubmissionBaselineState 显式区分新任务和已保存提交基线的恢复任务。
+//
+//go:embed 019_official_submission_baseline_state.sql
+var OfficialSubmissionBaselineState string
+
+// UpstreamFeedback 保存可供管理员查看的脱敏上游错误详情。
+//
+//go:embed 020_upstream_feedback.sql
+var UpstreamFeedback string

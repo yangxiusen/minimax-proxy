@@ -6,6 +6,10 @@ type Store interface {
 	UploadFile(context.Context, string, string, string) (string, error)
 }
 
+type DataStore interface {
+	Upload(context.Context, []byte, string, string) (string, error)
+}
+
 type Error struct {
 	Code      string
 	Message   string

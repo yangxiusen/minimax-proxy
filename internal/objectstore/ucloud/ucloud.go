@@ -1,6 +1,7 @@
 package ucloud
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -52,6 +53,25 @@ func (s *Store) UploadFile(ctx context.Context, filePath, objectKey, mimeType st
 	if err := request.AsyncUpload(filePath, objectKey, mimeType, 4); err != nil {
 		return "", mapError(err, request.LastResponseStatus)
 	}
+	return s.verifyUpload(ctx, objectKey)
+}
+
+func (s *Store) Upload(ctx context.Context, payload []byte, objectKey, mimeType string) (string, error) {
+	request, err := ufsdk.NewFileRequest(&ufsdk.Config{
+		PublicKey: s.config.PublicKey, PrivateKey: s.config.PrivateKey, BucketName: s.config.BucketName,
+		Endpoint: s.config.FileHost, VerifyUploadMD5: true,
+	}, s.config.Client)
+	if err != nil {
+		return "", &objectstore.Error{Code: "ucloud_config_invalid", Message: "UCloud 上传客户端创建失败"}
+	}
+	request.Context = ctx
+	if err := request.IOPut(bytes.NewReader(payload), objectKey, mimeType); err != nil {
+		return "", mapError(err, request.LastResponseStatus)
+	}
+	return s.verifyUpload(ctx, objectKey)
+}
+
+func (s *Store) verifyUpload(ctx context.Context, objectKey string) (string, error) {
 	verify, err := ufsdk.NewFileRequest(&ufsdk.Config{
 		PublicKey: s.config.PublicKey, PrivateKey: s.config.PrivateKey, BucketName: s.config.BucketName,
 		Endpoint: s.config.FileHost,

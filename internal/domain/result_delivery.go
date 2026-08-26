@@ -14,6 +14,7 @@ var (
 
 type ObjectStorageConfig struct {
 	Provider, BucketName, FileHost, PublicBaseURL string
+	UploadBase64Inputs                            bool
 	PublicKeyCiphertext, PublicKeyNonce           []byte
 	PublicKeyFingerprint                          string
 	PrivateKeyCiphertext, PrivateKeyNonce         []byte

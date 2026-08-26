@@ -639,25 +639,26 @@ func (h *handler) cancelTask(w http.ResponseWriter, r *http.Request) {
 }
 
 type taskDetailDTO struct {
-	ID                   string          `json:"id"`
-	APIKeyID             string          `json:"api_key_id"`
-	Status               domain.V2Status `json:"status"`
-	Phase                string          `json:"phase"`
-	Scenario             string          `json:"scenario"`
-	Model                string          `json:"model"`
-	Resolution           string          `json:"resolution"`
-	Ratio                string          `json:"ratio"`
-	Duration             int             `json:"duration"`
-	CreatedAt            int64           `json:"created_at"`
-	UpdatedAt            int64           `json:"updated_at"`
-	Request              any             `json:"request"`
-	Config               any             `json:"config,omitempty"`
-	LegacyBase64Present  bool            `json:"legacy_base64_present"`
-	ResultDeliveryStatus string          `json:"result_delivery_status"`
-	ResultUploadRound    int             `json:"result_upload_round"`
-	ResultUploadAttempts int             `json:"result_upload_attempts"`
-	CanRetryUpload       bool            `json:"can_retry_upload"`
-	ResultUploadError    *errorDTO       `json:"result_upload_error"`
+	ID                   string                   `json:"id"`
+	APIKeyID             string                   `json:"api_key_id"`
+	Status               domain.V2Status          `json:"status"`
+	Phase                string                   `json:"phase"`
+	Scenario             string                   `json:"scenario"`
+	Model                string                   `json:"model"`
+	Resolution           string                   `json:"resolution"`
+	Ratio                string                   `json:"ratio"`
+	Duration             int                      `json:"duration"`
+	CreatedAt            int64                    `json:"created_at"`
+	UpdatedAt            int64                    `json:"updated_at"`
+	Request              any                      `json:"request"`
+	Config               any                      `json:"config,omitempty"`
+	LegacyBase64Present  bool                     `json:"legacy_base64_present"`
+	UpstreamFeedback     *domain.UpstreamFeedback `json:"upstream_feedback,omitempty"`
+	ResultDeliveryStatus string                   `json:"result_delivery_status"`
+	ResultUploadRound    int                      `json:"result_upload_round"`
+	ResultUploadAttempts int                      `json:"result_upload_attempts"`
+	CanRetryUpload       bool                     `json:"can_retry_upload"`
+	ResultUploadError    *errorDTO                `json:"result_upload_error"`
 }
 
 func (h *handler) taskDetail(w http.ResponseWriter, r *http.Request) {
@@ -686,6 +687,7 @@ func (h *handler) taskDetail(w http.ResponseWriter, r *http.Request) {
 		Ratio: detail.Task.RatioRequested, Duration: detail.Task.Duration,
 		CreatedAt: unixTime(detail.Task.CreatedAt), UpdatedAt: unixTime(detail.Task.UpdatedAt),
 		Request: requestBody, Config: config, LegacyBase64Present: detail.LegacyBase64Present || legacy,
+		UpstreamFeedback: detail.Task.UpstreamFeedback,
 	}
 	delivery := h.resultDeliverySummary(r.Context(), taskID)
 	response.ResultDeliveryStatus, response.ResultUploadRound, response.ResultUploadAttempts = delivery.Status, delivery.Round, delivery.Attempts

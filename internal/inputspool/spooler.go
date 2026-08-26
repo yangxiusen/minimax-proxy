@@ -26,6 +26,37 @@ type PreparedRequest struct {
 	taskDir string
 }
 
+type DecodedDataURI struct {
+	Payload      []byte
+	DeclaredMIME string
+	DetectedMIME string
+	MediaType    string
+	Extension    string
+	SHA256       string
+}
+
+func DecodeDataURI(contentType, rawURL string) (DecodedDataURI, error) {
+	header, encoded, ok := strings.Cut(rawURL, ",")
+	if !ok || encoded == "" || !strings.HasSuffix(strings.ToLower(header), ";base64") {
+		return DecodedDataURI{}, errors.New("素材 Data URI 无效")
+	}
+	declared := strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(header, "data:"), ";base64"))
+	payload, err := base64.StdEncoding.Strict().DecodeString(encoded)
+	if err != nil {
+		return DecodedDataURI{}, err
+	}
+	if len(payload) == 0 {
+		return DecodedDataURI{}, errors.New("输入素材为空")
+	}
+	detected := detectMediaType(payload)
+	mediaType := chooseMediaType(contentType, declared, detected)
+	if mediaType == "" {
+		return DecodedDataURI{}, errors.New("媒体文件格式与声明类型不匹配")
+	}
+	digest := sha256.Sum256(payload)
+	return DecodedDataURI{Payload: payload, DeclaredMIME: normalizeMediaType(declared), DetectedMIME: normalizeMediaType(detected), MediaType: mediaType, Extension: mediaExtension(mediaType), SHA256: hex.EncodeToString(digest[:])}, nil
+}
+
 func New(root string) *Spooler {
 	return &Spooler{root: root}
 }
@@ -150,24 +181,14 @@ func roleOf(item map[string]any) string {
 }
 
 func (s *Spooler) writeDataURI(taskID string, index int, contentType, role, rawURL string) (domain.InputSpoolFile, error) {
-	header, encoded, ok := strings.Cut(rawURL, ",")
-	if !ok || encoded == "" || !strings.HasSuffix(strings.ToLower(header), ";base64") {
-		return domain.InputSpoolFile{}, errors.New("素材 Data URI 无效")
-	}
-	declared := strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(header, "data:"), ";base64"))
-	payload, err := base64.StdEncoding.Strict().DecodeString(encoded)
+	decoded, err := DecodeDataURI(contentType, rawURL)
 	if err != nil {
 		return domain.InputSpoolFile{}, err
 	}
-	if len(payload) == 0 {
-		return domain.InputSpoolFile{}, errors.New("输入素材为空")
-	}
-	detected := detectMediaType(payload)
-	mediaType := chooseMediaType(contentType, declared, detected)
-	if mediaType == "" {
-		return domain.InputSpoolFile{}, errors.New("媒体文件格式与声明类型不匹配")
-	}
-	extension := mediaExtension(mediaType)
+	header, _, _ := strings.Cut(rawURL, ",")
+	declared := strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(header, "data:"), ";base64"))
+	detected := detectMediaType(decoded.Payload)
+	mediaType, extension, payload := decoded.MediaType, decoded.Extension, decoded.Payload
 	inputID := stableInputID(taskID, index, rawURL)
 	relativePath := filepath.ToSlash(filepath.Join(taskID, inputID+extension))
 	finalPath := filepath.Join(s.root, filepath.FromSlash(relativePath))
@@ -185,12 +206,11 @@ func (s *Spooler) writeDataURI(taskID string, index int, contentType, role, rawU
 		_ = os.Remove(partPath)
 		return domain.InputSpoolFile{}, err
 	}
-	digest := sha256.Sum256(payload)
 	return domain.InputSpoolFile{
 		ID: inputID, TaskID: taskID, ContentIndex: index, ContentType: contentType, Role: role,
 		SourceKind: "data_uri", DeclaredMIME: declared, DetectedMIME: detected,
 		MediaType: mediaType, Extension: extension, RelativePath: relativePath,
-		SizeBytes: int64(len(payload)), SHA256: hex.EncodeToString(digest[:]),
+		SizeBytes: int64(len(payload)), SHA256: decoded.SHA256,
 	}, nil
 }
 

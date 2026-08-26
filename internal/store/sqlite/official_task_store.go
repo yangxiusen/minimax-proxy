@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"minimax-h3-tc/internal/domain"
 )
@@ -14,7 +15,7 @@ func (s *Store) SaveOfficialSubmissionBaseline(ctx context.Context, taskID, node
 	if err != nil {
 		return err
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE video_tasks SET upstream_jobs_before_json=?,updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND upstream_slot_active=1 AND status='dispatching'`, string(data), s.nowUnix(), taskID, nodeID)
+	result, err := s.db.ExecContext(ctx, `UPDATE video_tasks SET upstream_jobs_before_json=?,official_submission_baseline_saved=1,updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND upstream_slot_active=1 AND status='dispatching'`, string(data), s.nowUnix(), taskID, nodeID)
 	return oneRow(result, err)
 }
 
@@ -166,14 +167,22 @@ func (s *Store) MarkOfficialGenerated(ctx context.Context, taskID, nodeID, origi
 	return createCallbackDeliveryWithConn(ctx, conn, taskID, "succeeded", nowMS)
 }
 
-func (s *Store) MarkOfficialFailed(ctx context.Context, taskID, nodeID, code, message string) (err error) {
+func (s *Store) MarkOfficialFailed(ctx context.Context, taskID, nodeID, code, message string, feedback *domain.UpstreamFeedback) (err error) {
+	var feedbackJSON any
+	if feedback != nil {
+		data, marshalErr := json.Marshal(feedback)
+		if marshalErr != nil {
+			return fmt.Errorf("序列化上游反馈: %w", marshalErr)
+		}
+		feedbackJSON = string(data)
+	}
 	conn, finish, err := s.immediate(ctx)
 	if err != nil {
 		return err
 	}
 	defer completeTransaction(finish, &err)
 	now, nowMS := s.nowUnix(), s.nowMillis()
-	updated, err := conn.ExecContext(ctx, `UPDATE video_tasks SET status='failed',error_code=?,error_message=?,upstream_slot_active=0,finished_at=?,updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND upstream_slot_active=1 AND status IN ('dispatching','running')`, code, message, now, now, taskID, nodeID)
+	updated, err := conn.ExecContext(ctx, `UPDATE video_tasks SET status='failed',error_code=?,error_message=?,upstream_feedback_json=?,upstream_slot_active=0,finished_at=?,updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND upstream_slot_active=1 AND status IN ('dispatching','running')`, code, message, feedbackJSON, now, now, taskID, nodeID)
 	if err := oneRow(updated, err); err != nil {
 		return err
 	}

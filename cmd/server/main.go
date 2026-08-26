@@ -20,6 +20,7 @@ import (
 	"minimax-h3-tc/internal/domain"
 	managerapi "minimax-h3-tc/internal/httpapi/manager"
 	"minimax-h3-tc/internal/httpapi/v2"
+	"minimax-h3-tc/internal/inputobject"
 	"minimax-h3-tc/internal/inputspool"
 	monitorcache "minimax-h3-tc/internal/monitor"
 	"minimax-h3-tc/internal/objectstore"
@@ -188,7 +189,10 @@ func run(configPath string, logger *slog.Logger) error {
 			return managerapi.ObjectStorageProbeResult{Passed: true, Checks: []managerapi.NodeCheck{{Name: "public_read", Status: "passed"}}}
 		},
 	})
-	v2Handler := v2.NewHandler(v2.Dependencies{Store: store, Authenticator: keyAuthenticator, Profiles: cfg.GenerationProfiles, Logger: logger, Wake: nodeRegistry.Wake, Available: available, CallbackService: callbackService, CallbackCipher: nodeSecrets, ActiveProfiles: store, ArtifactURLs: artifactService, InputSpooler: inputSpooler})
+	inputObjects := inputobject.New(store, nodeSecrets, func(storage domain.ObjectStorageConfig, publicKey, privateKey string) (objectstore.DataStore, error) {
+		return objectucloud.New(objectucloud.Config{BucketName: storage.BucketName, FileHost: storage.FileHost, PublicBaseURL: storage.PublicBaseURL, PublicKey: publicKey, PrivateKey: privateKey, Client: &http.Client{Timeout: storage.RequestTimeout}})
+	})
+	v2Handler := v2.NewHandler(v2.Dependencies{Store: store, Authenticator: keyAuthenticator, Profiles: cfg.GenerationProfiles, Logger: logger, Wake: nodeRegistry.Wake, Available: available, CallbackService: callbackService, CallbackCipher: nodeSecrets, ActiveProfiles: store, ArtifactURLs: artifactService, InputSpooler: inputSpooler, InputObjects: inputObjects})
 	filesHandler := v2.NewFilesHandler(v2.FilesDependencies{Service: artifactService, Authenticator: keyAuthenticator, Logger: logger})
 	handler := newAppHandler(v2Handler, filesHandler, managerHandler)
 	server := &http.Server{Addr: cfg.Server.Address, Handler: handler, ReadTimeout: cfg.Server.ReadTimeout, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: cfg.Server.WriteTimeout, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}

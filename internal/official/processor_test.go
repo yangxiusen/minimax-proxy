@@ -3,6 +3,7 @@ package official
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -25,6 +26,64 @@ func TestProcessorSubmitsPollsAndCreatesDeliveryJob(t *testing.T) {
 	}
 	if store.uploadJob == nil || store.uploadJob.ObjectKey != "MiniMax-H3/2033-05-18/proxy-1.mp4" {
 		t.Fatalf("upload job=%+v", store.uploadJob)
+	}
+}
+
+func TestProcessorSubmitsFreshTaskWithPersistedEmptyBaseline(t *testing.T) {
+	events := []string{}
+	store := &storeFake{claimed: domain.Task{
+		TaskID: "proxy-fresh", RequestJSON: `{}`, UpstreamJobsBeforeJSON: `[]`,
+	}, events: &events}
+	client := &clientFake{
+		submitID: "official-fresh",
+		queries:  []minimaxv2.Task{{ID: "official-fresh", Status: minimaxv2.StatusSucceeded, Content: minimaxv2.Content{URL: "https://origin.example/video.mp4"}}},
+		events:   &events,
+	}
+	processor := Processor{Store: store, Client: client, NodeID: "node-1", NodeVersion: 1, Capacity: 1, PollInterval: time.Millisecond}
+
+	if err := processor.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if client.submitCalls != 1 || store.boundID != "official-fresh" || store.failedCode != "" {
+		t.Fatalf("submit=%d bound=%q failed=%q", client.submitCalls, store.boundID, store.failedCode)
+	}
+	if want := []string{"list", "save", "submit"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("submission events=%v want=%v", events, want)
+	}
+}
+
+func TestProcessorReconcilesSavedEmptyBaselineWithoutSubmittingAgain(t *testing.T) {
+	store := &storeFake{claimed: domain.Task{
+		TaskID: "proxy-recovery", UpstreamJobsBeforeJSON: `[]`, OfficialSubmissionBaselineSaved: true,
+		Resolution: "2K", Duration: 5,
+	}}
+	client := &clientFake{
+		lists:   [][]minimaxv2.Task{{{ID: "official-recovered", Resolution: "2K", Duration: 5}}},
+		queries: []minimaxv2.Task{{ID: "official-recovered", Status: minimaxv2.StatusSucceeded, Content: minimaxv2.Content{URL: "https://origin.example/video.mp4"}}},
+	}
+	processor := Processor{Store: store, Client: client, NodeID: "node-1", PollInterval: time.Millisecond}
+
+	if err := processor.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if client.submitCalls != 0 || store.boundID != "official-recovered" || store.failedCode != "" {
+		t.Fatalf("submit=%d bound=%q failed=%q", client.submitCalls, store.boundID, store.failedCode)
+	}
+}
+
+func TestProcessorFailsSavedEmptyBaselineWithoutSubmittingWhenNoCandidateAppears(t *testing.T) {
+	store := &storeFake{claimed: domain.Task{
+		TaskID: "proxy-recovery-missing", UpstreamJobsBeforeJSON: `[]`, OfficialSubmissionBaselineSaved: true,
+		Resolution: "2K", Duration: 5,
+	}}
+	client := &clientFake{}
+	processor := Processor{Store: store, Client: client, NodeID: "node-1", PollInterval: time.Millisecond}
+
+	if err := processor.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if client.submitCalls != 0 || store.failedCode != "official_submit_uncertain" {
+		t.Fatalf("submit=%d failed=%q", client.submitCalls, store.failedCode)
 	}
 }
 
@@ -100,6 +159,48 @@ func TestProcessorStoresStableMessageInsteadOfNetworkError(t *testing.T) {
 	}
 }
 
+func TestProcessorPersistsStructuredOfficialSubmitFeedback(t *testing.T) {
+	store := &storeFake{claimed: domain.Task{TaskID: "proxy-feedback", RequestJSON: `{}`}}
+	client := &clientFake{
+		submitErr: &minimaxv2.HTTPError{
+			StatusCode: 422, Code: "1027", Type: "unprocessable_entity_error",
+			Message: "text content contains sensitive content (1027)", ResourceType: "text", RequestID: "req-sensitive",
+		},
+	}
+	processor := Processor{Store: store, Client: client, NodeID: "node-1", NodeVersion: 1, Capacity: 1, PollInterval: time.Millisecond}
+
+	if err := processor.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	feedback := store.failedFeedback
+	if store.failedCode != "official_submit_failed" || feedback == nil || feedback.HTTPStatus != 422 ||
+		feedback.Code != "1027" || feedback.Type != "unprocessable_entity_error" ||
+		feedback.Message != "text content contains sensitive content (1027)" || feedback.ResourceType != "text" ||
+		feedback.RequestID != "req-sensitive" {
+		t.Fatalf("failure=%q feedback=%+v", store.failedCode, feedback)
+	}
+}
+
+func TestProcessorPreservesSubmitFeedbackWhenReconciliationFails(t *testing.T) {
+	store := &storeFake{claimed: domain.Task{TaskID: "proxy-feedback-reconcile", RequestJSON: `{}`}}
+	client := &clientFake{
+		submitErr: &minimaxv2.HTTPError{
+			StatusCode: 422, Code: "1027", Type: "unprocessable_entity_error",
+			Message: "text content contains sensitive content (1027)", ResourceType: "text", RequestID: "req-sensitive",
+		},
+		lists:    [][]minimaxv2.Task{{}},
+		listErrs: []error{nil, errors.New("reconciliation unavailable")},
+	}
+	processor := Processor{Store: store, Client: client, NodeID: "node-1", NodeVersion: 1, Capacity: 1, PollInterval: time.Millisecond}
+
+	if err := processor.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if store.failedCode != "official_reconcile_failed" || store.failedMessage != "官方任务提交结果对账失败" || store.failedFeedback == nil || store.failedFeedback.Code != "1027" {
+		t.Fatalf("failure=%q feedback=%+v", store.failedCode, store.failedFeedback)
+	}
+}
+
 func TestProcessorSubmitsMaterializedRequest(t *testing.T) {
 	store := &storeFake{claimed: domain.Task{TaskID: "proxy-1", RequestJSON: `{"content":[]}`}}
 	client := &clientFake{submitID: "official-1", queries: []minimaxv2.Task{{ID: "official-1", Status: minimaxv2.StatusSucceeded, Content: minimaxv2.Content{URL: "https://origin.example/video.mp4"}}}}
@@ -134,15 +235,20 @@ func (r restoreFake) Restore(context.Context, string, []byte) ([]byte, error) {
 }
 
 type storeFake struct {
-	claimed       domain.Task
-	boundID       string
-	generatedURL  string
-	uploadJob     *domain.ResultUploadJob
-	failedCode    string
-	failedMessage string
+	claimed        domain.Task
+	boundID        string
+	generatedURL   string
+	uploadJob      *domain.ResultUploadJob
+	failedCode     string
+	failedMessage  string
+	failedFeedback *domain.UpstreamFeedback
+	events         *[]string
 }
 
 func (s *storeFake) SaveOfficialSubmissionBaseline(context.Context, string, string, []string) error {
+	if s.events != nil {
+		*s.events = append(*s.events, "save")
+	}
 	return nil
 }
 
@@ -157,8 +263,9 @@ func (s *storeFake) MarkOfficialGenerated(_ context.Context, _, _, resultURL, _ 
 	s.generatedURL, s.uploadJob = resultURL, job
 	return nil
 }
-func (s *storeFake) MarkOfficialFailed(_ context.Context, _, _, code, message string) error {
+func (s *storeFake) MarkOfficialFailed(_ context.Context, _, _, code, message string, feedback *domain.UpstreamFeedback) error {
 	s.failedCode, s.failedMessage = code, message
+	s.failedFeedback = feedback
 	return nil
 }
 
@@ -169,10 +276,15 @@ type clientFake struct {
 	queries     []minimaxv2.Task
 	queryErr    error
 	lists       [][]minimaxv2.Task
+	listErrs    []error
 	submitBody  []byte
+	events      *[]string
 }
 
 func (c *clientFake) Submit(_ context.Context, body []byte) (string, error) {
+	if c.events != nil {
+		*c.events = append(*c.events, "submit")
+	}
 	c.submitCalls++
 	c.submitBody = append([]byte(nil), body...)
 	return c.submitID, c.submitErr
@@ -186,6 +298,16 @@ func (c *clientFake) Query(context.Context, string) (minimaxv2.Task, error) {
 	return result, nil
 }
 func (c *clientFake) List(context.Context) ([]minimaxv2.Task, error) {
+	if c.events != nil {
+		*c.events = append(*c.events, "list")
+	}
+	if len(c.listErrs) > 0 {
+		err := c.listErrs[0]
+		c.listErrs = c.listErrs[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	if len(c.lists) == 0 {
 		return []minimaxv2.Task{}, nil
 	}

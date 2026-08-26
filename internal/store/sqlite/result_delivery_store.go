@@ -9,7 +9,7 @@ import (
 	"minimax-h3-tc/internal/domain"
 )
 
-const objectStorageSelect = `SELECT provider,bucket_name,file_host,public_base_url,public_key_ciphertext,public_key_nonce,public_key_fingerprint,private_key_ciphertext,private_key_nonce,private_key_fingerprint,request_timeout_ms,last_test_status,COALESCE(last_tested_at,0),version,created_at,updated_at FROM object_storage_configs WHERE id=1`
+const objectStorageSelect = `SELECT provider,bucket_name,file_host,public_base_url,upload_base64_inputs,public_key_ciphertext,public_key_nonce,public_key_fingerprint,private_key_ciphertext,private_key_nonce,private_key_fingerprint,request_timeout_ms,last_test_status,COALESCE(last_tested_at,0),version,created_at,updated_at FROM object_storage_configs WHERE id=1`
 
 func (s *Store) GetObjectStorageConfig(ctx context.Context) (domain.ObjectStorageConfig, error) {
 	config, err := scanObjectStorageConfig(s.db.QueryRowContext(ctx, objectStorageSelect))
@@ -27,8 +27,8 @@ func (s *Store) PutObjectStorageConfig(ctx context.Context, expectedVersion int6
 	defer completeTransaction(finish, &err)
 	now := s.nowMillis()
 	if expectedVersion == 0 {
-		_, err = conn.ExecContext(ctx, `INSERT INTO object_storage_configs(id,provider,bucket_name,file_host,public_base_url,public_key_ciphertext,public_key_nonce,public_key_fingerprint,private_key_ciphertext,private_key_nonce,private_key_fingerprint,request_timeout_ms,last_test_status,version,created_at,updated_at) VALUES(1,?,?,?,?,?,?,?,?,?,?,?,'untested',1,?,?)`,
-			input.Provider, input.BucketName, input.FileHost, input.PublicBaseURL,
+		_, err = conn.ExecContext(ctx, `INSERT INTO object_storage_configs(id,provider,bucket_name,file_host,public_base_url,upload_base64_inputs,public_key_ciphertext,public_key_nonce,public_key_fingerprint,private_key_ciphertext,private_key_nonce,private_key_fingerprint,request_timeout_ms,last_test_status,version,created_at,updated_at) VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?,'untested',1,?,?)`,
+			input.Provider, input.BucketName, input.FileHost, input.PublicBaseURL, boolInt(input.UploadBase64Inputs),
 			input.PublicKeyCiphertext, input.PublicKeyNonce, input.PublicKeyFingerprint,
 			input.PrivateKeyCiphertext, input.PrivateKeyNonce, input.PrivateKeyFingerprint,
 			input.RequestTimeout.Milliseconds(), now, now)
@@ -40,8 +40,8 @@ func (s *Store) PutObjectStorageConfig(ctx context.Context, expectedVersion int6
 			return result, err
 		}
 	} else {
-		updated, execErr := conn.ExecContext(ctx, `UPDATE object_storage_configs SET provider=?,bucket_name=?,file_host=?,public_base_url=?,public_key_ciphertext=?,public_key_nonce=?,public_key_fingerprint=?,private_key_ciphertext=?,private_key_nonce=?,private_key_fingerprint=?,request_timeout_ms=?,last_test_status='untested',last_tested_at=NULL,version=version+1,updated_at=? WHERE id=1 AND version=?`,
-			input.Provider, input.BucketName, input.FileHost, input.PublicBaseURL,
+		updated, execErr := conn.ExecContext(ctx, `UPDATE object_storage_configs SET provider=?,bucket_name=?,file_host=?,public_base_url=?,upload_base64_inputs=?,public_key_ciphertext=?,public_key_nonce=?,public_key_fingerprint=?,private_key_ciphertext=?,private_key_nonce=?,private_key_fingerprint=?,request_timeout_ms=?,last_test_status='untested',last_tested_at=NULL,version=version+1,updated_at=? WHERE id=1 AND version=?`,
+			input.Provider, input.BucketName, input.FileHost, input.PublicBaseURL, boolInt(input.UploadBase64Inputs),
 			input.PublicKeyCiphertext, input.PublicKeyNonce, input.PublicKeyFingerprint,
 			input.PrivateKeyCiphertext, input.PrivateKeyNonce, input.PrivateKeyFingerprint,
 			input.RequestTimeout.Milliseconds(), now, expectedVersion)
@@ -66,8 +66,9 @@ func (s *Store) MarkObjectStorageTest(ctx context.Context, expectedVersion int64
 
 func scanObjectStorageConfig(scanner rowScanner) (domain.ObjectStorageConfig, error) {
 	var config domain.ObjectStorageConfig
+	var uploadBase64Inputs int
 	var timeoutMS, testedAt, createdAt, updatedAt int64
-	err := scanner.Scan(&config.Provider, &config.BucketName, &config.FileHost, &config.PublicBaseURL,
+	err := scanner.Scan(&config.Provider, &config.BucketName, &config.FileHost, &config.PublicBaseURL, &uploadBase64Inputs,
 		&config.PublicKeyCiphertext, &config.PublicKeyNonce, &config.PublicKeyFingerprint,
 		&config.PrivateKeyCiphertext, &config.PrivateKeyNonce, &config.PrivateKeyFingerprint,
 		&timeoutMS, &config.LastTestStatus, &testedAt, &config.Version, &createdAt, &updatedAt)
@@ -75,6 +76,7 @@ func scanObjectStorageConfig(scanner rowScanner) (domain.ObjectStorageConfig, er
 		return domain.ObjectStorageConfig{}, err
 	}
 	config.RequestTimeout = time.Duration(timeoutMS) * time.Millisecond
+	config.UploadBase64Inputs = uploadBase64Inputs == 1
 	config.LastTestedAt = optionalUnixMillis(testedAt)
 	config.CreatedAt = unixMillis(createdAt)
 	config.UpdatedAt = unixMillis(updatedAt)

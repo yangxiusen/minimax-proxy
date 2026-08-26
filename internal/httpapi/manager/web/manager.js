@@ -765,6 +765,21 @@ function renderTaskDetail(detail) {
     detailRow("创建时间", localTime(detail.created_at))
   );
   const request = detail.request || {};
+  const feedbackSection = makeElement("section", "task-detail-section");
+  feedbackSection.append(makeElement("h3", "", "上游反馈信息"));
+  if (!detail.upstream_feedback) {
+    feedbackSection.append(makeElement("p", "muted", "无上游反馈"));
+  } else {
+    const feedback = detail.upstream_feedback;
+    feedbackSection.append(
+      detailRow("HTTP 状态", feedback.http_status),
+      detailRow("错误码", feedback.code),
+      detailRow("错误类型", feedback.type),
+      detailRow("资源类型", feedback.resource_type),
+      detailRow("反馈消息", feedback.message),
+      detailRow("请求 ID", feedback.request_id)
+    );
+  }
   const content = Array.isArray(request.content) ? request.content : [];
   const textItems = content.filter((item) => item.type === "text");
   const mediaItems = content.filter((item) => item.type === "image_url" || item.type === "audio_url" || item.type === "video_url");
@@ -810,7 +825,7 @@ function renderTaskDetail(detail) {
     detailRow("尝试次数", detail.result_upload_attempts || 0)
   );
   if (detail.result_upload_error) deliverySection.append(detailRow("失败原因", `${detail.result_upload_error.code}：${detail.result_upload_error.summary || "上传失败"}`));
-  elements.taskDetailBody.replaceChildren(summary, textSection, mediaSection, deliverySection, configSection);
+  elements.taskDetailBody.replaceChildren(summary, feedbackSection, textSection, mediaSection, deliverySection, configSection);
 }
 
 function storageField(name) { return elements.storageForm.elements.namedItem(name); }
@@ -834,6 +849,7 @@ function fillStorageForm(config) {
   storageField("file_host").value = config?.file_host || "";
   storageField("public_base_url").value = config?.public_base_url || "";
   storageField("request_timeout").value = config?.request_timeout || "30m";
+  storageField("upload_base64_inputs").checked = Boolean(config?.upload_base64_inputs);
   storageField("public_key").value = "";
   storageField("private_key").value = "";
 }
@@ -862,7 +878,8 @@ function storagePayload(forTest = false) {
     public_base_url: storageField("public_base_url").value.trim(),
     public_key: storageField("public_key").value,
     private_key: storageField("private_key").value,
-    request_timeout: storageField("request_timeout").value.trim()
+    request_timeout: storageField("request_timeout").value.trim(),
+    upload_base64_inputs: storageField("upload_base64_inputs").checked
   };
   if (state.storageConfig) {
     payload.version = Number(storageField("version").value);

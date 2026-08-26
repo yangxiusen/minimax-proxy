@@ -1,6 +1,7 @@
 package ucloud
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,31 @@ import (
 
 	"minimax-h3-tc/internal/objectstore"
 )
+
+func TestUploadStreamsPayloadAndVerifiesPublicAccess(t *testing.T) {
+	var uploaded []byte
+	var contentType string
+	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPut {
+			uploaded, _ = io.ReadAll(request.Body)
+			contentType = request.Header.Get("Content-Type")
+		}
+		response.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	store, err := New(Config{BucketName: "bucket", FileHost: server.URL, PublicBaseURL: server.URL + "/public", PublicKey: "public-key", PrivateKey: "private-key", Client: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("image-bytes")
+	publicURL, err := store.Upload(t.Context(), payload, "MiniMax-H3/inputs/task-1/0.png", "image/png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(uploaded) != string(payload) || contentType != "image/png" || publicURL != server.URL+"/public/MiniMax-H3/inputs/task-1/0.png" {
+		t.Fatalf("payload=%q content_type=%q url=%q", uploaded, contentType, publicURL)
+	}
+}
 
 func TestUploadFileUsesMultipartAndVerifiesPublicAccess(t *testing.T) {
 	var mutex sync.Mutex

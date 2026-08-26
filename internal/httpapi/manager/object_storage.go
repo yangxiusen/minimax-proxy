@@ -27,6 +27,7 @@ type objectStorageRequest struct {
 	UseStoredPrivateKey bool   `json:"use_stored_private_key,omitempty"`
 	UseStoredConfig     bool   `json:"use_stored_config,omitempty"`
 	RequestTimeout      string `json:"request_timeout"`
+	UploadBase64Inputs  bool   `json:"upload_base64_inputs"`
 	Version             *int64 `json:"version,omitempty"`
 }
 
@@ -40,6 +41,7 @@ type objectStorageDTO struct {
 	PrivateKeyFingerprint string `json:"private_key_fingerprint,omitempty"`
 	PrivateKeyConfigured  bool   `json:"private_key_configured"`
 	RequestTimeout        string `json:"request_timeout,omitempty"`
+	UploadBase64Inputs    bool   `json:"upload_base64_inputs"`
 	LastTestStatus        string `json:"last_test_status,omitempty"`
 	LastTestedAt          int64  `json:"last_tested_at,omitempty"`
 	Version               int64  `json:"version,omitempty"`
@@ -244,7 +246,7 @@ func normalizeObjectStorageRequest(request objectStorageRequest) (domain.ObjectS
 	if !request.UseStoredPrivateKey && (!validStorageKey(request.PublicKey) || !validStorageKey(request.PrivateKey)) {
 		return domain.ObjectStorageConfig{}, errors.New("public_key 和 private_key 必须为 1 至 512 位且不含控制字符")
 	}
-	return domain.ObjectStorageConfig{Provider: request.Provider, BucketName: request.BucketName, FileHost: request.FileHost, PublicBaseURL: request.PublicBaseURL, RequestTimeout: timeout}, nil
+	return domain.ObjectStorageConfig{Provider: request.Provider, BucketName: request.BucketName, FileHost: request.FileHost, PublicBaseURL: request.PublicBaseURL, RequestTimeout: timeout, UploadBase64Inputs: request.UploadBase64Inputs}, nil
 }
 
 func validStorageKey(value string) bool {
@@ -255,7 +257,7 @@ func makeObjectStorageDTO(config domain.ObjectStorageConfig) objectStorageDTO {
 	return objectStorageDTO{
 		Configured: true, Provider: config.Provider, BucketName: config.BucketName, FileHost: config.FileHost, PublicBaseURL: config.PublicBaseURL,
 		PublicKeyFingerprint: config.PublicKeyFingerprint, PrivateKeyFingerprint: config.PrivateKeyFingerprint,
-		PrivateKeyConfigured: len(config.PrivateKeyCiphertext) > 0, RequestTimeout: config.RequestTimeout.String(), LastTestStatus: config.LastTestStatus,
+		PrivateKeyConfigured: len(config.PrivateKeyCiphertext) > 0, RequestTimeout: config.RequestTimeout.String(), UploadBase64Inputs: config.UploadBase64Inputs, LastTestStatus: config.LastTestStatus,
 		LastTestedAt: unixTime(config.LastTestedAt), Version: config.Version,
 	}
 }

@@ -1,8 +1,15 @@
 package minimaxv2
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -164,10 +171,249 @@ func TestClientReturnsSanitizedHTTPError(t *testing.T) {
 	client := NewClient(base, "key", "model", server.Client(), 1<<20)
 	_, err := client.List(context.Background())
 	httpErr, ok := err.(*HTTPError)
-	if !ok || httpErr.StatusCode != http.StatusUnauthorized || httpErr.Code != "authorized_error" || httpErr.RequestID != "req-1" {
+	if !ok || httpErr.StatusCode != http.StatusUnauthorized || httpErr.Code != "" || httpErr.Type != "authorized_error" || httpErr.RequestID != "req-1" {
 		t.Fatalf("error=%#v", err)
 	}
 	if httpErr.Error() == "" || httpErr.Error() == "secret upstream detail" {
 		t.Fatalf("unsafe error=%q", httpErr.Error())
 	}
+}
+
+func TestClientSanitizesFailedTaskFeedback(t *testing.T) {
+	for _, test := range []struct {
+		name, message, want, forbidden string
+	}{
+		{name: "API key", message: "prefix official-key suffix", want: "prefix [redacted] suffix", forbidden: "official-key"},
+		{name: "data URI", message: "prefix data:image/png;base64,PRIVATE", want: "[redacted-embedded-data-uri]", forbidden: "PRIVATE"},
+		{name: "length cap", message: strings.Repeat("x", 2048), want: strings.Repeat("x", 1024)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"task": map[string]any{
+					"id": "upstream-1", "status": "failed",
+					"error": map[string]string{"code": "1027", "message": test.message},
+				}})
+			}))
+			defer server.Close()
+			base, _ := url.Parse(server.URL)
+			client := NewClient(base, "official-key", "model", server.Client(), 1<<20)
+
+			task, err := client.Query(context.Background(), "upstream-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if task.Error == nil || task.Error.Code != "1027" || task.Error.Message != test.want ||
+				(test.forbidden != "" && strings.Contains(task.Error.Message, test.forbidden)) {
+				t.Fatalf("task error=%+v", task.Error)
+			}
+		})
+	}
+}
+
+func TestClientReturnsStructuredUpstreamFeedback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"code":"1027","type":"unprocessable_entity_error","message":"text content contains sensitive content (1027)","resource_type":"text"},"request_id":"req-sensitive"}`))
+	}))
+	defer server.Close()
+	base, _ := url.Parse(server.URL)
+	client := NewClient(base, "key", "model", server.Client(), 1<<20)
+
+	_, err := client.Submit(context.Background(), validSubmitBody())
+	httpErr, ok := err.(*HTTPError)
+	if !ok {
+		t.Fatalf("error=%#v", err)
+	}
+	if httpErr.StatusCode != http.StatusUnprocessableEntity || httpErr.Code != "1027" ||
+		httpErr.Type != "unprocessable_entity_error" || httpErr.Message != "text content contains sensitive content (1027)" ||
+		httpErr.ResourceType != "text" || httpErr.RequestID != "req-sensitive" {
+		t.Fatalf("HTTP error=%+v", httpErr)
+	}
+}
+
+func TestClientLogsSanitizedOfficialSubmitRequestAndResponse(t *testing.T) {
+	payload := []byte("private-image-bytes")
+	encoded := base64.StdEncoding.EncodeToString(payload)
+	dataURI := "data:image/png;base64," + encoded
+	receivedBody := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receivedBody <- body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"task_id":"upstream-1","request_id":"req-success","api_key":"official-secret-key","output_url":"https://video.example.com/result.mp4"}`))
+	}))
+	defer server.Close()
+
+	var logs bytes.Buffer
+	base, _ := url.Parse(server.URL)
+	client := NewClient(base, "official-secret-key", "configured-model", server.Client(), 1<<20)
+	client.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	requestBody, err := json.Marshal(map[string]any{
+		"content": []any{
+			map[string]any{"type": "text", "text": "diagnostic prompt"},
+			map[string]any{"type": "image_url", "role": "reference_image", "image_url": map[string]string{"url": dataURI}},
+			map[string]any{"type": "video_url", "role": "reference_video", "video_url": map[string]string{"url": "https://media.example.com/reference.mp4"}},
+			map[string]any{"type": "audio_url", "role": "reference_audio", "audio_url": map[string]string{"url": "mm_file:/inputs/reference.wav"}},
+		},
+		"resolution": "2K",
+		"duration":   8,
+		"ratio":      "16:9",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	taskID, err := client.Submit(WithProxyTaskID(context.Background(), "proxy-123"), requestBody)
+	if err != nil || taskID != "upstream-1" {
+		t.Fatalf("Submit()=%q,%v", taskID, err)
+	}
+	if got := string(<-receivedBody); !strings.Contains(got, dataURI) {
+		t.Fatalf("official request lost data URI: %s", got)
+	}
+
+	digest := sha256.Sum256(payload)
+	output := logs.String()
+	for _, want := range []string{
+		`"stage":"official_submit"`, `"event":"request"`, `"event":"response"`,
+		`"task_id":"proxy-123"`, `"model":"configured-model"`,
+		`"resolution":"2K"`, `"duration":8`, `"ratio":"16:9"`,
+		`"text":"diagnostic prompt"`, `"role":"reference_image"`,
+		`"source":"data_uri"`, `"media_type":"image/png"`,
+		`"decoded_bytes":19`, `"sha256":"` + hex.EncodeToString(digest[:]) + `"`,
+		`https://media.example.com/reference.mp4`, `mm_file:/inputs/reference.wav`,
+		`"status_code":200`, `req-success`, `upstream-1`, `https://video.example.com/result.mp4`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("logs missing %q:\n%s", want, output)
+		}
+	}
+	for _, forbidden := range []string{encoded, "official-secret-key", `"Authorization"`} {
+		if strings.Contains(output, forbidden) {
+			t.Errorf("logs contain secret %q:\n%s", forbidden, output)
+		}
+	}
+}
+
+func TestClientRedactsEmbeddedDataURIFromOfficialLogs(t *testing.T) {
+	secretPayload := base64.StdEncoding.EncodeToString([]byte("embedded-private-bytes"))
+	embedded := "prefix data:image/png;base64," + secretPayload
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"task_id": "upstream-1", "echo": embedded})
+	}))
+	defer server.Close()
+
+	var logs bytes.Buffer
+	base, _ := url.Parse(server.URL)
+	client := NewClient(base, "key", "model", server.Client(), 1<<20)
+	client.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	requestBody, err := json.Marshal(map[string]any{
+		"content":    []any{map[string]string{"type": "text", "text": embedded}},
+		"resolution": "2K",
+		"duration":   8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Submit(context.Background(), requestBody); err != nil {
+		t.Fatal(err)
+	}
+	output := logs.String()
+	if strings.Contains(output, secretPayload) || strings.Contains(output, embedded) {
+		t.Fatalf("logs contain embedded data URI:\n%s", output)
+	}
+	if !strings.Contains(output, "[redacted-embedded-data-uri]") {
+		t.Fatalf("logs do not mark embedded data URI redaction:\n%s", output)
+	}
+}
+
+func TestClientLogsOfficialSubmitHTTPFailureResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"invalid_params","message":"resolution is unsupported"},"request_id":"req-failure"}`))
+	}))
+	defer server.Close()
+
+	var logs bytes.Buffer
+	base, _ := url.Parse(server.URL)
+	client := NewClient(base, "official-secret-key", "configured-model", server.Client(), 1<<20)
+	client.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	_, err := client.Submit(WithProxyTaskID(context.Background(), "proxy-400"), validSubmitBody())
+	if err == nil {
+		t.Fatal("Submit() unexpectedly succeeded")
+	}
+	output := logs.String()
+	for _, want := range []string{
+		`"level":"ERROR"`, `"event":"response"`, `"task_id":"proxy-400"`,
+		`"status_code":400`, `"request_id":"req-failure"`,
+		`"error_type":"invalid_params"`, `resolution is unsupported`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("logs missing %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "official-secret-key") {
+		t.Fatalf("logs contain API key:\n%s", output)
+	}
+}
+
+func TestClientLogsOfficialSubmitNetworkFailure(t *testing.T) {
+	var logs bytes.Buffer
+	base, _ := url.Parse("https://official.example.com")
+	httpClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("dial tcp 10.0.0.1:443: connection refused")
+	})}
+	client := NewClient(base, "official-secret-key", "configured-model", httpClient, 1<<20)
+	client.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	_, err := client.Submit(WithProxyTaskID(context.Background(), "proxy-network"), validSubmitBody())
+	if err == nil {
+		t.Fatal("Submit() unexpectedly succeeded")
+	}
+	output := logs.String()
+	for _, want := range []string{`"level":"ERROR"`, `"event":"response"`, `"task_id":"proxy-network"`, `connection refused`, `[redacted-address]`} {
+		if !strings.Contains(output, want) {
+			t.Errorf("logs missing %q:\n%s", want, output)
+		}
+	}
+	for _, forbidden := range []string{"10.0.0.1", "official-secret-key"} {
+		if strings.Contains(output, forbidden) {
+			t.Errorf("logs contain secret %q:\n%s", forbidden, output)
+		}
+	}
+}
+
+func TestClientCapsOfficialSubmitResponseLog(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":      map[string]string{"type": "invalid_params", "message": strings.Repeat("x", 40<<10)},
+			"request_id": "req-large",
+		})
+	}))
+	defer server.Close()
+
+	var logs bytes.Buffer
+	base, _ := url.Parse(server.URL)
+	client := NewClient(base, "key", "model", server.Client(), 1<<20)
+	client.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	_, _ = client.Submit(context.Background(), validSubmitBody())
+	output := logs.String()
+	if !strings.Contains(output, `"response_truncated":true`) {
+		t.Fatalf("response log was not marked truncated:\n%s", output)
+	}
+	if logs.Len() >= 40<<10 {
+		t.Fatalf("response log was not capped: %d bytes", logs.Len())
+	}
+}
+
+func validSubmitBody() []byte {
+	return []byte(`{"content":[{"type":"text","text":"hello"}],"resolution":"2K","duration":8,"ratio":"16:9"}`)
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
 }

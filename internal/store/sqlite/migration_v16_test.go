@@ -16,8 +16,8 @@ func TestMigrationV16AddsOfficialNodeAndDeliverySchema(t *testing.T) {
 	if err := store.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 17 {
-		t.Fatalf("user_version=%d, want 17", version)
+	if version != 20 {
+		t.Fatalf("user_version=%d, want 20", version)
 	}
 
 	legacy := modelNodeInput("legacy")

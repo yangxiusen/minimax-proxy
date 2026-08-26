@@ -86,6 +86,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		{version: 15, name: "输入临时文件与后台维护", sql: migrations.InputSpoolAdminMaintenance},
 		{version: 16, name: "MiniMax V2 与结果交付", sql: migrations.MiniMaxV2ResultDelivery},
 		{version: 17, name: "官方 V2 Base64 输入", sql: migrations.OfficialV2Base64Inputs},
+		{version: 18, name: "Base64 输入直传对象存储", sql: migrations.OSSDirectBase64Inputs},
+		{version: 19, name: "官方提交基线状态", sql: migrations.OfficialSubmissionBaselineState},
+		{version: 20, name: "上游反馈信息", sql: migrations.UpstreamFeedback},
 	})
 }
 
@@ -763,7 +766,7 @@ func (s *Store) Requeue(ctx context.Context, taskID, upstreamID string) (err err
 		return err
 	}
 	defer completeTransaction(finish, &err)
-	result, err := conn.ExecContext(ctx, `UPDATE video_tasks SET status='queued_open',cancel_locked=0,upstream_id=NULL,gradio_event_id=NULL,upstream_job_id=NULL,upstream_jobs_before_json='[]',retry_count=0,attempt_started_at=NULL,cancel_requested_at=NULL,gallery_before_json=NULL,started_at=NULL,updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND status='dispatching'`, s.nowUnix(), taskID, upstreamID)
+	result, err := conn.ExecContext(ctx, `UPDATE video_tasks SET status='queued_open',cancel_locked=0,upstream_id=NULL,gradio_event_id=NULL,upstream_job_id=NULL,upstream_jobs_before_json='[]',official_submission_baseline_saved=0,upstream_feedback_json=NULL,retry_count=0,attempt_started_at=NULL,cancel_requested_at=NULL,gallery_before_json=NULL,started_at=NULL,updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND status='dispatching'`, s.nowUnix(), taskID, upstreamID)
 	if err := oneRow(result, err); err != nil {
 		return err
 	}
@@ -866,7 +869,7 @@ type rowQuerier interface {
 
 type rowScanner interface{ Scan(...any) error }
 
-const taskSelect = `SELECT queue_seq,task_id,api_key_id,model,scenario,request_json,request_hash,status,cancel_locked,COALESCE(upstream_id,''),COALESCE(gradio_event_id,''),COALESCE(upstream_job_id,''),upstream_slot_active,COALESCE(upstream_node_version,0),delivery_required,upstream_jobs_before_json,retry_count,COALESCE(attempt_started_at,0),COALESCE(cancel_requested_at,0),COALESCE(gallery_before_json,''),COALESCE(result_internal_url,''),COALESCE(result_public_url,''),resolution,duration,ratio_requested,COALESCE(ratio_actual,''),usage_total_seconds,usage_input_seconds,usage_output_seconds,usage_input_image_count,COALESCE(error_code,''),COALESCE(error_message,''),created_at,updated_at,COALESCE(started_at,0),COALESCE(finished_at,0),expires_at,version,COALESCE(profile_id,''),COALESCE(profile_version,0),COALESCE(config_snapshot_json,''),COALESCE(config_hash,''),COALESCE(active_stage_id,''),COALESCE(result_artifact_id,'') FROM video_tasks`
+const taskSelect = `SELECT queue_seq,task_id,api_key_id,model,scenario,request_json,request_hash,status,cancel_locked,COALESCE(upstream_id,''),COALESCE(gradio_event_id,''),COALESCE(upstream_job_id,''),upstream_slot_active,COALESCE(upstream_node_version,0),delivery_required,upstream_jobs_before_json,official_submission_baseline_saved,retry_count,COALESCE(attempt_started_at,0),COALESCE(cancel_requested_at,0),COALESCE(gallery_before_json,''),COALESCE(result_internal_url,''),COALESCE(result_public_url,''),resolution,duration,ratio_requested,COALESCE(ratio_actual,''),usage_total_seconds,usage_input_seconds,usage_output_seconds,usage_input_image_count,COALESCE(error_code,''),COALESCE(error_message,''),COALESCE(upstream_feedback_json,''),created_at,updated_at,COALESCE(started_at,0),COALESCE(finished_at,0),expires_at,version,COALESCE(profile_id,''),COALESCE(profile_version,0),COALESCE(config_snapshot_json,''),COALESCE(config_hash,''),COALESCE(active_stage_id,''),COALESCE(result_artifact_id,'') FROM video_tasks`
 
 const adminTaskSelect = `SELECT task_id,api_key_id,COALESCE(upstream_id,''),COALESCE((SELECT protocol_version FROM model_service_nodes WHERE id=video_tasks.upstream_id),''),scenario,resolution,status,retry_count,COALESCE(result_public_url,''),COALESCE(result_artifact_id,''),duration,created_at,COALESCE(started_at,0),COALESCE(finished_at,0) FROM video_tasks`
 
@@ -881,15 +884,23 @@ func getWith(ctx context.Context, query rowQuerier, owner, taskID string, now in
 
 func scanTask(scanner rowScanner) (domain.Task, error) {
 	var task domain.Task
-	var locked, upstreamSlotActive, deliveryRequired int
+	var upstreamFeedbackJSON string
+	var locked, upstreamSlotActive, deliveryRequired, officialSubmissionBaselineSaved int
 	var created, updated, started, finished, expires, attemptStarted, cancelRequested int64
-	err := scanner.Scan(&task.QueueSeq, &task.TaskID, &task.APIKeyID, &task.Model, &task.Scenario, &task.RequestJSON, &task.RequestHash, &task.Status, &locked, &task.UpstreamID, &task.GradioEventID, &task.UpstreamJobID, &upstreamSlotActive, &task.UpstreamNodeVersion, &deliveryRequired, &task.UpstreamJobsBeforeJSON, &task.RetryCount, &attemptStarted, &cancelRequested, &task.GalleryBeforeJSON, &task.ResultInternalURL, &task.ResultPublicURL, &task.Resolution, &task.Duration, &task.RatioRequested, &task.RatioActual, &task.UsageTotalSeconds, &task.UsageInputSeconds, &task.UsageOutputSeconds, &task.UsageInputImageCount, &task.ErrorCode, &task.ErrorMessage, &created, &updated, &started, &finished, &expires, &task.Version, &task.ProfileID, &task.ProfileVersion, &task.ConfigSnapshotJSON, &task.ConfigHash, &task.ActiveStageID, &task.ResultArtifactID)
+	err := scanner.Scan(&task.QueueSeq, &task.TaskID, &task.APIKeyID, &task.Model, &task.Scenario, &task.RequestJSON, &task.RequestHash, &task.Status, &locked, &task.UpstreamID, &task.GradioEventID, &task.UpstreamJobID, &upstreamSlotActive, &task.UpstreamNodeVersion, &deliveryRequired, &task.UpstreamJobsBeforeJSON, &officialSubmissionBaselineSaved, &task.RetryCount, &attemptStarted, &cancelRequested, &task.GalleryBeforeJSON, &task.ResultInternalURL, &task.ResultPublicURL, &task.Resolution, &task.Duration, &task.RatioRequested, &task.RatioActual, &task.UsageTotalSeconds, &task.UsageInputSeconds, &task.UsageOutputSeconds, &task.UsageInputImageCount, &task.ErrorCode, &task.ErrorMessage, &upstreamFeedbackJSON, &created, &updated, &started, &finished, &expires, &task.Version, &task.ProfileID, &task.ProfileVersion, &task.ConfigSnapshotJSON, &task.ConfigHash, &task.ActiveStageID, &task.ResultArtifactID)
 	if err != nil {
 		return domain.Task{}, err
 	}
 	task.CancelLocked = locked == 1
 	task.UpstreamSlotActive = upstreamSlotActive == 1
 	task.DeliveryRequired = deliveryRequired == 1
+	task.OfficialSubmissionBaselineSaved = officialSubmissionBaselineSaved == 1
+	if upstreamFeedbackJSON != "" {
+		task.UpstreamFeedback = &domain.UpstreamFeedback{}
+		if err := json.Unmarshal([]byte(upstreamFeedbackJSON), task.UpstreamFeedback); err != nil {
+			return domain.Task{}, fmt.Errorf("解析上游反馈: %w", err)
+		}
+	}
 	task.CreatedAt, task.UpdatedAt, task.ExpiresAt = unix(created), unix(updated), unix(expires)
 	if started > 0 {
 		task.StartedAt = unix(started)

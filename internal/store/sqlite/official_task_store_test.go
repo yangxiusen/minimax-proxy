@@ -37,6 +37,97 @@ func TestClaimNextOfficialHonorsConfiguredCapacity(t *testing.T) {
 	}
 }
 
+func TestSaveOfficialSubmissionBaselineMarksPersistedState(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 100})
+	ctx := context.Background()
+	node, err := store.CreateModelNode(ctx, officialNodeInput("official-baseline", 1, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(ctx, officialTask("baseline-empty", false, false), "", nil); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimNextOfficial(ctx, node.ID, node.Version, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.OfficialSubmissionBaselineSaved {
+		t.Fatal("freshly claimed task must not have a saved official baseline")
+	}
+	if err := store.SaveOfficialSubmissionBaseline(ctx, claimed.TaskID, node.ID, []string{}); err != nil {
+		t.Fatal(err)
+	}
+	active, err := store.ListActiveOfficialTasks(ctx, node.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || !active[0].OfficialSubmissionBaselineSaved || active[0].UpstreamJobsBeforeJSON != `[]` {
+		t.Fatalf("active=%+v", active)
+	}
+}
+
+func TestRequeueClearsOfficialSubmissionBaselineState(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 100})
+	ctx := context.Background()
+	node, err := store.CreateModelNode(ctx, officialNodeInput("official-requeue", 1, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(ctx, officialTask("baseline-requeue", false, false), "", nil); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimNextOfficial(ctx, node.ID, node.Version, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE video_tasks SET official_submission_baseline_saved=1,upstream_feedback_json='{"code":"old"}' WHERE task_id=?`, claimed.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Requeue(ctx, claimed.TaskID, node.ID); err != nil {
+		t.Fatal(err)
+	}
+	var saved int
+	var feedback *string
+	if err := store.db.QueryRowContext(ctx, `SELECT official_submission_baseline_saved,upstream_feedback_json FROM video_tasks WHERE task_id=?`, claimed.TaskID).Scan(&saved, &feedback); err != nil {
+		t.Fatal(err)
+	}
+	if saved != 0 {
+		t.Fatalf("requeued task retained official baseline state: %d", saved)
+	}
+	if feedback != nil {
+		t.Fatalf("requeued task retained upstream feedback: %q", *feedback)
+	}
+}
+
+func TestMarkOfficialFailedPersistsUpstreamFeedback(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 100})
+	ctx := context.Background()
+	node, err := store.CreateModelNode(ctx, officialNodeInput("official-feedback", 1, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(ctx, officialTask("feedback-task", false, false), "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextOfficial(ctx, node.ID, node.Version, 1); err != nil {
+		t.Fatal(err)
+	}
+	feedback := &domain.UpstreamFeedback{
+		HTTPStatus: 422, Code: "1027", Type: "unprocessable_entity_error",
+		Message: "text content contains sensitive content (1027)", ResourceType: "text", RequestID: "req-sensitive",
+	}
+	if err := store.MarkOfficialFailed(ctx, "feedback-task", node.ID, "official_submit_failed", "官方任务提交失败", feedback); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, "owner", "feedback-task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UpstreamFeedback == nil || *got.UpstreamFeedback != *feedback {
+		t.Fatalf("upstream feedback=%+v want=%+v", got.UpstreamFeedback, feedback)
+	}
+}
+
 func TestClaimNextOfficialIgnoresInternalConfiguration(t *testing.T) {
 	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 100, GlobalLimit: 100})
 	ctx := context.Background()

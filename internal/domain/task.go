@@ -131,6 +131,7 @@ type Task struct {
 	UpstreamNodeVersion                                                        int64
 	DeliveryRequired                                                           bool
 	UpstreamJobsBeforeJSON                                                     string
+	OfficialSubmissionBaselineSaved                                            bool
 	RetryCount                                                                 int
 	AttemptStartedAt, CancelRequestedAt                                        time.Time
 	GalleryBeforeJSON                                                          string
@@ -140,12 +141,22 @@ type Task struct {
 	UsageTotalSeconds, UsageInputSeconds                                       int
 	UsageOutputSeconds, UsageInputImageCount                                   int
 	ErrorCode, ErrorMessage                                                    string
+	UpstreamFeedback                                                           *UpstreamFeedback
 	CreatedAt, UpdatedAt                                                       time.Time
 	StartedAt, FinishedAt, ExpiresAt                                           time.Time
 	DeletedAt                                                                  *time.Time
 	Version                                                                    int64
 	ProfileID, ConfigSnapshotJSON, ConfigHash, ActiveStageID, ResultArtifactID string
 	ProfileVersion                                                             int64
+}
+
+type UpstreamFeedback struct {
+	HTTPStatus   int    `json:"http_status,omitempty"`
+	Code         string `json:"code,omitempty"`
+	Type         string `json:"type,omitempty"`
+	Message      string `json:"message,omitempty"`
+	ResourceType string `json:"resource_type,omitempty"`
+	RequestID    string `json:"request_id,omitempty"`
 }
 
 type TaskFilter struct {

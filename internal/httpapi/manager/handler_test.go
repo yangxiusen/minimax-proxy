@@ -244,7 +244,7 @@ func TestManagerPageIncludesTaskDetailDialog(t *testing.T) {
 			t.Errorf("manager.html missing task detail dialog %q", expected)
 		}
 	}
-	for _, expected := range []string{`openTaskDetail(item)`, `/manager/api/tasks/${encodeURIComponent(item.id)}`, `renderTaskDetail(detail)`, `closeTaskDetail()`, `mediaFileURL(detail.id, item.input_id)`, `download=1`, `查看`, `下载`} {
+	for _, expected := range []string{`openTaskDetail(item)`, `/manager/api/tasks/${encodeURIComponent(item.id)}`, `renderTaskDetail(detail)`, `closeTaskDetail()`, `mediaFileURL(detail.id, item.input_id)`, `download=1`, `查看`, `下载`, `上游反馈信息`, `upstream_feedback`, `无上游反馈`} {
 		if !strings.Contains(string(script), expected) {
 			t.Errorf("manager.js missing task detail behavior %q", expected)
 		}
@@ -264,6 +264,10 @@ func TestTaskDetailRequiresAuthenticationAndReturnsSanitizedRequest(t *testing.T
 			Scenario: "i2va", Resolution: "768P", RatioRequested: "adaptive", Duration: 5,
 			RequestJSON: `{"content":[{"type":"text","text":"hello"},{"type":"image_url","role":"first_frame","image_url":{"url":"proxy-input://task-detail/input_abc"}}],"resolution":"768P","duration":5}`,
 			CreatedAt:   now, UpdatedAt: now,
+			UpstreamFeedback: &domain.UpstreamFeedback{
+				HTTPStatus: 422, Code: "1027", Type: "unprocessable_entity_error",
+				Message: "text content contains sensitive content (1027)", ResourceType: "text", RequestID: "req-sensitive",
+			},
 		},
 		InputSpoolFiles: []domain.InputSpoolFile{{
 			ID: "input_abc", TaskID: "task-detail", ContentIndex: 1, ContentType: "image_url", Role: "first_frame",
@@ -281,13 +285,18 @@ func TestTaskDetailRequiresAuthenticationAndReturnsSanitizedRequest(t *testing.T
 		t.Fatalf("detail status=%d body=%s", response.Code, response.Body.String())
 	}
 	body := response.Body.String()
-	for _, expected := range []string{`"id":"task-detail"`, `"text":"hello"`, `"input_ref":"proxy-input://task-detail/input_abc"`, `"file_name":"input_abc.png"`, `"legacy_base64_present":false`} {
+	for _, expected := range []string{`"id":"task-detail"`, `"text":"hello"`, `"input_ref":"proxy-input://task-detail/input_abc"`, `"file_name":"input_abc.png"`, `"legacy_base64_present":false`, `"upstream_feedback":{"http_status":422,"code":"1027","type":"unprocessable_entity_error","message":"text content contains sensitive content (1027)","resource_type":"text","request_id":"req-sensitive"}`} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("detail body missing %q: %s", expected, body)
 		}
 	}
 	if strings.Contains(body, "relative_path") || strings.Contains(body, ";base64,") {
 		t.Fatalf("detail leaked path or base64: %s", body)
+	}
+	store.detail.Task.UpstreamFeedback = nil
+	withoutFeedback := serve(h, http.MethodGet, "/manager/api/tasks/task-detail", "", "", cookie, "192.0.2.10:1", false)
+	if strings.Contains(withoutFeedback.Body.String(), `"upstream_feedback"`) {
+		t.Fatalf("detail returned absent upstream feedback: %s", withoutFeedback.Body.String())
 	}
 }
 
