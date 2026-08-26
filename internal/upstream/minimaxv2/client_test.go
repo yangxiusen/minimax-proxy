@@ -25,6 +25,18 @@ func TestClientSubmitsOfficialV2RequestWithoutCallback(t *testing.T) {
 		if body["model"] != "configured-model" || body["resolution"] != "2K" || body["ratio"] != "16:9" {
 			t.Fatalf("body=%v", body)
 		}
+		content, _ := body["content"].([]any)
+		if len(content) != 4 {
+			t.Fatalf("content=%v", content)
+		}
+		for index, want := range []string{"data:image/png;base64,AAAA", "data:video/mp4;base64,AAAA", "data:audio/wav;base64,AAAA"} {
+			item, _ := content[index+1].(map[string]any)
+			kind, _ := item["type"].(string)
+			value, _ := item[kind].(map[string]any)
+			if value["url"] != want {
+				t.Fatalf("content[%d]=%v, want URL %q", index+1, item, want)
+			}
+		}
 		for _, field := range []string{"callback_url", "width", "height", "steps", "loras", "interpolation", "restoration", "profile_id"} {
 			if _, exists := body[field]; exists {
 				t.Fatalf("official request contains internal field %q: %v", field, body)
@@ -36,7 +48,7 @@ func TestClientSubmitsOfficialV2RequestWithoutCallback(t *testing.T) {
 	base, _ := url.Parse(server.URL)
 	client := NewClient(base, "official-key", "configured-model", server.Client(), 1<<20)
 
-	taskID, err := client.Submit(context.Background(), []byte(`{"model":"north-model","content":[{"type":"text","text":"hello"}],"resolution":"2K","duration":5,"ratio":"16:9","callback_url":"https://callback.example.com","aigc_watermark":true,"width":2048,"height":1152,"steps":30,"loras":[{"name":"style"}],"interpolation":{"enabled":true},"restoration":{"enabled":true},"profile_id":"internal-profile"}`))
+	taskID, err := client.Submit(context.Background(), []byte(`{"model":"north-model","content":[{"type":"text","text":"hello"},{"type":"image_url","role":"reference_image","image_url":{"url":"data:image/png;base64,AAAA"}},{"type":"video_url","role":"reference_video","video_url":{"url":"data:video/mp4;base64,AAAA"}},{"type":"audio_url","role":"reference_audio","audio_url":{"url":"data:audio/wav;base64,AAAA"}}],"resolution":"2K","duration":5,"ratio":"16:9","callback_url":"https://callback.example.com","aigc_watermark":true,"width":2048,"height":1152,"steps":30,"loras":[{"name":"style"}],"interpolation":{"enabled":true},"restoration":{"enabled":true},"profile_id":"internal-profile"}`))
 	if err != nil || taskID != "upstream-1" {
 		t.Fatalf("Submit()=%q,%v", taskID, err)
 	}

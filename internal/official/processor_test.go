@@ -100,6 +100,39 @@ func TestProcessorStoresStableMessageInsteadOfNetworkError(t *testing.T) {
 	}
 }
 
+func TestProcessorSubmitsMaterializedRequest(t *testing.T) {
+	store := &storeFake{claimed: domain.Task{TaskID: "proxy-1", RequestJSON: `{"content":[]}`}}
+	client := &clientFake{submitID: "official-1", queries: []minimaxv2.Task{{ID: "official-1", Status: minimaxv2.StatusSucceeded, Content: minimaxv2.Content{URL: "https://origin.example/video.mp4"}}}}
+	processor := Processor{Store: store, Client: client, Inputs: restoreFake{result: []byte(`{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}`)}, NodeID: "node-1", NodeVersion: 1, Capacity: 1}
+	if err := processor.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if string(client.submitBody) != `{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}` {
+		t.Fatalf("submit body=%s", client.submitBody)
+	}
+}
+
+func TestProcessorFailsWithoutSubmittingWhenMaterializationFails(t *testing.T) {
+	store := &storeFake{claimed: domain.Task{TaskID: "proxy-1", RequestJSON: `{"content":[]}`}}
+	client := &clientFake{}
+	processor := Processor{Store: store, Client: client, Inputs: restoreFake{err: errors.New("sensitive path")}, NodeID: "node-1", NodeVersion: 1, Capacity: 1}
+	if err := processor.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if client.submitCalls != 0 || store.failedCode != "official_input_materialization_failed" || store.failedMessage != "官方任务输入素材还原失败" {
+		t.Fatalf("submit=%d failure=%q %q", client.submitCalls, store.failedCode, store.failedMessage)
+	}
+}
+
+type restoreFake struct {
+	result []byte
+	err    error
+}
+
+func (r restoreFake) Restore(context.Context, string, []byte) ([]byte, error) {
+	return r.result, r.err
+}
+
 type storeFake struct {
 	claimed       domain.Task
 	boundID       string
@@ -136,10 +169,12 @@ type clientFake struct {
 	queries     []minimaxv2.Task
 	queryErr    error
 	lists       [][]minimaxv2.Task
+	submitBody  []byte
 }
 
-func (c *clientFake) Submit(context.Context, []byte) (string, error) {
+func (c *clientFake) Submit(_ context.Context, body []byte) (string, error) {
 	c.submitCalls++
+	c.submitBody = append([]byte(nil), body...)
 	return c.submitID, c.submitErr
 }
 func (c *clientFake) Query(context.Context, string) (minimaxv2.Task, error) {

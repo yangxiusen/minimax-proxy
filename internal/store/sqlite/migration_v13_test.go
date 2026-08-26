@@ -55,7 +55,7 @@ func TestMigrationV13BackfillsResolutionKeys(t *testing.T) {
 		t.Fatalf("resolution_key=%q", key)
 	}
 	var userVersion int
-	if err := store.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil || userVersion != 16 {
+	if err := store.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil || userVersion != 17 {
 		t.Fatalf("user_version=%d err=%v", userVersion, err)
 	}
 	if _, err := store.db.ExecContext(ctx, `INSERT INTO request_profiles(id,resolution,resolution_key,config_json,config_hash,created_by,updated_by,created_at,updated_at) VALUES('dynamic','1080P','1080p','{}','hash','admin','admin',1,1)`); err != nil {

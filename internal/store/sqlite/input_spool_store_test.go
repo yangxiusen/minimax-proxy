@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/migrations"
 )
 
 func TestMigrationV15CreatesInputSpoolFiles(t *testing.T) {
@@ -15,8 +16,8 @@ func TestMigrationV15CreatesInputSpoolFiles(t *testing.T) {
 	if err := store.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil {
 		t.Fatalf("query user_version: %v", err)
 	}
-	if userVersion != 16 {
-		t.Fatalf("user_version=%d, want 16", userVersion)
+	if userVersion != 17 {
+		t.Fatalf("user_version=%d, want 17", userVersion)
 	}
 	var migrationCount int
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=15`).Scan(&migrationCount); err != nil {
@@ -31,6 +32,59 @@ func TestMigrationV15CreatesInputSpoolFiles(t *testing.T) {
 	}
 	if tableCount != 1 {
 		t.Fatalf("task_input_spool_files table count=%d, want 1", tableCount)
+	}
+}
+
+func TestMigrationV17AllowsVideoInputSpoolFiles(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	var userVersion int
+	if err := store.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil {
+		t.Fatal(err)
+	}
+	if userVersion != 17 {
+		t.Fatalf("user_version=%d, want 17", userVersion)
+	}
+	input := newStoreTask("video-spool", "key-video-spool")
+	input.InputSpoolFiles = []domain.InputSpoolFile{{
+		ID: "input_video", TaskID: input.TaskID, ContentIndex: 0, ContentType: "video_url", Role: "reference_video",
+		SourceKind: "data_uri", DeclaredMIME: "video/mp4", DetectedMIME: "video/mp4", MediaType: "video/mp4",
+		Extension: ".mp4", RelativePath: "video-spool/input_video.mp4", SizeBytes: 12,
+		SHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+	}}
+	if _, err := store.Create(ctx, input, "video-spool-key", func() bool { return true }); err != nil {
+		t.Fatalf("Create() video spool error=%v", err)
+	}
+	files, err := store.ListInputSpoolFiles(ctx, input.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].ContentType != "video_url" || files[0].MediaType != "video/mp4" {
+		t.Fatalf("video spool files=%+v", files)
+	}
+}
+
+func TestMigrationV17TableRebuildPreservesExistingRows(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	input := newStoreTask("preserve-spool", "key-preserve-spool")
+	input.InputSpoolFiles = []domain.InputSpoolFile{{
+		ID: "input-existing", TaskID: input.TaskID, ContentIndex: 0, ContentType: "image_url", Role: "first_frame",
+		SourceKind: "data_uri", MediaType: "image/png", Extension: ".png", RelativePath: "preserve-spool/input-existing.png",
+		SizeBytes: 12, SHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+	}}
+	if _, err := store.Create(ctx, input, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, migrations.OfficialV2Base64Inputs); err != nil {
+		t.Fatalf("rebuild input spool table: %v", err)
+	}
+	files, err := store.ListInputSpoolFiles(ctx, input.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].ID != "input-existing" || files[0].ContentType != "image_url" {
+		t.Fatalf("preserved files=%+v", files)
 	}
 }
 

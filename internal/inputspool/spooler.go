@@ -115,7 +115,7 @@ func (s *Spooler) PrepareRequest(ctx context.Context, taskID string, requestJSON
 		}
 		item, _ := rawItem.(map[string]any)
 		itemType, _ := item["type"].(string)
-		if itemType != "image_url" && itemType != "audio_url" {
+		if itemType != "image_url" && itemType != "video_url" && itemType != "audio_url" {
 			continue
 		}
 		urlKey := itemType
@@ -209,6 +209,8 @@ func detectMediaType(payload []byte) string {
 		return "image/webp"
 	case len(payload) >= 12 && string(payload[:4]) == "RIFF" && string(payload[8:12]) == "WAVE":
 		return "audio/wav"
+	case len(payload) >= 12 && string(payload[4:8]) == "ftyp":
+		return "video/mp4"
 	case len(payload) >= 3 && string(payload[:3]) == "ID3":
 		return "audio/mpeg"
 	case len(payload) >= 2 && payload[0] == 0xff && payload[1]&0xe0 == 0xe0:
@@ -257,6 +259,8 @@ func mediaExtension(mediaType string) string {
 		return ".wav"
 	case "audio/mpeg":
 		return ".mp3"
+	case "video/mp4":
+		return ".mp4"
 	default:
 		return ".bin"
 	}

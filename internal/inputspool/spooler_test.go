@@ -113,3 +113,22 @@ func TestPrepareRequestPreservesAudioMP3Extension(t *testing.T) {
 		t.Fatalf("files=%+v", prepared.Files)
 	}
 }
+
+func TestPrepareRequestStoresVideoMP4AndRewritesJSON(t *testing.T) {
+	payload := []byte{0, 0, 0, 20, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm', 0, 0, 0, 0}
+	requestJSON := []byte(`{"content":[{"type":"video_url","role":"reference_video","video_url":{"url":"data:video/mp4;base64,` + base64.StdEncoding.EncodeToString(payload) + `"}}]}`)
+	prepared, err := New(t.TempDir()).PrepareRequest(context.Background(), "task-video", requestJSON)
+	if err != nil {
+		t.Fatalf("PrepareRequest() error=%v", err)
+	}
+	if len(prepared.Files) != 1 {
+		t.Fatalf("files=%+v", prepared.Files)
+	}
+	file := prepared.Files[0]
+	if file.ContentType != "video_url" || file.Extension != ".mp4" || file.MediaType != "video/mp4" {
+		t.Fatalf("video metadata=%+v", file)
+	}
+	if strings.Contains(string(prepared.JSON), ";base64,") || !strings.Contains(string(prepared.JSON), "proxy-input://task-video/") {
+		t.Fatalf("rewritten JSON=%s", prepared.JSON)
+	}
+}

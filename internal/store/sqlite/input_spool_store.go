@@ -80,7 +80,7 @@ func validateInputSpoolFile(file domain.InputSpoolFile) error {
 	if _, err := hex.DecodeString(file.SHA256); err != nil {
 		return errors.New("输入临时文件 SHA-256 无效")
 	}
-	if file.ContentType != "image_url" && file.ContentType != "audio_url" {
+	if file.ContentType != "image_url" && file.ContentType != "video_url" && file.ContentType != "audio_url" {
 		return errors.New("输入临时文件内容类型无效")
 	}
 	if file.SourceKind == "" {

@@ -79,28 +79,41 @@ func (s *Store) ClaimNextOfficial(ctx context.Context, nodeID string, nodeVersio
 		FROM video_tasks task
 		WHERE task.status=? AND task.deleted_at IS NULL
 		  AND task.resolution IN ('768P','2K') AND task.duration BETWEEN 4 AND 15
-		  AND NOT EXISTS (SELECT 1 FROM task_input_spool_files input WHERE input.task_id=task.task_id)
 		  AND NOT EXISTS (
 		    SELECT 1 FROM json_each(task.request_json,'$.content') content
 		    WHERE json_extract(content.value,'$.type') IN ('image_url','video_url','audio_url')
-		      AND lower(COALESCE(
-		        json_extract(content.value,'$.image_url.url'),
-		        json_extract(content.value,'$.video_url.url'),
-		        json_extract(content.value,'$.audio_url.url'),
-		        ''
-		      )) NOT LIKE 'http://%'
-		      AND lower(COALESCE(
-		        json_extract(content.value,'$.image_url.url'),
-		        json_extract(content.value,'$.video_url.url'),
-		        json_extract(content.value,'$.audio_url.url'),
-		        ''
-		      )) NOT LIKE 'https://%'
-		      AND substr(lower(COALESCE(
-		        json_extract(content.value,'$.image_url.url'),
-		        json_extract(content.value,'$.video_url.url'),
-		        json_extract(content.value,'$.audio_url.url'),
-		        ''
-		      )),1,10) <> 'mm_file://'
+		      AND NOT (
+		        lower(COALESCE(json_extract(content.value,'$.image_url.url'),json_extract(content.value,'$.video_url.url'),json_extract(content.value,'$.audio_url.url'),'')) LIKE 'http://%'
+		        OR lower(COALESCE(json_extract(content.value,'$.image_url.url'),json_extract(content.value,'$.video_url.url'),json_extract(content.value,'$.audio_url.url'),'')) LIKE 'https://%'
+		        OR (
+		          substr(lower(COALESCE(json_extract(content.value,'$.image_url.url'),json_extract(content.value,'$.video_url.url'),json_extract(content.value,'$.audio_url.url'),'')),1,10) = 'mm_file://'
+		          AND length(COALESCE(json_extract(content.value,'$.image_url.url'),json_extract(content.value,'$.video_url.url'),json_extract(content.value,'$.audio_url.url'),'')) > 10
+		        )
+		        OR (
+		          json_extract(content.value,'$.type')='image_url'
+		          AND lower(COALESCE(json_extract(content.value,'$.image_url.url'),'')) GLOB 'data:image/*;base64,?*'
+		        )
+		        OR (
+		          json_extract(content.value,'$.type')='video_url'
+		          AND lower(COALESCE(json_extract(content.value,'$.video_url.url'),'')) GLOB 'data:video/mp4;base64,?*'
+		        )
+		        OR (
+		          json_extract(content.value,'$.type')='audio_url'
+		          AND (
+		            lower(COALESCE(json_extract(content.value,'$.audio_url.url'),'')) GLOB 'data:audio/wav;base64,?*'
+		            OR lower(COALESCE(json_extract(content.value,'$.audio_url.url'),'')) GLOB 'data:audio/mpeg;base64,?*'
+		            OR lower(COALESCE(json_extract(content.value,'$.audio_url.url'),'')) GLOB 'data:audio/mp3;base64,?*'
+		          )
+		        )
+		        OR EXISTS (
+		          SELECT 1 FROM task_input_spool_files input
+		          WHERE input.task_id=task.task_id
+		            AND input.content_index=CAST(content.key AS INTEGER)
+		            AND input.content_type=json_extract(content.value,'$.type')
+		            AND input.role=COALESCE(json_extract(content.value,'$.role'),'')
+		            AND COALESCE(json_extract(content.value,'$.' || input.content_type || '.url'),'')='proxy-input://' || task.task_id || '/' || input.id
+		        )
+		      )
 		  )
 		ORDER BY task.queue_seq LIMIT 1`, wanted).Scan(&taskID, &owner)
 	if errors.Is(err, sql.ErrNoRows) {

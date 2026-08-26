@@ -76,3 +76,8 @@ var InputSpoolAdminMaintenance string
 //
 //go:embed 016_minimax_v2_result_delivery.sql
 var MiniMaxV2ResultDelivery string
+
+// OfficialV2Base64Inputs 扩展输入临时文件元数据以支持视频 Data URI。
+//
+//go:embed 017_official_v2_base64_inputs.sql
+var OfficialV2Base64Inputs string

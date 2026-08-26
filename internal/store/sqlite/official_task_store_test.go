@@ -78,10 +78,10 @@ func TestClaimNextOfficialIgnoresInternalConfiguration(t *testing.T) {
 	}
 }
 
-func TestClaimNextOfficialOnlyAcceptsPublicOrMMFileMediaURLs(t *testing.T) {
+func TestClaimNextOfficialAcceptsSupportedOfficialMediaSources(t *testing.T) {
 	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 100, GlobalLimit: 100})
 	ctx := context.Background()
-	node, err := store.CreateModelNode(ctx, officialNodeInput("official", 2, false))
+	node, err := store.CreateModelNode(ctx, officialNodeInput("official", 3, false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,11 +99,36 @@ func TestClaimNextOfficialOnlyAcceptsPublicOrMMFileMediaURLs(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for index, wantID := range []string{"public-url", "mm-file"} {
+	for index, wantID := range []string{"data-url", "public-url", "mm-file"} {
 		claimed, err := store.ClaimNextOfficial(ctx, node.ID, node.Version, node.MaxConcurrency)
 		if err != nil || claimed.TaskID != wantID {
 			t.Fatalf("claim %d=%+v err=%v want=%s", index+1, claimed, err, wantID)
 		}
+	}
+}
+
+func TestClaimNextOfficialAcceptsOnlyMatchingProxyInputMetadata(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 100, GlobalLimit: 100})
+	ctx := context.Background()
+	node, err := store.CreateModelNode(ctx, officialNodeInput("official", 2, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := officialTaskWithContent("valid-spool", `[{"type":"image_url","role":"reference_image","image_url":{"url":"proxy-input://valid-spool/input-valid"}}]`)
+	valid.InputSpoolFiles = []domain.InputSpoolFile{{
+		ID: "input-valid", TaskID: valid.TaskID, ContentIndex: 0, ContentType: "image_url", Role: "reference_image",
+		SourceKind: "data_uri", MediaType: "image/png", Extension: ".png", RelativePath: "valid-spool/input-valid.png",
+		SizeBytes: 12, SHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+	}}
+	invalid := officialTaskWithContent("invalid-spool", `[{"type":"image_url","role":"reference_image","image_url":{"url":"proxy-input://invalid-spool/missing"}}]`)
+	for _, task := range []domain.NewTask{invalid, valid} {
+		if _, err := store.Create(ctx, task, "", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claimed, err := store.ClaimNextOfficial(ctx, node.ID, node.Version, node.MaxConcurrency)
+	if err != nil || claimed.TaskID != valid.TaskID {
+		t.Fatalf("claimed=%+v err=%v", claimed, err)
 	}
 }
 

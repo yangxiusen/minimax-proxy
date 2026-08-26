@@ -26,9 +26,14 @@ type Client interface {
 	List(context.Context) ([]minimaxv2.Task, error)
 }
 
+type RequestRestorer interface {
+	Restore(context.Context, string, []byte) ([]byte, error)
+}
+
 type Processor struct {
 	Store        Store
 	Client       Client
+	Inputs       RequestRestorer
 	NodeID       string
 	NodeVersion  int64
 	Capacity     int
@@ -68,6 +73,17 @@ func (p *Processor) ProcessTask(ctx context.Context, task domain.Task) error {
 			}
 		}
 		if upstreamTaskID == "" {
+			requestBody := []byte(task.RequestJSON)
+			if p.Inputs != nil {
+				restored, restoreErr := p.Inputs.Restore(ctx, task.TaskID, requestBody)
+				if restoreErr != nil {
+					if ctx.Err() != nil {
+						return restoreErr
+					}
+					return p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, "official_input_materialization_failed", "官方任务输入素材还原失败")
+				}
+				requestBody = restored
+			}
 			before, err := p.Client.List(ctx)
 			if err != nil {
 				return p.failUnlessStopping(ctx, task, "official_baseline_failed", err)
@@ -80,7 +96,7 @@ func (p *Processor) ProcessTask(ctx context.Context, task domain.Task) error {
 			if err := p.Store.SaveOfficialSubmissionBaseline(ctx, task.TaskID, p.NodeID, ids); err != nil {
 				return err
 			}
-			created, err := p.Client.Submit(ctx, []byte(task.RequestJSON))
+			created, err := p.Client.Submit(ctx, requestBody)
 			if err != nil {
 				if reconciled, ok, reconcileErr := p.reconcileSubmissionWithRetry(ctx, task, baseline); reconcileErr == nil && ok {
 					created = reconciled

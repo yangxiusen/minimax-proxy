@@ -192,12 +192,35 @@ func TestValidateCreateLimitsDecodedBase64AudioTo15MiB(t *testing.T) {
 	})
 }
 
+func TestValidateCreateAcceptsVideoMP4DataURI(t *testing.T) {
+	source := "data:video/mp4;base64," + base64.StdEncoding.EncodeToString([]byte{0, 0, 0, 20, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm'})
+	request := CreateRequest{Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: "保持一致"}, video(source, "reference_video")}, Resolution: "768P", Duration: 4, Ratio: "adaptive"}
+	if _, err := ValidateCreate(request, profiles()); err != nil {
+		t.Fatalf("ValidateCreate(video data URI) error=%v", err)
+	}
+}
+
+func TestValidateCreateRejectsUnsupportedVideoDataURIType(t *testing.T) {
+	request := CreateRequest{Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: "保持一致"}, video("data:video/webm;base64,AAAA", "reference_video")}, Resolution: "768P", Duration: 4, Ratio: "adaptive"}
+	if _, err := ValidateCreate(request, profiles()); err == nil || !strings.Contains(err.Error(), "视频 Base64 类型仅支持 MP4") {
+		t.Fatalf("ValidateCreate() error=%v", err)
+	}
+}
+
+func TestValidateCreateRejectsImageDataURIOver30MiB(t *testing.T) {
+	source := "data:image/png;base64," + base64.StdEncoding.EncodeToString(make([]byte, MaxDecodedImageBytes+1))
+	request := CreateRequest{Model: "MiniMax-H3", Content: []ContentItem{{Type: "text", Text: "保持一致"}, image(source, "first_frame")}, Resolution: "768P", Duration: 4}
+	if _, err := ValidateCreate(request, profiles()); err == nil || !strings.Contains(err.Error(), "图片 Base64 单张不能超过 30 MiB") {
+		t.Fatalf("ValidateCreate() error=%v", err)
+	}
+}
+
 func TestValidateCreateRejectsNonURLAudioAndVideo(t *testing.T) {
 	tests := []struct {
 		name string
 		item ContentItem
 	}{
-		{name: "video", item: video("data:video/mp4;base64,AAAA", "reference_video")},
+		{name: "video", item: video("C:/media/reference.mp4", "reference_video")},
 		{name: "audio", item: audio("C:/media/reference.wav", "reference_audio")},
 	}
 	for _, tt := range tests {

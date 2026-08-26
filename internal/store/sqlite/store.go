@@ -85,6 +85,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		{version: 14, name: "节点取消对账屏障", sql: migrations.NodeDispatchBarriers},
 		{version: 15, name: "输入临时文件与后台维护", sql: migrations.InputSpoolAdminMaintenance},
 		{version: 16, name: "MiniMax V2 与结果交付", sql: migrations.MiniMaxV2ResultDelivery},
+		{version: 17, name: "官方 V2 Base64 输入", sql: migrations.OfficialV2Base64Inputs},
 	})
 }
 

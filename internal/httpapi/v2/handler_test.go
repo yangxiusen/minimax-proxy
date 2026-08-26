@@ -168,6 +168,38 @@ func TestCreateStoresDataURIInInputSpoolInsteadOfRequestJSON(t *testing.T) {
 	}
 }
 
+func TestCreateStoresVideoDataURIInInputSpool(t *testing.T) {
+	store := apiStore(t, 0)
+	spooler := inputspool.New(filepath.Join(t.TempDir(), "temp-inputs"))
+	handler := NewHandler(Dependencies{
+		Store: store, APIKeys: []config.APIKeyConfig{{ID: "owner-a", Key: "key-a", Enabled: true}},
+		Profiles: profiles(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), InputSpooler: spooler,
+	})
+	payload := `{"model":"MiniMax-H3","content":[{"type":"text","text":"保持一致"},{"type":"video_url","role":"reference_video","video_url":{"url":"data:video/mp4;base64,AAAAFGZ0eXBpc29tAAAAAA=="}}],"resolution":"768P","duration":5,"ratio":"16:9"}`
+	created := request(t, handler, http.MethodPost, "/v2/video_generation", []byte(payload), "key-a")
+	if created.Code != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var body struct {
+		TaskID string `json:"task_id"`
+	}
+	decode(t, created, &body)
+	files, err := store.ListInputSpoolFiles(context.Background(), body.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].ContentType != "video_url" || files[0].MediaType != "video/mp4" || files[0].Extension != ".mp4" {
+		t.Fatalf("video spool files=%+v", files)
+	}
+	task, err := store.Get(context.Background(), "owner-a", body.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(task.RequestJSON, ";base64,") || !strings.Contains(task.RequestJSON, "proxy-input://"+body.TaskID+"/") {
+		t.Fatalf("request JSON=%s", task.RequestJSON)
+	}
+}
+
 func TestCreateSharesOneResolutionProfileAcrossAllScenarios(t *testing.T) {
 	profileConfig := domain.ProfileConfig{
 		Resolution: "2K",

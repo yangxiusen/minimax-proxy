@@ -11,6 +11,7 @@ import (
 
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/inputspool"
 	"minimax-h3-tc/internal/monitor"
 	"minimax-h3-tc/internal/official"
 	"minimax-h3-tc/internal/orchestrator"
@@ -169,7 +170,7 @@ func (f NodeRuntimeFactory) startOfficialV2(parent context.Context, node domain.
 		return nil, errors.New("官方节点 API 客户端未创建")
 	}
 	processor := &official.Processor{
-		Store: f.Store, Client: client, NodeID: node.ID, NodeVersion: node.Version,
+		Store: f.Store, Client: client, Inputs: inputspool.NewRestorer(f.InputSpoolRoot, f.Store), NodeID: node.ID, NodeVersion: node.Version,
 		Capacity: input.MaxConcurrency, PollInterval: input.PollInterval, Now: f.Now,
 	}
 	maxHealthAge := upstream.RequestTimeout + monitorInterval(f.MonitorInterval)

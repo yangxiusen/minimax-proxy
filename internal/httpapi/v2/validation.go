@@ -33,7 +33,11 @@ type URLValue struct {
 	URL string `json:"url"`
 }
 
-const MaxDecodedAudioBytes = 15 << 20
+const (
+	MaxDecodedImageBytes = 30 << 20
+	MaxDecodedVideoBytes = 50 << 20
+	MaxDecodedAudioBytes = 15 << 20
+)
 
 type ValidatedRequest struct {
 	CreateRequest
@@ -95,7 +99,7 @@ func ValidateCreate(request CreateRequest, profiles map[string]config.Generation
 			if item.VideoURL == nil || item.ImageURL != nil || item.AudioURL != nil || item.Text != "" || item.Role != "reference_video" {
 				return ValidatedRequest{}, fmt.Errorf("video_url 必须使用 reference_video role")
 			}
-			if err := validateAccessibleMediaURL(item.VideoURL.URL); err != nil {
+			if err := validateVideoSource(item.VideoURL.URL); err != nil {
 				return ValidatedRequest{}, err
 			}
 			referenceVideos++
@@ -160,14 +164,10 @@ func ValidateCreate(request CreateRequest, profiles map[string]config.Generation
 
 func validateImageSource(value string) error {
 	if strings.HasPrefix(value, "data:") {
-		header, encoded, ok := strings.Cut(value, ",")
-		if !ok || !strings.HasPrefix(header, "data:image/") || !strings.HasSuffix(strings.ToLower(header), ";base64") || encoded == "" {
-			return fmt.Errorf("图片 Base64 格式无效")
-		}
-		if _, err := base64.StdEncoding.Strict().DecodeString(encoded); err != nil {
-			return fmt.Errorf("图片 Base64 格式无效")
-		}
-		return nil
+		_, _, _, err := parseDataURI(value, "图片", MaxDecodedImageBytes, "单张", map[string]string{
+			"image/jpeg": "image/jpeg", "image/jpg": "image/jpeg", "image/png": "image/png", "image/webp": "image/webp",
+		})
+		return err
 	}
 	if strings.HasPrefix(value, "mm_file://") {
 		if strings.TrimSpace(strings.TrimPrefix(value, "mm_file://")) == "" {
@@ -180,6 +180,17 @@ func validateImageSource(value string) error {
 		return fmt.Errorf("媒体 URL 必须是无凭据的 HTTP/HTTPS 地址")
 	}
 	return nil
+}
+
+func validateVideoSource(value string) error {
+	if strings.HasPrefix(value, "data:") {
+		_, _, _, err := parseDataURI(value, "视频", MaxDecodedVideoBytes, "单段", map[string]string{"video/mp4": "video/mp4"})
+		if err != nil && strings.Contains(err.Error(), "类型") {
+			return fmt.Errorf("视频 Base64 类型仅支持 MP4")
+		}
+		return err
+	}
+	return validateAccessibleMediaURL(value)
 }
 
 func validateAccessibleMediaURL(value string) error {
@@ -205,34 +216,43 @@ func validateAudioSource(value string) error {
 }
 
 func ParseAudioDataURI(value string) (string, []byte, bool, error) {
+	mediaType, decoded, isDataURI, err := parseDataURI(value, "音频", MaxDecodedAudioBytes, "单段", map[string]string{
+		"audio/wav": "audio/wav", "audio/mpeg": "audio/mpeg", "audio/mp3": "audio/mp3",
+	})
+	if err != nil && strings.Contains(err.Error(), "类型") {
+		return "", nil, isDataURI, fmt.Errorf("音频 Base64 类型仅支持 WAV 或 MP3")
+	}
+	return mediaType, decoded, isDataURI, err
+}
+
+func parseDataURI(value, label string, maxBytes int, unit string, supported map[string]string) (string, []byte, bool, error) {
 	if !strings.HasPrefix(value, "data:") {
 		return "", nil, false, nil
 	}
 	header, encoded, ok := strings.Cut(value, ",")
 	if !ok || encoded == "" {
-		return "", nil, true, fmt.Errorf("音频 Base64 格式无效")
+		return "", nil, true, fmt.Errorf("%s Base64 格式无效", label)
 	}
 	mediaType, encoding, ok := strings.Cut(strings.TrimPrefix(header, "data:"), ";")
 	if !ok || !strings.EqualFold(encoding, "base64") {
-		return "", nil, true, fmt.Errorf("音频 Base64 格式无效")
+		return "", nil, true, fmt.Errorf("%s Base64 格式无效", label)
 	}
-	switch strings.ToLower(mediaType) {
-	case "audio/wav", "audio/mpeg", "audio/mp3":
-		mediaType = strings.ToLower(mediaType)
-	default:
-		return "", nil, true, fmt.Errorf("音频 Base64 类型仅支持 WAV 或 MP3")
+	mediaType = strings.ToLower(mediaType)
+	normalized, ok := supported[mediaType]
+	if !ok {
+		return "", nil, true, fmt.Errorf("%s Base64 类型不支持", label)
 	}
-	if len(encoded) > base64.StdEncoding.EncodedLen(MaxDecodedAudioBytes) {
-		return "", nil, true, fmt.Errorf("音频 Base64 单段不能超过 15 MiB")
+	if len(encoded) > base64.StdEncoding.EncodedLen(maxBytes) {
+		return "", nil, true, fmt.Errorf("%s Base64 %s不能超过 %d MiB", label, unit, maxBytes>>20)
 	}
 	decoded, err := base64.StdEncoding.Strict().DecodeString(encoded)
 	if err != nil {
-		return "", nil, true, fmt.Errorf("音频 Base64 格式无效")
+		return "", nil, true, fmt.Errorf("%s Base64 格式无效", label)
 	}
-	if len(decoded) > MaxDecodedAudioBytes {
-		return "", nil, true, fmt.Errorf("音频 Base64 单段不能超过 15 MiB")
+	if len(decoded) > maxBytes {
+		return "", nil, true, fmt.Errorf("%s Base64 %s不能超过 %d MiB", label, unit, maxBytes>>20)
 	}
-	return mediaType, decoded, true, nil
+	return normalized, decoded, true, nil
 }
 
 func validRatio(value string) bool {
