@@ -442,6 +442,38 @@ func TestSucceededArtifactSigningFailureDoesNotFallBackToLegacyURL(t *testing.T)
 	}
 }
 
+func TestFailedTaskUsesLocalizedOfficialFeedback(t *testing.T) {
+	h := &handler{}
+	response, err := h.mapTask(context.Background(), domain.Task{
+		TaskID: "failed-sensitive", Model: "MiniMax-H3", Status: domain.StatusFailed,
+		ErrorCode: "official_submit_failed", ErrorMessage: "官方任务提交失败",
+		UpstreamFeedback: &domain.UpstreamFeedback{Code: "1027", Message: "text content contains sensitive content (1027)"},
+		CreatedAt:        time.Unix(1, 0), UpdatedAt: time.Unix(2, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Error == nil || response.Error.Code != "1027" || response.Error.Message != "模型生成内容触发安全审核，需要修改输入后重新生成" {
+		t.Fatalf("error=%+v", response.Error)
+	}
+}
+
+func TestFailedTaskKeepsStableErrorForUnknownOfficialFeedback(t *testing.T) {
+	h := &handler{}
+	response, err := h.mapTask(context.Background(), domain.Task{
+		TaskID: "failed-unknown", Model: "MiniMax-H3", Status: domain.StatusFailed,
+		ErrorCode: "official_submit_failed", ErrorMessage: "官方任务提交失败",
+		UpstreamFeedback: &domain.UpstreamFeedback{Code: "9999", Message: "unreviewed upstream message"},
+		CreatedAt:        time.Unix(1, 0), UpdatedAt: time.Unix(2, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Error == nil || response.Error.Code != "official_submit_failed" || response.Error.Message != "官方任务提交失败" {
+		t.Fatalf("error=%+v", response.Error)
+	}
+}
+
 func TestSucceededArtifactURLIgnoresUntrustedForwardingHeaders(t *testing.T) {
 	store := &fixedTaskStore{task: domain.Task{
 		TaskID: "task-1", APIKeyID: "owner-a", Model: "MiniMax-H3", Status: domain.StatusSucceeded,
@@ -478,7 +510,7 @@ func TestListAddsAbsoluteArtifactURLOnlyToSucceededTasks(t *testing.T) {
 	store := &fixedTaskStore{items: []domain.Task{
 		{TaskID: "succeeded", APIKeyID: "owner-a", Model: "MiniMax-H3", Status: domain.StatusSucceeded, ResultArtifactID: "artifact-1", CreatedAt: now, UpdatedAt: now},
 		{TaskID: "running", APIKeyID: "owner-a", Model: "MiniMax-H3", Status: domain.StatusRunning, CreatedAt: now, UpdatedAt: now},
-		{TaskID: "failed", APIKeyID: "owner-a", Model: "MiniMax-H3", Status: domain.StatusFailed, ErrorCode: "node_failed", ErrorMessage: "failed", CreatedAt: now, UpdatedAt: now},
+		{TaskID: "failed", APIKeyID: "owner-a", Model: "MiniMax-H3", Status: domain.StatusFailed, ErrorCode: "official_submit_failed", ErrorMessage: "官方任务提交失败", UpstreamFeedback: &domain.UpstreamFeedback{Code: "1027"}, CreatedAt: now, UpdatedAt: now},
 	}}
 	signer := &signerSpy{url: "https://proxy.example/v2/files/artifact-1/content?expires=1&signature=signed"}
 	handler := NewHandler(Dependencies{
@@ -500,6 +532,9 @@ func TestListAddsAbsoluteArtifactURLOnlyToSucceededTasks(t *testing.T) {
 	}
 	if body.Items[0].Content == nil || body.Items[0].Content.URL != signer.url || body.Items[1].Content != nil || body.Items[2].Content != nil {
 		t.Fatalf("items=%+v", body.Items)
+	}
+	if body.Items[2].Error == nil || body.Items[2].Error.Code != "1027" || body.Items[2].Error.Message != "模型生成内容触发安全审核，需要修改输入后重新生成" {
+		t.Fatalf("failed error=%+v", body.Items[2].Error)
 	}
 }
 

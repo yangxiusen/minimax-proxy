@@ -173,7 +173,7 @@ func TestProcessorPersistsStructuredOfficialSubmitFeedback(t *testing.T) {
 		t.Fatal(err)
 	}
 	feedback := store.failedFeedback
-	if store.failedCode != "official_submit_failed" || feedback == nil || feedback.HTTPStatus != 422 ||
+	if store.failedCode != "1027" || store.failedMessage != "模型生成内容触发安全审核，需要修改输入后重新生成" || feedback == nil || feedback.HTTPStatus != 422 ||
 		feedback.Code != "1027" || feedback.Type != "unprocessable_entity_error" ||
 		feedback.Message != "text content contains sensitive content (1027)" || feedback.ResourceType != "text" ||
 		feedback.RequestID != "req-sensitive" {
@@ -196,8 +196,41 @@ func TestProcessorPreservesSubmitFeedbackWhenReconciliationFails(t *testing.T) {
 	if err := processor.ProcessOne(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if store.failedCode != "official_reconcile_failed" || store.failedMessage != "官方任务提交结果对账失败" || store.failedFeedback == nil || store.failedFeedback.Code != "1027" {
+	if store.failedCode != "1027" || store.failedMessage != "模型生成内容触发安全审核，需要修改输入后重新生成" || store.failedFeedback == nil || store.failedFeedback.Code != "1027" {
 		t.Fatalf("failure=%q feedback=%+v", store.failedCode, store.failedFeedback)
+	}
+}
+
+func TestProcessorLocalizesKnownGenerationErrorsAndFallsBackForUnmappedCodes(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      minimaxv2.Status
+		upstream    *minimaxv2.TaskError
+		wantCode    string
+		wantMessage string
+	}{
+		{name: "known", status: minimaxv2.StatusFailed, upstream: &minimaxv2.TaskError{Code: "1027", Message: "raw sensitive message"}, wantCode: "1027", wantMessage: "模型生成内容触发安全审核，需要修改输入后重新生成"},
+		{name: "unknown", status: minimaxv2.StatusFailed, upstream: &minimaxv2.TaskError{Code: "9999", Message: "unreviewed upstream message"}, wantCode: "official_generation_failed", wantMessage: "官方视频生成任务失败"},
+		{name: "empty", status: minimaxv2.StatusFailed, upstream: &minimaxv2.TaskError{Message: "unreviewed upstream message"}, wantCode: "official_generation_failed", wantMessage: "官方视频生成任务失败"},
+		{name: "success code", status: minimaxv2.StatusFailed, upstream: &minimaxv2.TaskError{Code: "0", Message: "success"}, wantCode: "official_generation_failed", wantMessage: "官方视频生成任务失败"},
+		{name: "cancelled unknown", status: minimaxv2.StatusCancelled, upstream: &minimaxv2.TaskError{Code: "9999", Message: "unreviewed upstream message"}, wantCode: "official_task_cancelled", wantMessage: "官方视频生成任务已取消"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &storeFake{}
+			client := &clientFake{queries: []minimaxv2.Task{{ID: "official-existing", Status: test.status, Error: test.upstream}}}
+			processor := Processor{Store: store, Client: client, NodeID: "node-1", PollInterval: time.Millisecond}
+
+			if err := processor.ProcessTask(context.Background(), domain.Task{TaskID: "proxy-1", UpstreamID: "node-1", UpstreamJobID: "official-existing"}); err != nil {
+				t.Fatal(err)
+			}
+			if store.failedCode != test.wantCode || store.failedMessage != test.wantMessage {
+				t.Fatalf("failure=%q %q; want %q %q", store.failedCode, store.failedMessage, test.wantCode, test.wantMessage)
+			}
+			if store.failedFeedback == nil || store.failedFeedback.Code != test.upstream.Code || store.failedFeedback.Message != test.upstream.Message {
+				t.Fatalf("feedback=%+v", store.failedFeedback)
+			}
+		})
 	}
 }
 

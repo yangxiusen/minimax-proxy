@@ -602,7 +602,8 @@ func (h *handler) mapTask(ctx context.Context, task domain.Task) (TaskResponse, 
 		}
 	}
 	if task.Status == domain.StatusFailed {
-		response.Error = &TaskError{Code: task.ErrorCode, Message: task.ErrorMessage}
+		code, message := domain.LocalizeOfficialError(task.ErrorCode, task.ErrorMessage, task.UpstreamFeedback)
+		response.Error = &TaskError{Code: code, Message: message}
 	}
 	return response, nil
 }

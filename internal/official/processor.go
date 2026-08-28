@@ -151,13 +151,8 @@ func (p *Processor) ProcessTask(ctx context.Context, task domain.Task) error {
 			}
 			if result.Error != nil {
 				feedback = &domain.UpstreamFeedback{Code: result.Error.Code, Message: result.Error.Message}
-				if result.Error.Code != "" {
-					code = result.Error.Code
-				}
-				if result.Error.Message != "" {
-					message = result.Error.Message
-				}
 			}
+			code, message = domain.LocalizeOfficialError(code, message, feedback)
 			return p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, code, message, feedback)
 		default:
 			return p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, "official_status_invalid", "官方任务返回未知状态", nil)
@@ -238,7 +233,8 @@ func (p *Processor) failUnlessStoppingWithFeedback(ctx context.Context, task dom
 	if ctx.Err() != nil {
 		return cause
 	}
-	if err := p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, code, officialFailureMessage(code), feedback); err != nil {
+	code, message := domain.LocalizeOfficialError(code, officialFailureMessage(code), feedback)
+	if err := p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, code, message, feedback); err != nil {
 		return errors.Join(cause, err)
 	}
 	return nil
