@@ -474,6 +474,22 @@ func TestFailedTaskKeepsStableErrorForUnknownOfficialFeedback(t *testing.T) {
 	}
 }
 
+func TestFailedTaskInfersMediaDownloadErrorFromHistoricalFeedback(t *testing.T) {
+	h := &handler{}
+	response, err := h.mapTask(context.Background(), domain.Task{
+		TaskID: "failed-media-download", Model: "MiniMax-H3", Status: domain.StatusFailed,
+		ErrorCode: "official_submit_failed", ErrorMessage: "官方任务提交失败",
+		UpstreamFeedback: &domain.UpstreamFeedback{Message: "cannot download media URL (2013)"},
+		CreatedAt:        time.Unix(1, 0), UpdatedAt: time.Unix(2, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Error == nil || response.Error.Code != "2013" || response.Error.Message != "无法下载媒体 URL，请确认地址可被公网直接访问并返回有效媒体文件" {
+		t.Fatalf("error=%+v", response.Error)
+	}
+}
+
 func TestSucceededArtifactURLIgnoresUntrustedForwardingHeaders(t *testing.T) {
 	store := &fixedTaskStore{task: domain.Task{
 		TaskID: "task-1", APIKeyID: "owner-a", Model: "MiniMax-H3", Status: domain.StatusSucceeded,

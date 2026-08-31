@@ -54,3 +54,51 @@ func TestLocalizeOfficialErrorFallsBackForUnmappedFeedback(t *testing.T) {
 		})
 	}
 }
+
+func TestOfficialErrorCodeInfersKnownTrailingCodeFromMessage(t *testing.T) {
+	feedback := &UpstreamFeedback{Message: "cannot download media URL (2013)"}
+	if got := OfficialErrorCode(feedback); got != "2013" {
+		t.Fatalf("OfficialErrorCode() = %q; want 2013", got)
+	}
+}
+
+func TestOfficialErrorCodeDoesNotInferUntrustedMessageContent(t *testing.T) {
+	tests := map[string]string{
+		"unknown code":        "upstream failure (9999)",
+		"non-numeric code":    "upstream failure (error)",
+		"code not at the end": "upstream failure (2013) retry",
+		"missing parentheses": "upstream failure 2013",
+	}
+	for name, message := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := OfficialErrorCode(&UpstreamFeedback{Message: message}); got != "" {
+				t.Fatalf("OfficialErrorCode() = %q; want empty", got)
+			}
+		})
+	}
+}
+
+func TestOfficialErrorCodePrefersExplicitCode(t *testing.T) {
+	feedback := &UpstreamFeedback{Code: "1027", Message: "cannot download media URL (2013)"}
+	if got := OfficialErrorCode(feedback); got != "1027" {
+		t.Fatalf("OfficialErrorCode() = %q; want 1027", got)
+	}
+}
+
+func TestLocalizeOfficialErrorDescribesMediaDownloadFailure(t *testing.T) {
+	code, message := LocalizeOfficialError("official_submit_failed", "官方任务提交失败", &UpstreamFeedback{
+		Message: "cannot download media URL (2013)",
+	})
+	if code != "2013" || message != "无法下载媒体 URL，请确认地址可被公网直接访问并返回有效媒体文件" {
+		t.Fatalf("LocalizeOfficialError() = %q, %q", code, message)
+	}
+}
+
+func TestLocalizeOfficialErrorKeepsGenericMessageForOther2013Failures(t *testing.T) {
+	code, message := LocalizeOfficialError("official_submit_failed", "官方任务提交失败", &UpstreamFeedback{
+		Message: "invalid params (2013)",
+	})
+	if code != "2013" || message != "请求参数无效，或字形定义格式错误" {
+		t.Fatalf("LocalizeOfficialError() = %q, %q", code, message)
+	}
+}

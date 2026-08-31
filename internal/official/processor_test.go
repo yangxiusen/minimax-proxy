@@ -181,6 +181,26 @@ func TestProcessorPersistsStructuredOfficialSubmitFeedback(t *testing.T) {
 	}
 }
 
+func TestProcessorInfersMissingOfficialCodeFromSubmitMessage(t *testing.T) {
+	store := &storeFake{claimed: domain.Task{TaskID: "proxy-media-download", RequestJSON: `{}`}}
+	client := &clientFake{
+		submitErr: &minimaxv2.HTTPError{
+			StatusCode: 400, Type: "bad_request_error",
+			Message: "cannot download media URL (2013)", RequestID: "req-media-download",
+		},
+	}
+	processor := Processor{Store: store, Client: client, NodeID: "node-1", NodeVersion: 1, Capacity: 1, PollInterval: time.Millisecond}
+
+	if err := processor.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	feedback := store.failedFeedback
+	if store.failedCode != "2013" || store.failedMessage != "无法下载媒体 URL，请确认地址可被公网直接访问并返回有效媒体文件" ||
+		feedback == nil || feedback.Code != "2013" || feedback.HTTPStatus != 400 || feedback.RequestID != "req-media-download" {
+		t.Fatalf("failure=%q %q feedback=%+v", store.failedCode, store.failedMessage, feedback)
+	}
+}
+
 func TestProcessorPreservesSubmitFeedbackWhenReconciliationFails(t *testing.T) {
 	store := &storeFake{claimed: domain.Task{TaskID: "proxy-feedback-reconcile", RequestJSON: `{}`}}
 	client := &clientFake{
@@ -203,13 +223,15 @@ func TestProcessorPreservesSubmitFeedbackWhenReconciliationFails(t *testing.T) {
 
 func TestProcessorLocalizesKnownGenerationErrorsAndFallsBackForUnmappedCodes(t *testing.T) {
 	tests := []struct {
-		name        string
-		status      minimaxv2.Status
-		upstream    *minimaxv2.TaskError
-		wantCode    string
-		wantMessage string
+		name             string
+		status           minimaxv2.Status
+		upstream         *minimaxv2.TaskError
+		wantCode         string
+		wantMessage      string
+		wantFeedbackCode string
 	}{
 		{name: "known", status: minimaxv2.StatusFailed, upstream: &minimaxv2.TaskError{Code: "1027", Message: "raw sensitive message"}, wantCode: "1027", wantMessage: "模型生成内容触发安全审核，需要修改输入后重新生成"},
+		{name: "inferred media download", status: minimaxv2.StatusFailed, upstream: &minimaxv2.TaskError{Message: "cannot download media URL (2013)"}, wantCode: "2013", wantMessage: "无法下载媒体 URL，请确认地址可被公网直接访问并返回有效媒体文件", wantFeedbackCode: "2013"},
 		{name: "unknown", status: minimaxv2.StatusFailed, upstream: &minimaxv2.TaskError{Code: "9999", Message: "unreviewed upstream message"}, wantCode: "official_generation_failed", wantMessage: "官方视频生成任务失败"},
 		{name: "empty", status: minimaxv2.StatusFailed, upstream: &minimaxv2.TaskError{Message: "unreviewed upstream message"}, wantCode: "official_generation_failed", wantMessage: "官方视频生成任务失败"},
 		{name: "success code", status: minimaxv2.StatusFailed, upstream: &minimaxv2.TaskError{Code: "0", Message: "success"}, wantCode: "official_generation_failed", wantMessage: "官方视频生成任务失败"},
@@ -227,7 +249,11 @@ func TestProcessorLocalizesKnownGenerationErrorsAndFallsBackForUnmappedCodes(t *
 			if store.failedCode != test.wantCode || store.failedMessage != test.wantMessage {
 				t.Fatalf("failure=%q %q; want %q %q", store.failedCode, store.failedMessage, test.wantCode, test.wantMessage)
 			}
-			if store.failedFeedback == nil || store.failedFeedback.Code != test.upstream.Code || store.failedFeedback.Message != test.upstream.Message {
+			wantFeedbackCode := test.wantFeedbackCode
+			if wantFeedbackCode == "" {
+				wantFeedbackCode = test.upstream.Code
+			}
+			if store.failedFeedback == nil || store.failedFeedback.Code != wantFeedbackCode || store.failedFeedback.Message != test.upstream.Message {
 				t.Fatalf("feedback=%+v", store.failedFeedback)
 			}
 		})

@@ -1,5 +1,9 @@
 package domain
 
+import "strings"
+
+const mediaDownloadErrorMessage = "cannot download media URL (2013)"
+
 var officialErrorMessages = map[string]string{
 	"1000":  "未知错误，稍后重试",
 	"1001":  "请求超时，可以重试",
@@ -27,12 +31,41 @@ var officialErrorMessages = map[string]string{
 }
 
 func LocalizeOfficialError(fallbackCode, fallbackMessage string, feedback *UpstreamFeedback) (string, string) {
-	if feedback == nil {
-		return fallbackCode, fallbackMessage
-	}
-	message, ok := officialErrorMessages[feedback.Code]
+	code := OfficialErrorCode(feedback)
+	message, ok := officialErrorMessages[code]
 	if !ok {
 		return fallbackCode, fallbackMessage
 	}
-	return feedback.Code, message
+	if code == "2013" && strings.EqualFold(strings.TrimSpace(feedback.Message), mediaDownloadErrorMessage) {
+		message = "无法下载媒体 URL，请确认地址可被公网直接访问并返回有效媒体文件"
+	}
+	return code, message
+}
+
+func OfficialErrorCode(feedback *UpstreamFeedback) string {
+	if feedback == nil {
+		return ""
+	}
+	if code := strings.TrimSpace(feedback.Code); code != "" {
+		return code
+	}
+
+	message := strings.TrimSpace(feedback.Message)
+	if len(message) < 3 || message[len(message)-1] != ')' {
+		return ""
+	}
+	opening := strings.LastIndexByte(message, '(')
+	if opening < 0 || opening == len(message)-2 {
+		return ""
+	}
+	candidate := message[opening+1 : len(message)-1]
+	for _, character := range candidate {
+		if character < '0' || character > '9' {
+			return ""
+		}
+	}
+	if _, known := officialErrorMessages[candidate]; !known {
+		return ""
+	}
+	return candidate
 }

@@ -151,6 +151,7 @@ func (p *Processor) ProcessTask(ctx context.Context, task domain.Task) error {
 			}
 			if result.Error != nil {
 				feedback = &domain.UpstreamFeedback{Code: result.Error.Code, Message: result.Error.Message}
+				feedback.Code = domain.OfficialErrorCode(feedback)
 			}
 			code, message = domain.LocalizeOfficialError(code, message, feedback)
 			return p.Store.MarkOfficialFailed(ctx, task.TaskID, p.NodeID, code, message, feedback)
@@ -245,10 +246,12 @@ func upstreamFeedback(cause error) *domain.UpstreamFeedback {
 	if !errors.As(cause, &httpError) {
 		return nil
 	}
-	return &domain.UpstreamFeedback{
+	feedback := &domain.UpstreamFeedback{
 		HTTPStatus: httpError.StatusCode, Code: httpError.Code, Type: httpError.Type,
 		Message: httpError.Message, ResourceType: httpError.ResourceType, RequestID: httpError.RequestID,
 	}
+	feedback.Code = domain.OfficialErrorCode(feedback)
+	return feedback
 }
 
 func officialFailureMessage(code string) string {
