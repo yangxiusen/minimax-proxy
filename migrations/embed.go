@@ -96,3 +96,8 @@ var OfficialSubmissionBaselineState string
 //
 //go:embed 020_upstream_feedback.sql
 var UpstreamFeedback string
+
+// OSSInputObjectMetadata 保存对象存储输入的公开读取地址。
+//
+//go:embed 021_oss_input_object_metadata.sql
+var OSSInputObjectMetadata string

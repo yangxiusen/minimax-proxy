@@ -28,6 +28,8 @@ func sanitizedTaskRequest(requestJSON string, files []domain.InputSpoolFile) (an
 			urlObject, _ = item["image_url"].(map[string]any)
 		case "audio_url":
 			urlObject, _ = item["audio_url"].(map[string]any)
+		case "video_url":
+			urlObject, _ = item["video_url"].(map[string]any)
 		default:
 			continue
 		}
@@ -42,6 +44,9 @@ func sanitizedTaskRequest(requestJSON string, files []domain.InputSpoolFile) (an
 		}
 		if file, ok := byIndex[index]; ok {
 			item["source_kind"] = file.SourceKind
+			if file.ObjectURL != "" {
+				item["source_kind"] = "object_storage"
+			}
 			item["media_type"] = file.MediaType
 			item["extension"] = file.Extension
 			item["file_name"] = filepath.Base(filepath.FromSlash(file.RelativePath))

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"minimax-h3-tc/internal/config"
+	"minimax-h3-tc/internal/domain"
 	"minimax-h3-tc/internal/inputobject"
 	"minimax-h3-tc/internal/inputspool"
 )
@@ -37,9 +38,18 @@ func (p *inputObjectPreparerFake) Prepare(_ context.Context, namespace string, _
 	return p.result, p.err
 }
 
-func TestCreateUsesObjectInputRequestWithoutLocalSpoolMetadata(t *testing.T) {
+func TestCreateUsesObjectInputRequestAndPersistsRemoteMetadata(t *testing.T) {
 	store := &createSpyStore{}
-	objects := &inputObjectPreparerFake{result: inputobject.PreparedRequest{Enabled: true, JSON: []byte(`{"model":"MiniMax-H3","content":[{"type":"text","text":"海边日落"},{"type":"image_url","role":"first_frame","image_url":{"url":"https://cdn.example/input.png"}}],"resolution":"2K","duration":5,"ratio":"16:9"}`)}}
+	objects := &inputObjectPreparerFake{result: inputobject.PreparedRequest{
+		Enabled: true,
+		JSON:    []byte(`{"model":"MiniMax-H3","content":[{"type":"text","text":"海边日落"},{"type":"image_url","role":"first_frame","image_url":{"url":"https://cdn.example/input.png"}}],"resolution":"2K","duration":5,"ratio":"16:9"}`),
+		Files: []domain.InputSpoolFile{{
+			ContentIndex: 1, ContentType: "image_url", Role: "first_frame", SourceKind: "data_uri",
+			DeclaredMIME: "image/png", DetectedMIME: "image/png", MediaType: "image/png", Extension: ".png",
+			RelativePath: "MiniMax-H3/inputs/request/1-deadbeef.png", ObjectURL: "https://cdn.example/input.png",
+			SizeBytes: 68, SHA256: strings.Repeat("a", 64),
+		}},
+	}}
 	spooler := inputspool.New(t.TempDir())
 	handler := NewHandler(Dependencies{Store: store, APIKeys: []config.APIKeyConfig{{ID: "owner-a", Key: "key-a", Enabled: true}}, Profiles: profiles(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), InputSpooler: spooler, InputObjects: objects})
 	body := []byte(`{"model":"MiniMax-H3","content":[{"type":"text","text":"海边日落"},{"type":"image_url","role":"first_frame","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}}],"resolution":"2K","duration":5,"ratio":"16:9"}`)
@@ -47,8 +57,12 @@ func TestCreateUsesObjectInputRequestWithoutLocalSpoolMetadata(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
-	if objects.calls != 1 || len(store.lastTask.InputSpoolFiles) != 0 || !strings.Contains(store.lastTask.RequestJSON, "https://cdn.example/input.png") || strings.Contains(store.lastTask.RequestJSON, "proxy-input://") {
+	if objects.calls != 1 || len(store.lastTask.InputSpoolFiles) != 1 || !strings.Contains(store.lastTask.RequestJSON, "https://cdn.example/input.png") || strings.Contains(store.lastTask.RequestJSON, "proxy-input://") {
 		t.Fatalf("calls=%d task=%+v", objects.calls, store.lastTask)
+	}
+	file := store.lastTask.InputSpoolFiles[0]
+	if file.TaskID != store.lastTask.TaskID || !strings.HasPrefix(file.ID, "input_") || file.ObjectURL != "https://cdn.example/input.png" {
+		t.Fatalf("persisted remote metadata=%+v task_id=%q", file, store.lastTask.TaskID)
 	}
 	if len(objects.namespace) != 64 || objects.namespace == store.lastTask.TaskID {
 		t.Fatalf("unstable namespace=%q task_id=%q", objects.namespace, store.lastTask.TaskID)

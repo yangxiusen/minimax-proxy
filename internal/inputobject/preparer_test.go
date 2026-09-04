@@ -54,6 +54,16 @@ func TestPrepareUploadsDataURIAndLeavesURLInputsUnchanged(t *testing.T) {
 	if !result.Enabled || upload.calls != 1 || upload.mime != "image/png" || string(upload.payload) != string(png) {
 		t.Fatalf("result=%+v upload=%+v", result, upload)
 	}
+	if len(result.Files) != 1 {
+		t.Fatalf("metadata files=%+v, want one object-backed input", result.Files)
+	}
+	file := result.Files[0]
+	if file.ContentIndex != 0 || file.ContentType != "image_url" || file.Role != "first_frame" ||
+		file.SourceKind != "data_uri" || file.DeclaredMIME != "image/png" || file.DetectedMIME != "image/png" ||
+		file.MediaType != "image/png" || file.Extension != ".png" || file.RelativePath != upload.key ||
+		file.ObjectURL != "https://cdn.example.com/"+upload.key || file.SizeBytes != int64(len(png)) || len(file.SHA256) != 64 {
+		t.Fatalf("object input metadata=%+v", file)
+	}
 	if !strings.Contains(upload.key, "/request-namespace/") {
 		t.Fatalf("unstable object key=%q", upload.key)
 	}

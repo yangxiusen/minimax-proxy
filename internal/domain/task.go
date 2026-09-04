@@ -114,6 +114,7 @@ type InputSpoolFile struct {
 	MediaType    string
 	Extension    string
 	RelativePath string
+	ObjectURL    string
 	SizeBytes    int64
 	SHA256       string
 	CreatedAt    time.Time

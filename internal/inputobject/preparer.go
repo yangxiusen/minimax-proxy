@@ -27,6 +27,7 @@ type StoreFactory func(domain.ObjectStorageConfig, string, string) (objectstore.
 type PreparedRequest struct {
 	JSON    []byte
 	Enabled bool
+	Files   []domain.InputSpoolFile
 }
 type Preparer struct {
 	configs ConfigStore
@@ -77,6 +78,7 @@ func (p *Preparer) Prepare(ctx context.Context, requestNamespace string, request
 	if err != nil {
 		return PreparedRequest{}, ErrNotReady
 	}
+	result := PreparedRequest{Enabled: true}
 	for index, rawItem := range content {
 		if err := ctx.Err(); err != nil {
 			return PreparedRequest{}, err
@@ -104,10 +106,21 @@ func (p *Preparer) Prepare(ctx context.Context, requestNamespace string, request
 			return PreparedRequest{}, fmt.Errorf("%w: %v", ErrUploadFailed, err)
 		}
 		urlObject["url"] = publicURL
+		role, _ := item["role"].(string)
+		if role == "" {
+			role = "input"
+		}
+		result.Files = append(result.Files, domain.InputSpoolFile{
+			ContentIndex: index, ContentType: contentType, Role: role,
+			SourceKind: "data_uri", DeclaredMIME: decoded.DeclaredMIME, DetectedMIME: decoded.DetectedMIME,
+			MediaType: decoded.MediaType, Extension: decoded.Extension, RelativePath: key, ObjectURL: publicURL,
+			SizeBytes: int64(len(decoded.Payload)), SHA256: decoded.SHA256,
+		})
 	}
 	rewritten, err := json.Marshal(request)
 	if err != nil {
 		return PreparedRequest{}, err
 	}
-	return PreparedRequest{JSON: rewritten, Enabled: true}, nil
+	result.JSON = rewritten
+	return result, nil
 }

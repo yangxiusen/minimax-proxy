@@ -803,6 +803,7 @@ function renderTaskDetail(detail) {
         detailRow("角色", item.role),
         detailRow("来源", item.source_kind || "url"),
         detailRow("MIME", item.media_type),
+        detailRow("格式", item.extension),
         detailRow("文件", item.file_name || item.input_ref || "已隐藏"),
         detailRow("大小", item.size_bytes ? `${item.size_bytes} B` : "--"),
         detailRow("SHA256", item.sha256 ? `${String(item.sha256).slice(0, 16)}...` : "--")

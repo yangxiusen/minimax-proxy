@@ -101,6 +101,7 @@ type Dependencies struct {
 	APIKeyService      APIKeyService
 	ArtifactURLs       ArtifactURLSigner
 	InputSpooler       *inputspool.Spooler
+	InputObjectClient  *http.Client
 }
 
 type handler struct {
@@ -123,6 +124,7 @@ type handler struct {
 	probeObjectStorage func(context.Context, ObjectStorageProbeInput) ObjectStorageProbeResult
 	artifactURLs       ArtifactURLSigner
 	inputSpooler       *inputspool.Spooler
+	inputObjectClient  *http.Client
 
 	sessionMu          sync.Mutex
 	sessions           map[[sha256.Size]byte]time.Time
@@ -159,6 +161,12 @@ func NewHandler(dependencies Dependencies) http.Handler {
 	if monitorInterval <= 0 {
 		monitorInterval = 5 * time.Second
 	}
+	inputObjectClient := dependencies.InputObjectClient
+	if inputObjectClient == nil {
+		inputObjectClient = &http.Client{Timeout: 5 * time.Minute}
+	}
+	safeInputObjectClient := *inputObjectClient
+	safeInputObjectClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	h := &handler{
 		cache:              cache,
 		store:              dependencies.Store,
@@ -178,6 +186,7 @@ func NewHandler(dependencies Dependencies) http.Handler {
 		probeObjectStorage: dependencies.ProbeObjectStorage,
 		artifactURLs:       dependencies.ArtifactURLs,
 		inputSpooler:       dependencies.InputSpooler,
+		inputObjectClient:  &safeInputObjectClient,
 		sessions:           make(map[[sha256.Size]byte]time.Time),
 		failures:           make(map[string]loginFailure),
 	}
@@ -677,6 +686,7 @@ func (h *handler) taskDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	requestBody, legacy := sanitizedTaskRequest(detail.Task.RequestJSON, detail.InputSpoolFiles)
+	h.enrichHistoricalObjectInputs(r.Context(), requestBody)
 	var config any
 	if detail.Task.ConfigSnapshotJSON != "" {
 		_ = json.Unmarshal([]byte(detail.Task.ConfigSnapshotJSON), &config)
@@ -768,13 +778,20 @@ func (h *handler) taskInputContent(w http.ResponseWriter, r *http.Request) {
 		h.internalError(w, r, errors.New("monitor task store is nil"))
 		return
 	}
-	if h.inputSpooler == nil || h.inputSpooler.Root() == "" {
-		h.internalError(w, r, errors.New("input spooler is nil"))
-		return
-	}
 	fileMeta, err := h.store.GetInputSpoolFile(r.Context(), taskID, inputID)
+	if errors.Is(err, domain.ErrTaskNotFound) {
+		fileMeta, err = h.resolveHistoricalObjectInput(r.Context(), taskID, inputID)
+	}
 	if err != nil {
 		h.writeTaskActionError(w, r, err)
+		return
+	}
+	if fileMeta.ObjectURL != "" {
+		h.serveObjectInput(w, r, fileMeta)
+		return
+	}
+	if h.inputSpooler == nil || h.inputSpooler.Root() == "" {
+		h.internalError(w, r, errors.New("input spooler is nil"))
 		return
 	}
 	absolutePath, err := h.inputSpoolPath(fileMeta)
@@ -824,6 +841,81 @@ func (h *handler) taskInputContent(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": fileName}))
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	http.ServeContent(w, r, fileName, info.ModTime(), file)
+}
+
+func (h *handler) serveObjectInput(w http.ResponseWriter, r *http.Request, fileMeta domain.InputSpoolFile) {
+	target, err := url.Parse(fileMeta.ObjectURL)
+	if err != nil || target.Scheme != "https" || target.Host == "" || target.User != nil || target.Fragment != "" {
+		h.internalError(w, r, errors.New("对象存储输入 URL 无效"))
+		return
+	}
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target.String(), nil)
+	if err != nil {
+		h.internalError(w, r, err)
+		return
+	}
+	if value := r.Header.Get("Range"); value != "" {
+		request.Header.Set("Range", value)
+	}
+	response, err := h.inputObjectClient.Do(request)
+	if err != nil {
+		h.writeError(w, http.StatusBadGateway, "input_object_read_failed", "对象存储输入暂时无法读取")
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent {
+		h.writeError(w, http.StatusBadGateway, "input_object_read_failed", "对象存储输入暂时无法读取")
+		return
+	}
+	if responseSize, known := inputObjectResponseSize(response); fileMeta.SizeBytes > 0 && known && responseSize != fileMeta.SizeBytes {
+		h.writeError(w, http.StatusBadGateway, "input_object_changed", "对象存储输入内容已变化")
+		return
+	}
+	contentType, previewable := historicalMediaType(fileMeta.ContentType, strings.ToLower(fileMeta.Extension))
+	if !previewable {
+		contentType = "application/octet-stream"
+	}
+	fileName := filepath.Base(filepath.FromSlash(fileMeta.RelativePath))
+	if fileName == "." || fileName == string(filepath.Separator) || fileName == "" {
+		fileName = fileMeta.ID + fileMeta.Extension
+	}
+	disposition := "inline"
+	if r.URL.Query().Get("download") == "1" || !previewable {
+		disposition = "attachment"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": fileName}))
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	for _, header := range []string{"Accept-Ranges", "Content-Length", "Content-Range"} {
+		if value := response.Header.Get(header); value != "" {
+			w.Header().Set(header, value)
+		}
+	}
+	w.WriteHeader(response.StatusCode)
+	if _, err := io.Copy(w, response.Body); err != nil {
+		h.logger.WarnContext(r.Context(), "对象存储输入响应传输失败", "task_id", fileMeta.TaskID, "input_id", fileMeta.ID, "stage", "input_object_read")
+	}
+}
+
+func inputObjectResponseSize(response *http.Response) (int64, bool) {
+	if response.StatusCode == http.StatusOK {
+		length := response.ContentLength
+		if length <= 0 {
+			length, _ = strconv.ParseInt(response.Header.Get("Content-Length"), 10, 64)
+		}
+		return length, length > 0
+	}
+	if response.StatusCode == http.StatusPartialContent {
+		contentRange := response.Header.Get("Content-Range")
+		slash := strings.LastIndexByte(contentRange, '/')
+		if slash < 0 || slash == len(contentRange)-1 || contentRange[slash+1:] == "*" {
+			return 0, false
+		}
+		total, err := strconv.ParseInt(contentRange[slash+1:], 10, 64)
+		return total, err == nil && total > 0
+	}
+	return 0, false
 }
 
 func (h *handler) inputSpoolPath(fileMeta domain.InputSpoolFile) (string, error) {

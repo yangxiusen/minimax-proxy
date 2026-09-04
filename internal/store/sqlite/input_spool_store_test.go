@@ -16,8 +16,8 @@ func TestMigrationV15CreatesInputSpoolFiles(t *testing.T) {
 	if err := store.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil {
 		t.Fatalf("query user_version: %v", err)
 	}
-	if userVersion != 20 {
-		t.Fatalf("user_version=%d, want 20", userVersion)
+	if userVersion != 21 {
+		t.Fatalf("user_version=%d, want 21", userVersion)
 	}
 	var migrationCount int
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=15`).Scan(&migrationCount); err != nil {
@@ -42,8 +42,8 @@ func TestMigrationV17AllowsVideoInputSpoolFiles(t *testing.T) {
 	if err := store.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil {
 		t.Fatal(err)
 	}
-	if userVersion != 20 {
-		t.Fatalf("user_version=%d, want 20", userVersion)
+	if userVersion != 21 {
+		t.Fatalf("user_version=%d, want 21", userVersion)
 	}
 	input := newStoreTask("video-spool", "key-video-spool")
 	input.InputSpoolFiles = []domain.InputSpoolFile{{
@@ -79,12 +79,12 @@ func TestMigrationV17TableRebuildPreservesExistingRows(t *testing.T) {
 	if _, err := store.db.ExecContext(ctx, migrations.OfficialV2Base64Inputs); err != nil {
 		t.Fatalf("rebuild input spool table: %v", err)
 	}
-	files, err := store.ListInputSpoolFiles(ctx, input.TaskID)
-	if err != nil {
+	var id, contentType string
+	if err := store.db.QueryRowContext(ctx, `SELECT id,content_type FROM task_input_spool_files WHERE task_id=?`, input.TaskID).Scan(&id, &contentType); err != nil {
 		t.Fatal(err)
 	}
-	if len(files) != 1 || files[0].ID != "input-existing" || files[0].ContentType != "image_url" {
-		t.Fatalf("preserved files=%+v", files)
+	if id != "input-existing" || contentType != "image_url" {
+		t.Fatalf("preserved id=%q content_type=%q", id, contentType)
 	}
 }
 

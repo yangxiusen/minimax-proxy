@@ -20,8 +20,8 @@ func TestUpstreamFeedbackMigration(t *testing.T) {
 	if err := store.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 20 {
-		t.Fatalf("user_version=%d want=20", version)
+	if version != 21 {
+		t.Fatalf("user_version=%d want=21", version)
 	}
 	var columnCount int
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('video_tasks') WHERE name='upstream_feedback_json' AND type='TEXT' AND "notnull"=0`).Scan(&columnCount); err != nil {

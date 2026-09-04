@@ -89,6 +89,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		{version: 18, name: "Base64 输入直传对象存储", sql: migrations.OSSDirectBase64Inputs},
 		{version: 19, name: "官方提交基线状态", sql: migrations.OfficialSubmissionBaselineState},
 		{version: 20, name: "上游反馈信息", sql: migrations.UpstreamFeedback},
+		{version: 21, name: "对象存储输入元数据", sql: migrations.OSSInputObjectMetadata},
 	})
 }
 
@@ -228,8 +229,8 @@ func (s *Store) Create(ctx context.Context, input domain.NewTask, keyHash string
 		if err := validateInputSpoolFile(file); err != nil {
 			return domain.Task{}, err
 		}
-		_, err = conn.ExecContext(ctx, `INSERT INTO task_input_spool_files(id,task_id,content_index,content_type,role,source_kind,declared_mime,detected_mime,media_type,extension,relative_path,size_bytes,sha256,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			file.ID, file.TaskID, file.ContentIndex, file.ContentType, file.Role, file.SourceKind, nullEmpty(file.DeclaredMIME), nullEmpty(file.DetectedMIME), file.MediaType, file.Extension, file.RelativePath, file.SizeBytes, file.SHA256, now*1000, now*1000)
+		_, err = conn.ExecContext(ctx, `INSERT INTO task_input_spool_files(id,task_id,content_index,content_type,role,source_kind,declared_mime,detected_mime,media_type,extension,relative_path,object_url,size_bytes,sha256,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			file.ID, file.TaskID, file.ContentIndex, file.ContentType, file.Role, file.SourceKind, nullEmpty(file.DeclaredMIME), nullEmpty(file.DetectedMIME), file.MediaType, file.Extension, file.RelativePath, nullEmpty(file.ObjectURL), file.SizeBytes, file.SHA256, now*1000, now*1000)
 		if err != nil {
 			return domain.Task{}, fmt.Errorf("插入输入临时文件元数据: %w", err)
 		}

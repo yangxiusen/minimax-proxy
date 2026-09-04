@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"net/url"
 	"time"
 
 	"minimax-h3-tc/internal/domain"
@@ -89,10 +90,16 @@ func validateInputSpoolFile(file domain.InputSpoolFile) error {
 	if file.SourceKind != "data_uri" {
 		return errors.New("输入临时文件来源类型无效")
 	}
+	if file.ObjectURL != "" {
+		parsed, err := url.Parse(file.ObjectURL)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+			return errors.New("对象存储输入 URL 无效")
+		}
+	}
 	return nil
 }
 
-const inputSpoolFileSelect = `SELECT id,task_id,content_index,content_type,role,source_kind,COALESCE(declared_mime,''),COALESCE(detected_mime,''),media_type,extension,relative_path,size_bytes,sha256,created_at,updated_at FROM task_input_spool_files`
+const inputSpoolFileSelect = `SELECT id,task_id,content_index,content_type,role,source_kind,COALESCE(declared_mime,''),COALESCE(detected_mime,''),media_type,extension,relative_path,COALESCE(object_url,''),size_bytes,sha256,created_at,updated_at FROM task_input_spool_files`
 
 func scanInputSpoolFile(scanner rowScanner) (domain.InputSpoolFile, error) {
 	var file domain.InputSpoolFile
@@ -100,7 +107,7 @@ func scanInputSpoolFile(scanner rowScanner) (domain.InputSpoolFile, error) {
 	err := scanner.Scan(
 		&file.ID, &file.TaskID, &file.ContentIndex, &file.ContentType, &file.Role, &file.SourceKind,
 		&file.DeclaredMIME, &file.DetectedMIME, &file.MediaType, &file.Extension, &file.RelativePath,
-		&file.SizeBytes, &file.SHA256, &createdAt, &updatedAt,
+		&file.ObjectURL, &file.SizeBytes, &file.SHA256, &createdAt, &updatedAt,
 	)
 	if err != nil {
 		return domain.InputSpoolFile{}, err

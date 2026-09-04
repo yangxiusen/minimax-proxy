@@ -273,6 +273,11 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 		objectInputsEnabled = objectPrepared.Enabled
 		if objectInputsEnabled {
 			persistedJSON = objectPrepared.JSON
+			prepared.Files = objectPrepared.Files
+			for index := range prepared.Files {
+				prepared.Files[index].TaskID = taskID
+				prepared.Files[index].ID = objectInputID(taskID, prepared.Files[index])
+			}
 		}
 	}
 	if !objectInputsEnabled && h.inputSpooler != nil {
@@ -324,6 +329,11 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 func inputObjectNamespace(ownerID, requestHash string) string {
 	digest := sha256.Sum256([]byte(ownerID + "\x00" + requestHash))
 	return hex.EncodeToString(digest[:])
+}
+
+func objectInputID(taskID string, file domain.InputSpoolFile) string {
+	digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%s", taskID, file.ContentIndex, file.ObjectURL)))
+	return "input_" + hex.EncodeToString(digest[:16])
 }
 
 func freezeStages(taskID string, request ValidatedRequest, configJSON string) ([]domain.NewTaskStage, error) {

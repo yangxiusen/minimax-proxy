@@ -12,7 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func TestOpenMigratesEmptyDatabaseThroughVersionSixteenAndIsRepeatable(t *testing.T) {
+func TestOpenMigratesEmptyDatabaseThroughLatestVersionAndIsRepeatable(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "empty.db")
 	for attempt := 0; attempt < 2; attempt++ {
@@ -24,10 +24,10 @@ func TestOpenMigratesEmptyDatabaseThroughVersionSixteenAndIsRepeatable(t *testin
 		if err := store.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version IN (1,2,3,4,5,6,7,8,10,11,12,13,14,15,16,17)`).Scan(&migrationCount); err != nil {
+		if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&migrationCount); err != nil {
 			t.Fatal(err)
 		}
-		if userVersion != 20 || migrationCount != 16 {
+		if userVersion != 21 || migrationCount != 20 {
 			t.Fatalf("attempt %d user_version=%d migrations=%d", attempt, userVersion, migrationCount)
 		}
 		for _, table := range []string{"model_request_profiles", "request_profiles", "profile_test_runs", "task_stages", "stage_attempts", "task_artifacts", "artifact_locations", "artifact_deletion_jobs", "artifact_deletion_items", "callback_deliveries", "external_api_keys", "api_key_config_bootstrap", "task_input_spool_files"} {
@@ -164,7 +164,7 @@ func TestOpenForwardsVersionSevenCallbackRowsThroughLatestVersion(t *testing.T) 
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('callback_deliveries') WHERE name IN ('request_body','lease_expires_at')`).Scan(&columns); err != nil {
 		t.Fatal(err)
 	}
-	if userVersion != 20 || columns != 2 {
+	if userVersion != 21 || columns != 2 {
 		t.Fatalf("user_version=%d columns=%d", userVersion, columns)
 	}
 }

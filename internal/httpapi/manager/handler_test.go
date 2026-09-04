@@ -50,6 +50,10 @@ type managerSignerSpy struct {
 	err                      error
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return fn(request) }
+
 func (s *managerSignerSpy) SignURL(_ context.Context, artifactID, ownerID string) (string, error) {
 	s.artifactID, s.ownerID = artifactID, ownerID
 	return s.url, s.err
@@ -272,7 +276,8 @@ func TestTaskDetailRequiresAuthenticationAndReturnsSanitizedRequest(t *testing.T
 		InputSpoolFiles: []domain.InputSpoolFile{{
 			ID: "input_abc", TaskID: "task-detail", ContentIndex: 1, ContentType: "image_url", Role: "first_frame",
 			SourceKind: "data_uri", MediaType: "image/png", Extension: ".png", RelativePath: "task-detail/input_abc.png",
-			SizeBytes: 12, SHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			ObjectURL: "https://cdn.example.com/MiniMax-H3/inputs/request/input_abc.png", SizeBytes: 12,
+			SHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		}},
 	}}
 	h := testHandler(Dependencies{Admin: config.AdminConfig{Username: "admin", Password: "secret", SessionTTL: time.Hour}, Store: store, Now: func() time.Time { return now }})
@@ -285,12 +290,12 @@ func TestTaskDetailRequiresAuthenticationAndReturnsSanitizedRequest(t *testing.T
 		t.Fatalf("detail status=%d body=%s", response.Code, response.Body.String())
 	}
 	body := response.Body.String()
-	for _, expected := range []string{`"id":"task-detail"`, `"text":"hello"`, `"input_ref":"proxy-input://task-detail/input_abc"`, `"file_name":"input_abc.png"`, `"legacy_base64_present":false`, `"upstream_feedback":{"http_status":422,"code":"1027","type":"unprocessable_entity_error","message":"text content contains sensitive content (1027)","resource_type":"text","request_id":"req-sensitive"}`} {
+	for _, expected := range []string{`"id":"task-detail"`, `"text":"hello"`, `"input_ref":"proxy-input://task-detail/input_abc"`, `"source_kind":"object_storage"`, `"file_name":"input_abc.png"`, `"legacy_base64_present":false`, `"upstream_feedback":{"http_status":422,"code":"1027","type":"unprocessable_entity_error","message":"text content contains sensitive content (1027)","resource_type":"text","request_id":"req-sensitive"}`} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("detail body missing %q: %s", expected, body)
 		}
 	}
-	if strings.Contains(body, "relative_path") || strings.Contains(body, ";base64,") {
+	if strings.Contains(body, "relative_path") || strings.Contains(body, "object_url") || strings.Contains(body, "cdn.example.com") || strings.Contains(body, ";base64,") {
 		t.Fatalf("detail leaked path or base64: %s", body)
 	}
 	store.detail.Task.UpstreamFeedback = nil
@@ -402,6 +407,147 @@ func TestTaskInputContentRequiresAuthenticationAndSupportsInlineAndDownload(t *t
 	}
 }
 
+func TestTaskInputContentProxiesObjectStorageWithoutLocalSpool(t *testing.T) {
+	body := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+	store := &taskStoreStub{inputFile: domain.InputSpoolFile{
+		ID: "input_object", TaskID: "task-object", ContentIndex: 0, ContentType: "image_url", Role: "reference_image",
+		SourceKind: "data_uri", MediaType: "image/png", Extension: ".png", RelativePath: "MiniMax-H3/inputs/request/input_object.png",
+		ObjectURL: "https://cdn.example.com/MiniMax-H3/inputs/request/input_object.png", SizeBytes: int64(len(body)),
+		SHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+	}}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.String() != store.inputFile.ObjectURL || request.Header.Get("Authorization") != "" || request.Header.Get("Cookie") != "" {
+			t.Fatalf("unsafe object request url=%s headers=%v", request.URL, request.Header)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"image/png"}, "Content-Length": []string{"8"}}, Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}
+	h := testHandler(Dependencies{
+		Admin: config.AdminConfig{Username: "admin", Password: "secret", SessionTTL: time.Hour},
+		Store: store, InputObjectClient: client,
+	})
+	cookie := login(t, h, "admin", "secret", "192.0.2.10:1")
+	path := "/manager/api/tasks/task-object/inputs/input_object/content"
+	inline := serve(h, http.MethodGet, path, "", "", cookie, "192.0.2.10:1", false)
+	if inline.Code != http.StatusOK || !bytes.Equal(inline.Body.Bytes(), body) {
+		t.Fatalf("inline status=%d body=%x", inline.Code, inline.Body.Bytes())
+	}
+	if disposition := inline.Header().Get("Content-Disposition"); !strings.Contains(disposition, "inline") || !strings.Contains(disposition, "input_object.png") {
+		t.Fatalf("inline disposition=%q", disposition)
+	}
+	download := serve(h, http.MethodGet, path+"?download=1", "", "", cookie, "192.0.2.10:1", false)
+	if download.Code != http.StatusOK || !bytes.Equal(download.Body.Bytes(), body) || !strings.Contains(download.Header().Get("Content-Disposition"), "attachment") {
+		t.Fatalf("download status=%d disposition=%q body=%x", download.Code, download.Header().Get("Content-Disposition"), download.Body.Bytes())
+	}
+}
+
+func TestTaskInputContentForwardsRangeToObjectStorage(t *testing.T) {
+	body := []byte("234")
+	store := &taskStoreStub{inputFile: domain.InputSpoolFile{
+		ID: "input_video", TaskID: "task-range", ContentIndex: 0, ContentType: "video_url", Role: "input",
+		SourceKind: "data_uri", MediaType: "video/mp4", Extension: ".mp4", RelativePath: "MiniMax-H3/inputs/request/input_video.mp4",
+		ObjectURL: "https://cdn.example.com/MiniMax-H3/inputs/request/input_video.mp4", SizeBytes: 8,
+	}}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if got := request.Header.Get("Range"); got != "bytes=2-4" {
+			t.Fatalf("upstream Range=%q", got)
+		}
+		return &http.Response{
+			StatusCode: http.StatusPartialContent,
+			Header: http.Header{
+				"Accept-Ranges":  []string{"bytes"},
+				"Content-Length": []string{"3"},
+				"Content-Range":  []string{"bytes 2-4/8"},
+			},
+			Body: io.NopCloser(bytes.NewReader(body)),
+		}, nil
+	})}
+	h := testHandler(Dependencies{
+		Admin: config.AdminConfig{Username: "admin", Password: "secret", SessionTTL: time.Hour},
+		Store: store, InputObjectClient: client,
+	})
+	cookie := login(t, h, "admin", "secret", "192.0.2.10:1")
+	request := httptest.NewRequest(http.MethodGet, "/manager/api/tasks/task-range/inputs/input_video/content", nil)
+	request.RemoteAddr = "192.0.2.10:1"
+	request.Header.Set("Range", "bytes=2-4")
+	request.AddCookie(&http.Cookie{Name: SessionCookieName, Value: cookie})
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+
+	if response.Code != http.StatusPartialContent || !bytes.Equal(response.Body.Bytes(), body) {
+		t.Fatalf("status=%d body=%q", response.Code, response.Body.Bytes())
+	}
+	if response.Header().Get("Accept-Ranges") != "bytes" || response.Header().Get("Content-Length") != "3" || response.Header().Get("Content-Range") != "bytes 2-4/8" {
+		t.Fatalf("range headers=%v", response.Header())
+	}
+}
+
+func TestTaskInputContentRejectsChangedObjectLength(t *testing.T) {
+	store := &taskStoreStub{inputFile: domain.InputSpoolFile{
+		ID: "input_changed", TaskID: "task-changed", ContentType: "image_url", Role: "input",
+		MediaType: "image/png", Extension: ".png", RelativePath: "MiniMax-H3/inputs/request/input_changed.png",
+		ObjectURL: "https://cdn.example.com/MiniMax-H3/inputs/request/input_changed.png", SizeBytes: 8,
+	}}
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK, ContentLength: 9,
+			Header: http.Header{"Content-Length": []string{"9"}}, Body: io.NopCloser(strings.NewReader("123456789")),
+		}, nil
+	})}
+	h := testHandler(Dependencies{
+		Admin: config.AdminConfig{Username: "admin", Password: "secret", SessionTTL: time.Hour},
+		Store: store, InputObjectClient: client,
+	})
+	cookie := login(t, h, "admin", "secret", "192.0.2.10:1")
+	response := serve(h, http.MethodGet, "/manager/api/tasks/task-changed/inputs/input_changed/content", "", "", cookie, "192.0.2.10:1", false)
+	if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "input_object_changed") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestTaskInputContentRejectsChangedObjectLengthForRangeRequests(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		statusCode    int
+		contentLength int64
+		contentRange  string
+	}{
+		{name: "upstream ignored range", statusCode: http.StatusOK, contentLength: 9},
+		{name: "partial response total changed", statusCode: http.StatusPartialContent, contentLength: 3, contentRange: "bytes 2-4/9"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			store := &taskStoreStub{inputFile: domain.InputSpoolFile{
+				ID: "input_changed_range", TaskID: "task-changed-range", ContentType: "video_url", Role: "input",
+				MediaType: "video/mp4", Extension: ".mp4", RelativePath: "MiniMax-H3/inputs/request/input_changed_range.mp4",
+				ObjectURL: "https://cdn.example.com/MiniMax-H3/inputs/request/input_changed_range.mp4", SizeBytes: 8,
+			}}
+			client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				header := http.Header{"Content-Length": []string{strconv.FormatInt(testCase.contentLength, 10)}}
+				if testCase.contentRange != "" {
+					header.Set("Content-Range", testCase.contentRange)
+				}
+				return &http.Response{
+					StatusCode: testCase.statusCode, ContentLength: testCase.contentLength,
+					Header: header, Body: io.NopCloser(strings.NewReader(strings.Repeat("x", int(testCase.contentLength)))),
+				}, nil
+			})}
+			h := testHandler(Dependencies{
+				Admin: config.AdminConfig{Username: "admin", Password: "secret", SessionTTL: time.Hour},
+				Store: store, InputObjectClient: client,
+			})
+			cookie := login(t, h, "admin", "secret", "192.0.2.10:1")
+			request := httptest.NewRequest(http.MethodGet, "/manager/api/tasks/task-changed-range/inputs/input_changed_range/content", nil)
+			request.RemoteAddr = "192.0.2.10:1"
+			request.Header.Set("Range", "bytes=2-4")
+			request.AddCookie(&http.Cookie{Name: SessionCookieName, Value: cookie})
+			response := httptest.NewRecorder()
+			h.ServeHTTP(response, request)
+			if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "input_object_changed") {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
 func TestManagerPageIncludesNodeConfigurationWorkflow(t *testing.T) {
 	page, err := webAssets.ReadFile("web/manager.html")
 	if err != nil {
@@ -419,6 +565,9 @@ func TestManagerPageIncludesNodeConfigurationWorkflow(t *testing.T) {
 		if !strings.Contains(string(page), expected) {
 			t.Errorf("manager.html missing node configuration control %q", expected)
 		}
+	}
+	if !strings.Contains(string(script), `detailRow("格式", item.extension)`) {
+		t.Error("manager.js missing media format detail row")
 	}
 	if strings.Contains(string(page), "name=\"api_key_id\"") || strings.Contains(string(page), "<span>Key ID</span>") {
 		t.Error("manager.html still exposes node Key ID")
