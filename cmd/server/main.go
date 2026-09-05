@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -44,9 +45,7 @@ func main() {
 	flag.Parse()
 	logger, closeLog, logErr := newServerLogger(os.Stdout, serverLogDir())
 	if logErr != nil {
-		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 		logger.Error("日志初始化失败", "stage", "lifecycle", "error_code", "log_init_failed", "error_reason", logsafe.Error(logErr))
-		os.Exit(1)
 	}
 	defer closeLog()
 	slog.SetDefault(logger)
@@ -57,19 +56,25 @@ func main() {
 }
 
 func newServerLogger(stdout io.Writer, logDir string) (*slog.Logger, func() error, error) {
+	return newServerLoggerWithClock(stdout, logDir, time.Now)
+}
+
+func newServerLoggerWithClock(stdout io.Writer, logDir string, now func() time.Time) (*slog.Logger, func() error, error) {
 	if stdout == nil {
 		stdout = io.Discard
 	}
 	if err := os.MkdirAll(logDir, 0o750); err != nil {
-		return nil, nil, err
+		logger := slog.New(slog.NewJSONHandler(stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		return logger, func() error { return nil }, err
 	}
-	file, err := os.OpenFile(filepath.Join(logDir, "server.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
-	if err != nil {
-		return nil, nil, err
+	fileWriter := &dailyLogWriter{dir: logDir, now: now}
+	if err := fileWriter.rotateLocked(); err != nil {
+		logger := slog.New(slog.NewJSONHandler(stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		return logger, func() error { return nil }, err
 	}
-	writer := io.MultiWriter(stdout, file)
+	writer := io.MultiWriter(stdout, fileWriter)
 	logger := slog.New(slog.NewJSONHandler(writer, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	return logger, file.Close, nil
+	return logger, fileWriter.Close, nil
 }
 
 func serverLogDir() string {
@@ -77,6 +82,50 @@ func serverLogDir() string {
 		return value
 	}
 	return defaultLogDir
+}
+
+type dailyLogWriter struct {
+	mu          sync.Mutex
+	dir         string
+	now         func() time.Time
+	currentDate string
+	file        *os.File
+}
+
+func (w *dailyLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.rotateLocked(); err != nil {
+		return 0, err
+	}
+	return w.file.Write(p)
+}
+
+func (w *dailyLogWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file == nil {
+		return nil
+	}
+	return w.file.Close()
+}
+
+func (w *dailyLogWriter) rotateLocked() error {
+	date := w.now().Format("2006-01-02")
+	if w.file != nil && w.currentDate == date {
+		return nil
+	}
+	file, err := os.OpenFile(filepath.Join(w.dir, "server-"+date+".log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
+	if err != nil {
+		return err
+	}
+	oldFile := w.file
+	w.file = file
+	w.currentDate = date
+	if oldFile != nil {
+		return oldFile.Close()
+	}
+	return nil
 }
 
 func run(configPath string, logger *slog.Logger) error {

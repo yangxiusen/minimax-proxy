@@ -50,7 +50,8 @@ func TestWarnDefaultAdminPasswordDependsOnlyOnPasswordAndDoesNotLogIt(t *testing
 func TestNewServerLoggerWritesStdoutAndFile(t *testing.T) {
 	var stdout bytes.Buffer
 	logDir := t.TempDir()
-	logger, closeLog, err := newServerLogger(stdoutWriter{&stdout}, logDir)
+	now := func() time.Time { return time.Date(2026, 9, 5, 18, 0, 0, 0, time.UTC) }
+	logger, closeLog, err := newServerLoggerWithClock(stdoutWriter{&stdout}, logDir, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,12 +61,63 @@ func TestNewServerLoggerWritesStdoutAndFile(t *testing.T) {
 	if !strings.Contains(stdout.String(), `"error_reason":"boom"`) {
 		t.Fatalf("stdout log missing error_reason: %s", stdout.String())
 	}
-	data, err := os.ReadFile(filepath.Join(logDir, "server.log"))
+	data, err := os.ReadFile(filepath.Join(logDir, "server-2026-09-05.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Contains(data, []byte(`"error_reason":"boom"`)) {
 		t.Fatalf("file log missing error_reason: %s", string(data))
+	}
+}
+
+func TestNewServerLoggerRotatesFileByDay(t *testing.T) {
+	var stdout bytes.Buffer
+	logDir := t.TempDir()
+	current := time.Date(2026, 9, 5, 23, 59, 0, 0, time.UTC)
+	logger, closeLog, err := newServerLoggerWithClock(stdoutWriter{&stdout}, logDir, func() time.Time { return current })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeLog()
+
+	logger.Info("第一天", "stage", "test")
+	current = current.Add(2 * time.Minute)
+	logger.Info("第二天", "stage", "test")
+
+	first, err := os.ReadFile(filepath.Join(logDir, "server-2026-09-05.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile(filepath.Join(logDir, "server-2026-09-06.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(first, []byte("第一天")) || bytes.Contains(first, []byte("第二天")) {
+		t.Fatalf("first day log mismatch: %s", string(first))
+	}
+	if !bytes.Contains(second, []byte("第二天")) || bytes.Contains(second, []byte("第一天")) {
+		t.Fatalf("second day log mismatch: %s", string(second))
+	}
+}
+
+func TestNewServerLoggerFallsBackToStdoutWhenFilePathIsInvalid(t *testing.T) {
+	var stdout bytes.Buffer
+	logDir := filepath.Join(t.TempDir(), "server.log")
+	if err := os.WriteFile(logDir, []byte("occupied"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logger, closeLog, err := newServerLoggerWithClock(stdoutWriter{&stdout}, logDir, time.Now)
+	if err == nil {
+		t.Fatal("expected file logger error")
+	}
+	if logger == nil {
+		t.Fatal("logger must fall back to stdout")
+	}
+	defer closeLog()
+
+	logger.Error("娴嬭瘯寮傚父", "stage", "test", "error_code", "test_error", "error_reason", "boom")
+	if !strings.Contains(stdout.String(), `"error_reason":"boom"`) {
+		t.Fatalf("stdout fallback missing error_reason: %s", stdout.String())
 	}
 }
 
