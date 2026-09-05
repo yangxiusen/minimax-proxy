@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -71,10 +72,12 @@ func (h cleanupHandlers) preview(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusInternalServerError, "internal_error", "清理预览失败")
 		return
 	}
+	warnings := cleanupPreviewWarnings(preview)
 	h.writeJSON(w, http.StatusOK, map[string]any{
 		"preview_token": preview.Token, "expires_at": millisTime(preview.ExpiresAt), "cutoff_at": millisTime(preview.CutoffAt),
 		"candidate_count": preview.CandidateCount, "candidate_bytes": preview.CandidateBytes,
-		"skipped_active_count": preview.SkippedActiveCount, "by_node": preview.ByNode, "warnings": []string{},
+		"skipped_active_count": preview.SkippedActiveCount, "unmanaged_result_count": preview.UnmanagedResultTaskCount,
+		"by_node": preview.ByNode, "warnings": warnings,
 	})
 }
 
@@ -87,7 +90,7 @@ func (h cleanupHandlers) confirm(w http.ResponseWriter, r *http.Request) {
 		PreviewToken string `json:"preview_token"`
 		Confirmation string `json:"confirmation"`
 	}
-	if err := decodeManagerJSON(w, r, &request); err != nil || request.PreviewToken == "" || request.Confirmation == "" {
+	if err := decodeManagerJSON(w, r, &request); err != nil || request.PreviewToken == "" {
 		h.writeError(w, http.StatusBadRequest, "bad_request_error", "请求 JSON 无效")
 		return
 	}
@@ -191,6 +194,17 @@ func sameOriginMutation(r *http.Request) bool {
 	}
 	origin := r.Header.Get("Origin")
 	return origin == "" || origin == "http://"+r.Host || origin == "https://"+r.Host
+}
+
+func cleanupPreviewWarnings(preview sqlite.CleanupPreview) []string {
+	warnings := make([]string, 0, 2)
+	if preview.UnmanagedResultTaskCount > 0 {
+		warnings = append(warnings, fmt.Sprintf("有 %d 个已完成结果没有 H3 Node 受管产物记录，无法通过此清理任务删除物理文件", preview.UnmanagedResultTaskCount))
+	}
+	if preview.SkippedActiveCount > 0 {
+		warnings = append(warnings, fmt.Sprintf("有 %d 个未结束任务早于截止时间，已跳过", preview.SkippedActiveCount))
+	}
+	return warnings
 }
 
 func cleanupJobResponse(job sqlite.CleanupJobDetail, nodes []sqlite.CleanupNodeProgress) map[string]any {

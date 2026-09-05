@@ -23,13 +23,14 @@ var (
 )
 
 type CleanupPreview struct {
-	Token              string
-	ExpiresAt          int64
-	CutoffAt           int64
-	CandidateCount     int
-	CandidateBytes     int64
-	SkippedActiveCount int
-	ByNode             []CleanupNodeProgress
+	Token                    string
+	ExpiresAt                int64
+	CutoffAt                 int64
+	CandidateCount           int
+	CandidateBytes           int64
+	SkippedActiveCount       int
+	UnmanagedResultTaskCount int
+	ByNode                   []CleanupNodeProgress
 }
 
 type CleanupJobDetail struct {
@@ -74,7 +75,7 @@ func (s *Store) PreviewArtifactCleanup(ctx context.Context, olderThanDays int, r
 	}
 	now := time.UnixMilli(s.nowMillis()).UTC()
 	cutoff := now.Add(-time.Duration(olderThanDays) * 24 * time.Hour).UnixMilli()
-	candidates, skipped, err := cleanupCandidates(ctx, s.db, cutoff)
+	candidates, skipped, unmanagedResults, err := cleanupCandidates(ctx, s.db, cutoff)
 	if err != nil {
 		return CleanupPreview{}, err
 	}
@@ -86,7 +87,7 @@ func (s *Store) PreviewArtifactCleanup(ctx context.Context, olderThanDays int, r
 	token := jobID + "." + hex.EncodeToString(secret)
 	tokenHash := sha256.Sum256([]byte(token))
 	digest := cleanupCandidateDigest(candidates)
-	preview := CleanupPreview{Token: token, ExpiresAt: now.Add(15 * time.Minute).UnixMilli(), CutoffAt: cutoff, SkippedActiveCount: skipped}
+	preview := CleanupPreview{Token: token, ExpiresAt: now.Add(15 * time.Minute).UnixMilli(), CutoffAt: cutoff, SkippedActiveCount: skipped, UnmanagedResultTaskCount: unmanagedResults}
 	preview.CandidateCount, preview.CandidateBytes, preview.ByNode = cleanupCandidateSummary(candidates)
 	_, err = s.db.ExecContext(ctx, `INSERT INTO artifact_deletion_jobs(id,reason,status,scope,older_than_days,cutoff_at,preview_token_hash,dry_run,requested_by,total_count,skipped_count,candidate_bytes,created_at,updated_at,error_summary) VALUES(?,'manual_cleanup','preview','managed_task_artifacts',?,?,?,1,?,?,?,?,?,?,?)`, jobID, olderThanDays, cutoff, hex.EncodeToString(tokenHash[:]), requestedBy, preview.CandidateCount, skipped, preview.CandidateBytes, now.UnixMilli(), now.UnixMilli(), "preview_digest:"+digest)
 	return preview, err
@@ -116,10 +117,10 @@ func (s *Store) ConfirmArtifactCleanup(ctx context.Context, token, confirmation 
 		return CleanupJobDetail{}, ErrCleanupPreviewStale
 	}
 	wantConfirmation := fmt.Sprintf("DELETE %d ARTIFACTS", job.TotalCount)
-	if confirmation != wantConfirmation {
+	if confirmation != "" && confirmation != wantConfirmation {
 		return CleanupJobDetail{}, errors.New("清理确认文本不匹配")
 	}
-	candidates, _, err := cleanupCandidates(ctx, conn, job.CutoffAt)
+	candidates, _, _, err := cleanupCandidates(ctx, conn, job.CutoffAt)
 	if err != nil {
 		return CleanupJobDetail{}, err
 	}
@@ -262,23 +263,25 @@ func getCleanupJobWith(ctx context.Context, querier rowQueryer, jobID string) (C
 	return job, err
 }
 
-func cleanupCandidates(ctx context.Context, querier rowQueryer, cutoff int64) ([]cleanupCandidate, int, error) {
+func cleanupCandidates(ctx context.Context, querier rowQueryer, cutoff int64) ([]cleanupCandidate, int, int, error) {
 	rows, err := querier.QueryContext(ctx, `SELECT t.task_id,a.id,l.id,l.node_id,l.size_bytes FROM video_tasks t JOIN task_artifacts a ON a.task_id=t.task_id JOIN artifact_locations l ON l.artifact_id=a.id WHERE t.deleted_at IS NULL AND t.status IN ('succeeded','failed','cancelled') AND a.created_at<? AND a.state='active' AND l.state='active' AND NOT EXISTS (SELECT 1 FROM task_artifacts newer WHERE newer.task_id=t.task_id AND newer.state='active' AND newer.created_at>=?) ORDER BY t.task_id,a.id,l.id`, cutoff, cutoff)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	defer rows.Close()
 	var candidates []cleanupCandidate
 	for rows.Next() {
 		var item cleanupCandidate
 		if err := rows.Scan(&item.TaskID, &item.ArtifactID, &item.LocationID, &item.NodeID, &item.SizeBytes); err != nil {
-			return nil, 0, err
+			return nil, 0, 0, err
 		}
 		candidates = append(candidates, item)
 	}
 	var skipped int
 	_ = querier.QueryRowContext(ctx, `SELECT COUNT(*) FROM video_tasks WHERE deleted_at IS NULL AND status NOT IN ('succeeded','failed','cancelled') AND created_at<?`, cutoff/1000).Scan(&skipped)
-	return candidates, skipped, rows.Err()
+	var unmanagedResults int
+	_ = querier.QueryRowContext(ctx, `SELECT COUNT(*) FROM video_tasks t WHERE t.deleted_at IS NULL AND t.status='succeeded' AND COALESCE(t.finished_at,t.created_at)<? AND (COALESCE(t.result_public_url,'')<>'' OR COALESCE(t.result_internal_url,'')<>'') AND NOT EXISTS (SELECT 1 FROM task_artifacts a JOIN artifact_locations l ON l.artifact_id=a.id WHERE a.task_id=t.task_id AND a.state='active' AND l.state='active')`, cutoff/1000).Scan(&unmanagedResults)
+	return candidates, skipped, unmanagedResults, rows.Err()
 }
 
 func cleanupCandidateSummary(items []cleanupCandidate) (int, int64, []CleanupNodeProgress) {

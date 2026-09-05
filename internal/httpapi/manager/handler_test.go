@@ -23,6 +23,7 @@ import (
 	"minimax-h3-tc/internal/domain"
 	"minimax-h3-tc/internal/inputspool"
 	monitorcache "minimax-h3-tc/internal/monitor"
+	"minimax-h3-tc/internal/store/sqlite"
 )
 
 type taskStoreStub struct {
@@ -43,6 +44,19 @@ type taskStoreStub struct {
 	uploadJob        domain.ResultUploadJob
 	uploadRetryError error
 	uploadRetryTask  string
+}
+
+type cleanupStoreStub struct {
+	preview             sqlite.CleanupPreview
+	previewError        error
+	confirmedToken      string
+	confirmedText       string
+	confirmError        error
+	job                 sqlite.CleanupJobDetail
+	items               []sqlite.CleanupItemDetail
+	retryError          error
+	retriedCleanupID    string
+	previewOlderThanDay int
 }
 
 type managerSignerSpy struct {
@@ -95,6 +109,30 @@ func (s *taskStoreStub) GetInputSpoolFile(_ context.Context, taskID, inputID str
 		return s.inputFile, nil
 	}
 	return domain.InputSpoolFile{}, domain.ErrTaskNotFound
+}
+
+func (s *cleanupStoreStub) PreviewArtifactCleanup(_ context.Context, olderThanDays int, _ string) (sqlite.CleanupPreview, error) {
+	s.previewOlderThanDay = olderThanDays
+	return s.preview, s.previewError
+}
+
+func (s *cleanupStoreStub) ConfirmArtifactCleanup(_ context.Context, token, confirmation string) (sqlite.CleanupJobDetail, error) {
+	s.confirmedToken = token
+	s.confirmedText = confirmation
+	return s.job, s.confirmError
+}
+
+func (s *cleanupStoreStub) GetArtifactCleanup(context.Context, string) (sqlite.CleanupJobDetail, []sqlite.CleanupNodeProgress, error) {
+	return s.job, nil, nil
+}
+
+func (s *cleanupStoreStub) ListArtifactCleanupItems(context.Context, string, string, string, int) ([]sqlite.CleanupItemDetail, error) {
+	return s.items, nil
+}
+
+func (s *cleanupStoreStub) RetryArtifactCleanup(_ context.Context, cleanupID string, _ []string) (sqlite.CleanupJobDetail, error) {
+	s.retriedCleanupID = cleanupID
+	return s.job, s.retryError
 }
 
 func TestWebRoutesRedirectAuthenticateAndServeEmbeddedAssets(t *testing.T) {
@@ -615,6 +653,43 @@ func TestManagerDefaultsNewProfilesToFlashVSRWithoutOverridingSavedEngine(t *tes
 	}
 	if !strings.Contains(string(page), `<option value="flashvsr" selected>FlashVSR</option>`) {
 		t.Error("manager.html must select FlashVSR before JavaScript initializes the form")
+	}
+}
+
+func TestCleanupWorkflowUsesBrowserConfirmWithoutManualText(t *testing.T) {
+	page, err := webAssets.ReadFile("web/manager.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := webAssets.ReadFile("web/manager.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	markup, source := string(page), string(script)
+	for _, removed := range []string{"cleanup-confirmation", "输入确认文本", "DELETE ${preview.candidate_count} ARTIFACTS", "确认文本不匹配"} {
+		if strings.Contains(markup, removed) || strings.Contains(source, removed) {
+			t.Fatalf("cleanup workflow still requires manual confirmation text %q", removed)
+		}
+	}
+	if !strings.Contains(source, "window.confirm") {
+		t.Fatal("cleanup workflow must keep browser confirmation")
+	}
+}
+
+func TestCleanupConfirmAcceptsPreviewTokenOnly(t *testing.T) {
+	store := &cleanupStoreStub{job: sqlite.CleanupJobDetail{ID: "cleanup-1", Status: "pending", TotalCount: 2}}
+	h := testHandler(Dependencies{
+		Admin:    config.AdminConfig{Username: "admin", Password: "secret", SessionTTL: time.Hour},
+		Cleanups: store,
+	})
+	cookie := login(t, h, "admin", "secret", "203.0.113.70:1")
+	response := serve(h, http.MethodPost, "/manager/api/artifact-cleanups", `{"preview_token":"token-1"}`, "application/json", cookie, "203.0.113.70:1", false)
+
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if store.confirmedToken != "token-1" || store.confirmedText != "" {
+		t.Fatalf("confirm token=%q text=%q", store.confirmedToken, store.confirmedText)
 	}
 }
 

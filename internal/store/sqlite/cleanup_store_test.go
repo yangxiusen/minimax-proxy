@@ -75,6 +75,28 @@ func TestCleanupPreviewDoesNotMutateAndConfirmCreatesDeletionItems(t *testing.T)
 	}
 }
 
+func TestCleanupPreviewReportsTerminalTasksWithoutManagedArtifacts(t *testing.T) {
+	now := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
+	store := newStore(t, Options{PerKeyLimit: 10, GlobalLimit: 100, Now: func() time.Time { return now }})
+	ctx := context.Background()
+	created, err := store.Create(ctx, domain.NewTask{TaskID: "legacy-task", APIKeyID: "owner", Model: "MiniMax-H3", Scenario: "t2va", RequestJSON: `{}`, RequestHash: "hash", Resolution: "2K", Duration: 5, Ratio: "16:9"}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := now.Add(-72 * time.Hour).Unix()
+	if _, err := store.db.ExecContext(ctx, `UPDATE video_tasks SET status='succeeded',result_public_url='https://cdn.example/legacy.mp4',finished_at=?,created_at=? WHERE task_id=?`, old, old, created.TaskID); err != nil {
+		t.Fatal(err)
+	}
+
+	preview, err := store.PreviewArtifactCleanup(ctx, 2, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.CandidateCount != 0 || preview.UnmanagedResultTaskCount != 1 {
+		t.Fatalf("preview=%+v", preview)
+	}
+}
+
 func TestCleanupConfirmRejectsChangedCandidateSet(t *testing.T) {
 	now := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
 	store := newStore(t, Options{PerKeyLimit: 10, GlobalLimit: 100, Now: func() time.Time { return now }})
@@ -88,5 +110,23 @@ func TestCleanupConfirmRejectsChangedCandidateSet(t *testing.T) {
 	}
 	if _, err := store.ConfirmArtifactCleanup(ctx, preview.Token, "DELETE 1 ARTIFACTS"); !errors.Is(err, ErrCleanupPreviewStale) {
 		t.Fatalf("confirm error=%v", err)
+	}
+}
+
+func TestCleanupConfirmAllowsPreviewTokenWithoutManualText(t *testing.T) {
+	now := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
+	store := newStore(t, Options{PerKeyLimit: 10, GlobalLimit: 100, Now: func() time.Time { return now }})
+	ctx := context.Background()
+	preview, err := store.PreviewArtifactCleanup(ctx, 2, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	job, err := store.ConfirmArtifactCleanup(ctx, preview.Token, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != "succeeded" || job.TotalCount != 0 {
+		t.Fatalf("job=%+v", job)
 	}
 }
