@@ -11,6 +11,7 @@ import (
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
 	"minimax-h3-tc/internal/httpapi/v2"
+	"minimax-h3-tc/internal/logsafe"
 	"minimax-h3-tc/internal/monitor"
 	"minimax-h3-tc/internal/upstream/gradio"
 )
@@ -97,7 +98,7 @@ func (p *Processor) ProcessOne(ctx context.Context) error {
 		before, listErr := jobs.ListJobs(ctx)
 		if listErr != nil {
 			p.markPollFailure()
-			p.Logger.WarnContext(ctx, "读取私有任务基线失败，任务重新排队", "task_id", task.TaskID, "upstream_id", p.Upstream.ID, "stage", "jobs_baseline", "error_code", "upstream_unavailable")
+			p.Logger.WarnContext(ctx, "读取私有任务基线失败，任务重新排队", "task_id", task.TaskID, "upstream_id", p.Upstream.ID, "stage", "jobs_baseline", "error_code", "upstream_unavailable", "error_reason", logsafe.Error(listErr))
 			if err := p.Store.Requeue(ctx, task.TaskID, p.Upstream.ID); err != nil {
 				return err
 			}
@@ -112,7 +113,7 @@ func (p *Processor) ProcessOne(ctx context.Context) error {
 	baselineResult, err := p.Client.Call(ctx, p.Upstream.CheckAPIName, []any{})
 	if err != nil {
 		p.markPollFailure()
-		p.Logger.WarnContext(ctx, "读取 Gallery 基线失败，任务重新排队", "task_id", task.TaskID, "upstream_id", p.Upstream.ID, "stage", "baseline", "error_code", "upstream_unavailable")
+		p.Logger.WarnContext(ctx, "读取 Gallery 基线失败，任务重新排队", "task_id", task.TaskID, "upstream_id", p.Upstream.ID, "stage", "baseline", "error_code", "upstream_unavailable", "error_reason", logsafe.Error(err))
 		if err := p.Store.Requeue(ctx, task.TaskID, p.Upstream.ID); err != nil {
 			return err
 		}
@@ -137,7 +138,7 @@ func (p *Processor) ProcessOne(ctx context.Context) error {
 		if errors.Is(err, gradio.ErrRequestRejected) {
 			return p.fail(ctx, task, "upstream_rejected", "私有服务拒绝任务参数")
 		}
-		p.Logger.WarnContext(ctx, "提交结果未知，进入恢复轮询", "task_id", task.TaskID, "upstream_id", p.Upstream.ID, "stage", "submit", "error_code", "submit_unknown")
+		p.Logger.WarnContext(ctx, "提交结果未知，进入恢复轮询", "task_id", task.TaskID, "upstream_id", p.Upstream.ID, "stage", "submit", "error_code", "submit_unknown", "error_reason", logsafe.Error(err))
 		if markErr := p.Store.MarkReconciling(ctx, task.TaskID, p.Upstream.ID); markErr != nil {
 			return markErr
 		}
@@ -243,7 +244,7 @@ func (p *Processor) poll(ctx context.Context, task domain.Task, validated v2.Val
 				return err
 			}
 			task.Status = domain.StatusReconciling
-			p.Logger.WarnContext(ctx, "轮询私有服务失败", "task_id", task.TaskID, "upstream_id", p.Upstream.ID, "stage", "poll", "error_code", "upstream_poll_error")
+			p.Logger.WarnContext(ctx, "轮询私有服务失败", "task_id", task.TaskID, "upstream_id", p.Upstream.ID, "stage", "poll", "error_code", "upstream_poll_error", "error_reason", logsafe.Error(err))
 			if p.timedOut(task) {
 				return p.timeout(ctx, task, "upstream_unavailable_timeout", "私有服务持续不可用，任务已结束")
 			}
@@ -359,7 +360,7 @@ func (p *Processor) timeout(ctx context.Context, task domain.Task, code, message
 		_, err := jobs.CancelJob(ctx, task.UpstreamJobID)
 		if err != nil && !errors.Is(err, gradio.ErrJobNotFound) {
 			p.blockScheduling()
-			p.Logger.WarnContext(ctx, "任务超时后中止私有任务失败，继续关闭本地任务", "task_id", task.TaskID, "upstream_id", p.Upstream.ID, "stage", "timeout_cancel", "error_code", "upstream_cancel_error")
+			p.Logger.WarnContext(ctx, "任务超时后中止私有任务失败，继续关闭本地任务", "task_id", task.TaskID, "upstream_id", p.Upstream.ID, "stage", "timeout_cancel", "error_code", "upstream_cancel_error", "error_reason", logsafe.Error(err))
 		}
 	}
 	return p.fail(ctx, task, code, message)
@@ -709,7 +710,7 @@ func (p *Processor) markFinished(ctx context.Context) error {
 	})
 	finished, err := p.Store.LatestFinishedForUpstream(ctx, p.Upstream.ID)
 	if err != nil {
-		p.Logger.WarnContext(ctx, "读取最近完成任务失败，运行缓存已清理", "upstream_id", p.Upstream.ID, "stage", "cache_finish", "error_code", "latest_finished_unavailable")
+		p.Logger.WarnContext(ctx, "读取最近完成任务失败，运行缓存已清理", "upstream_id", p.Upstream.ID, "stage", "cache_finish", "error_code", "latest_finished_unavailable", "error_reason", logsafe.Error(err))
 		return nil
 	}
 	duration := int64(0)

@@ -12,6 +12,7 @@ import (
 	"net/http"
 
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/logsafe"
 )
 
 const profileRequestBodyLimit = 1 << 20
@@ -147,7 +148,7 @@ func (api *profileAPI) writeError(w http.ResponseWriter, r *http.Request, err er
 	case errors.Is(err, domain.ErrProfileKeyConflict):
 		writeProfileError(w, http.StatusConflict, "profile_key_conflict", "逻辑分辨率名称已存在")
 	default:
-		api.logger.ErrorContext(r.Context(), "模型请求配置接口处理失败", "error_type", fmt.Sprintf("%T", err))
+		api.logger.ErrorContext(r.Context(), "模型请求配置接口处理失败", "error_type", fmt.Sprintf("%T", err), "error_reason", logsafe.Error(err))
 		writeProfileError(w, http.StatusInternalServerError, "server_error", "服务内部错误")
 	}
 }

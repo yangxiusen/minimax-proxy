@@ -47,6 +47,37 @@ func (s *Store) ListInputSpoolFiles(ctx context.Context, taskID string) ([]domai
 	return files, rows.Err()
 }
 
+func (s *Store) FindReusableInputObjects(ctx context.Context, apiKeyID, requestHash string) (string, []domain.InputSpoolFile, error) {
+	var taskID, requestJSON string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT task_id,request_json
+		FROM video_tasks
+		WHERE api_key_id=? AND request_hash=? AND deleted_at IS NULL
+		  AND EXISTS (
+		    SELECT 1
+		    FROM task_input_spool_files input
+		    WHERE input.task_id=video_tasks.task_id AND COALESCE(input.object_url,'')<>''
+		  )
+		ORDER BY created_at DESC
+		LIMIT 1`, apiKeyID, requestHash).Scan(&taskID, &requestJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil, domain.ErrTaskNotFound
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	files, err := s.ListInputSpoolFiles(ctx, taskID)
+	if err != nil {
+		return "", nil, err
+	}
+	for _, file := range files {
+		if file.ObjectURL == "" {
+			return "", nil, domain.ErrTaskNotFound
+		}
+	}
+	return requestJSON, files, nil
+}
+
 func (s *Store) GetInputSpoolFile(ctx context.Context, taskID, inputID string) (domain.InputSpoolFile, error) {
 	file, err := scanInputSpoolFile(s.db.QueryRowContext(ctx, inputSpoolFileSelect+` WHERE task_id=? AND id=?`, taskID, inputID))
 	if errors.Is(err, sql.ErrNoRows) {

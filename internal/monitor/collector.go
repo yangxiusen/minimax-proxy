@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"minimax-h3-tc/internal/config"
+	"minimax-h3-tc/internal/logsafe"
 	"minimax-h3-tc/internal/upstream/gradio"
 )
 
@@ -85,19 +86,19 @@ func (c *Collector) probe(ctx context.Context, node CollectorNode) {
 	defer cancel()
 	if err := node.Client.Healthy(probeCtx, node.Upstream.HealthPath); err != nil {
 		c.markFailure(node.Upstream.ID, "upstream_unhealthy")
-		c.logger().WarnContext(ctx, "私有服务监控健康检查失败", "upstream_id", node.Upstream.ID, "stage", "monitor_health", "error_code", "upstream_unhealthy")
+		c.logger().WarnContext(ctx, "私有服务监控健康检查失败", "upstream_id", node.Upstream.ID, "stage", "monitor_health", "error_code", "upstream_unhealthy", "error_reason", logsafe.Error(err))
 		return
 	}
 	jobs, err := node.Client.ListJobs(probeCtx)
 	if err != nil {
 		c.markFailure(node.Upstream.ID, "upstream_jobs_unhealthy")
-		c.logger().WarnContext(ctx, "私有任务服务健康检查失败", "upstream_id", node.Upstream.ID, "stage", "monitor_jobs", "error_code", "upstream_jobs_unhealthy")
+		c.logger().WarnContext(ctx, "私有任务服务健康检查失败", "upstream_id", node.Upstream.ID, "stage", "monitor_jobs", "error_code", "upstream_jobs_unhealthy", "error_reason", logsafe.Error(err))
 		return
 	}
 	result, err := node.Client.Call(probeCtx, node.Upstream.CheckAPIName, []any{})
 	if err != nil {
 		c.markFailure(node.Upstream.ID, "upstream_poll_error")
-		c.logger().WarnContext(ctx, "私有服务监控状态查询失败", "upstream_id", node.Upstream.ID, "stage", "monitor_poll", "error_code", "upstream_poll_error")
+		c.logger().WarnContext(ctx, "私有服务监控状态查询失败", "upstream_id", node.Upstream.ID, "stage", "monitor_poll", "error_code", "upstream_poll_error", "error_reason", logsafe.Error(err))
 		return
 	}
 	c.mergeObservation(node.Upstream.ID, gradio.ParseObservation(result), jobs)

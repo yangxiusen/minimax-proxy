@@ -101,3 +101,8 @@ var UpstreamFeedback string
 //
 //go:embed 021_oss_input_object_metadata.sql
 var OSSInputObjectMetadata string
+
+// ReusableInputObjectRefs 允许多个任务复用同一个对象存储输入。
+//
+//go:embed 022_reusable_input_object_refs.sql
+var ReusableInputObjectRefs string

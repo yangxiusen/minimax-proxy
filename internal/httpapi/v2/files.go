@@ -13,6 +13,7 @@ import (
 
 	artifactservice "minimax-h3-tc/internal/artifact"
 	"minimax-h3-tc/internal/config"
+	"minimax-h3-tc/internal/logsafe"
 )
 
 type FileService interface {
@@ -79,6 +80,7 @@ func (h *filesHandler) content(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, artifactservice.ErrBusy):
 			h.writeFileError(w, http.StatusTooManyRequests, "rate_limit_error", "结果文件下载并发已满")
 		default:
+			h.logger.WarnContext(r.Context(), "结果文件打开失败", "request_id", requestID(r.Context()), "artifact_id", artifactID, "error_code", "file_open_failed", "error_reason", logsafe.Error(err))
 			h.writeFileError(w, http.StatusServiceUnavailable, "file_unavailable_error", "结果文件暂不可用")
 		}
 		return
@@ -105,7 +107,11 @@ func (h *filesHandler) content(w http.ResponseWriter, r *http.Request) {
 	buffer := make([]byte, 64<<10)
 	written, err := io.CopyBuffer(w, content.Body, buffer)
 	if err != nil || written != content.ContentLength {
-		h.logger.WarnContext(r.Context(), "结果文件流传输中断", "request_id", requestID(r.Context()), "artifact_id", artifactID, "error_code", "file_stream_interrupted")
+		reason := "传输字节数与元数据不一致"
+		if err != nil {
+			reason = logsafe.Error(err)
+		}
+		h.logger.WarnContext(r.Context(), "结果文件流传输中断", "request_id", requestID(r.Context()), "artifact_id", artifactID, "error_code", "file_stream_interrupted", "error_reason", reason)
 	}
 }
 

@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,6 +46,30 @@ func TestWarnDefaultAdminPasswordDependsOnlyOnPasswordAndDoesNotLogIt(t *testing
 		})
 	}
 }
+
+func TestNewServerLoggerWritesStdoutAndFile(t *testing.T) {
+	var stdout bytes.Buffer
+	logDir := t.TempDir()
+	logger, closeLog, err := newServerLogger(stdoutWriter{&stdout}, logDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeLog()
+
+	logger.Error("测试异常", "stage", "test", "error_code", "test_error", "error_reason", "boom")
+	if !strings.Contains(stdout.String(), `"error_reason":"boom"`) {
+		t.Fatalf("stdout log missing error_reason: %s", stdout.String())
+	}
+	data, err := os.ReadFile(filepath.Join(logDir, "server.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte(`"error_reason":"boom"`)) {
+		t.Fatalf("file log missing error_reason: %s", string(data))
+	}
+}
+
+type stdoutWriter struct{ io.Writer }
 
 func TestNodeCacheAvailabilityUsesFreshEnabledSnapshots(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0).UTC()

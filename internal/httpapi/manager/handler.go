@@ -27,6 +27,7 @@ import (
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
 	"minimax-h3-tc/internal/inputspool"
+	"minimax-h3-tc/internal/logsafe"
 	monitorcache "minimax-h3-tc/internal/monitor"
 	"minimax-h3-tc/internal/upstream/nodeapi"
 )
@@ -859,6 +860,7 @@ func (h *handler) serveObjectInput(w http.ResponseWriter, r *http.Request, fileM
 	}
 	response, err := h.inputObjectClient.Do(request)
 	if err != nil {
+		h.logger.WarnContext(r.Context(), "对象存储输入读取失败", "task_id", fileMeta.TaskID, "input_id", fileMeta.ID, "stage", "input_object_read", "error_code", "input_object_read_failed", "error_reason", logsafe.Error(err))
 		h.writeError(w, http.StatusBadGateway, "input_object_read_failed", "对象存储输入暂时无法读取")
 		return
 	}
@@ -894,7 +896,7 @@ func (h *handler) serveObjectInput(w http.ResponseWriter, r *http.Request, fileM
 	}
 	w.WriteHeader(response.StatusCode)
 	if _, err := io.Copy(w, response.Body); err != nil {
-		h.logger.WarnContext(r.Context(), "对象存储输入响应传输失败", "task_id", fileMeta.TaskID, "input_id", fileMeta.ID, "stage", "input_object_read")
+		h.logger.WarnContext(r.Context(), "对象存储输入响应传输失败", "task_id", fileMeta.TaskID, "input_id", fileMeta.ID, "stage", "input_object_read", "error_code", "input_object_stream_failed", "error_reason", logsafe.Error(err))
 	}
 }
 
@@ -1101,7 +1103,7 @@ func (h *handler) noStore(next http.Handler) http.Handler {
 }
 
 func (h *handler) internalError(w http.ResponseWriter, r *http.Request, err error) {
-	h.logger.ErrorContext(r.Context(), "管理接口处理失败", "error_type", fmt.Sprintf("%T", err))
+	h.logger.ErrorContext(r.Context(), "管理接口处理失败", "error_type", fmt.Sprintf("%T", err), "error_reason", logsafe.Error(err))
 	h.writeError(w, http.StatusInternalServerError, "server_error", "服务内部错误")
 }
 

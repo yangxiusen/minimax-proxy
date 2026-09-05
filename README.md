@@ -70,3 +70,5 @@ docker compose --env-file .env.docker up -d
 ```
 
 The SQLite database lives in `data/`. Migrations are forward-only and run atomically on startup; take a database backup before changing binaries. Legacy `legacy-gradio-v1` nodes remain readable for old tasks, while new v0.0.1 profiles require compatible `h3-node-v1` nodes.
+
+Container JSON logs are written to stdout and `/var/log/minimax-proxy/server.log`. The default compose file mounts this path to `./logs`; set `MINIMAX_LOG_DIR` only when the in-container log directory must be changed.

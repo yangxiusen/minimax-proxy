@@ -27,7 +27,7 @@ func TestOpenMigratesEmptyDatabaseThroughLatestVersionAndIsRepeatable(t *testing
 		if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&migrationCount); err != nil {
 			t.Fatal(err)
 		}
-		if userVersion != 21 || migrationCount != 20 {
+		if userVersion != 22 || migrationCount != 21 {
 			t.Fatalf("attempt %d user_version=%d migrations=%d", attempt, userVersion, migrationCount)
 		}
 		for _, table := range []string{"model_request_profiles", "request_profiles", "profile_test_runs", "task_stages", "stage_attempts", "task_artifacts", "artifact_locations", "artifact_deletion_jobs", "artifact_deletion_items", "callback_deliveries", "external_api_keys", "api_key_config_bootstrap", "task_input_spool_files"} {
@@ -164,7 +164,7 @@ func TestOpenForwardsVersionSevenCallbackRowsThroughLatestVersion(t *testing.T) 
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('callback_deliveries') WHERE name IN ('request_body','lease_expires_at')`).Scan(&columns); err != nil {
 		t.Fatal(err)
 	}
-	if userVersion != 21 || columns != 2 {
+	if userVersion != 22 || columns != 2 {
 		t.Fatalf("user_version=%d columns=%d", userVersion, columns)
 	}
 }

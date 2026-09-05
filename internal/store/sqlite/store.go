@@ -90,6 +90,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		{version: 19, name: "官方提交基线状态", sql: migrations.OfficialSubmissionBaselineState},
 		{version: 20, name: "上游反馈信息", sql: migrations.UpstreamFeedback},
 		{version: 21, name: "对象存储输入元数据", sql: migrations.OSSInputObjectMetadata},
+		{version: 22, name: "可复用对象存储输入", sql: migrations.ReusableInputObjectRefs},
 	})
 }
 

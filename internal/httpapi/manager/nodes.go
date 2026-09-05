@@ -16,6 +16,7 @@ import (
 
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/logsafe"
 )
 
 const nodeRequestBodyLimit = 64 << 10
@@ -188,6 +189,9 @@ func (h *handler) ensureObjectStorageReady(w http.ResponseWriter, r *http.Reques
 	}
 	config, err := h.objectStorage.GetObjectStorageConfig(r.Context())
 	if err != nil || config.LastTestStatus != "passed" {
+		if err != nil {
+			h.logger.WarnContext(r.Context(), "读取对象存储配置失败", "stage", "node_object_storage_check", "error_code", "object_storage_config_unavailable", "error_reason", logsafe.Error(err))
+		}
 		h.writeError(w, http.StatusConflict, "object_storage_not_ready", "请先配置并测试通过对象存储")
 		return false
 	}

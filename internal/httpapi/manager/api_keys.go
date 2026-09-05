@@ -15,6 +15,7 @@ import (
 
 	"minimax-h3-tc/internal/authkey"
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/logsafe"
 )
 
 type APIKeyService interface {
@@ -168,7 +169,7 @@ func (api *apiKeyAPI) writeError(w http.ResponseWriter, r *http.Request, err err
 	case errors.Is(err, authkey.ErrCacheRefresh):
 		status, kind, message = http.StatusServiceUnavailable, "cache_refresh_failed", "密钥已保存，但鉴权缓存暂未刷新，请重新加载"
 	default:
-		api.logger.ErrorContext(r.Context(), "对外 API Key 接口处理失败", "error_type", "internal", "stage", "api_key_management")
+		api.logger.ErrorContext(r.Context(), "对外 API Key 接口处理失败", "error_type", "internal", "stage", "api_key_management", "error_reason", logsafe.Error(err))
 	}
 	writeProfileError(w, status, kind, message)
 }

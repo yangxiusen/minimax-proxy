@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+
+	"minimax-h3-tc/internal/logsafe"
 )
 
 var ErrNoDelivery = errors.New("没有待投递 callback")
@@ -57,13 +59,13 @@ func (w *Worker) ProcessOne(ctx context.Context) (bool, error) {
 		if err := w.Store.ScheduleCallbackRetry(ctx, delivery.ID, attempt, result.HTTPStatus, message, nextAttempt); err != nil {
 			return true, err
 		}
-		logger.Warn("callback 投递失败，已安排重试", "http_status", result.HTTPStatus, "next_attempt_at", nextAttempt)
+		logger.Warn("callback 投递失败，已安排重试", "http_status", result.HTTPStatus, "next_attempt_at", nextAttempt, "error_reason", logsafe.Error(result.Error))
 		return true, nil
 	}
 	if err := w.Store.MarkCallbackFailed(ctx, delivery.ID, attempt, result.HTTPStatus, message); err != nil {
 		return true, err
 	}
-	logger.Error("callback 投递最终失败", "http_status", result.HTTPStatus)
+	logger.Error("callback 投递最终失败", "http_status", result.HTTPStatus, "error_reason", logsafe.Error(result.Error))
 	return true, nil
 }
 
@@ -79,7 +81,7 @@ func (w *Worker) Run(ctx context.Context, idleInterval time.Duration) error {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return err
 			}
-			w.logger().Error("callback worker 执行失败", "error", err)
+			w.logger().Error("callback worker 执行失败", "error_reason", logsafe.Error(err))
 		}
 		if worked {
 			continue

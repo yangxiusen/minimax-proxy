@@ -12,6 +12,7 @@ import (
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
 	"minimax-h3-tc/internal/inputspool"
+	"minimax-h3-tc/internal/logsafe"
 	"minimax-h3-tc/internal/monitor"
 	"minimax-h3-tc/internal/official"
 	"minimax-h3-tc/internal/orchestrator"
@@ -208,7 +209,7 @@ func (f NodeRuntimeFactory) startOfficialV2(parent context.Context, node domain.
 				if logger == nil {
 					logger = slog.Default()
 				}
-				logger.ErrorContext(nodeCtx, "恢复官方任务失败", "upstream_id", node.ID, "task_id", task.TaskID, "error_code", "official_recovery_failed")
+				logger.ErrorContext(nodeCtx, "恢复官方任务失败", "upstream_id", node.ID, "task_id", task.TaskID, "error_code", "official_recovery_failed", "error_reason", logsafe.Error(err))
 			}
 		}()
 	}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"time"
+
+	"minimax-h3-tc/internal/logsafe"
 )
 
 type Store interface {
@@ -36,7 +38,7 @@ func (c Cleaner) Run(ctx context.Context) {
 		case <-ticker.C:
 			tasks, keys, err := c.Store.CleanupExpired(ctx, c.BatchSize)
 			if err != nil {
-				c.Logger.ErrorContext(ctx, "清理过期任务失败", "stage", "cleanup", "error_code", "cleanup_failed")
+				c.Logger.ErrorContext(ctx, "清理过期任务失败", "stage", "cleanup", "error_code", "cleanup_failed", "error_reason", logsafe.Error(err))
 				continue
 			}
 			if tasks > 0 || keys > 0 {

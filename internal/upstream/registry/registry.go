@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/logsafe"
 	"minimax-h3-tc/internal/monitor"
 )
 
@@ -92,7 +93,7 @@ func (r *Registry) Wake() {
 func (r *Registry) reconcile(ctx context.Context) {
 	nodes, err := r.store.ListModelNodes(ctx)
 	if err != nil {
-		r.logger.ErrorContext(ctx, "读取模型节点配置失败", "stage", "node_reconcile", "error_code", "node_config_read_failed")
+		r.logger.ErrorContext(ctx, "读取模型节点配置失败", "stage", "node_reconcile", "error_code", "node_config_read_failed", "error_reason", logsafe.Error(err))
 		return
 	}
 	desired := make(map[string]domain.ModelNode, len(nodes))
@@ -134,7 +135,7 @@ func (r *Registry) reconcile(ctx context.Context) {
 		}
 		runtime, err := r.factory(ctx, node)
 		if err != nil {
-			r.logger.ErrorContext(ctx, "应用模型节点配置失败", "node_id", node.ID, "config_version", node.Version, "stage", "node_reconcile", "error_code", "node_runtime_start_failed")
+			r.logger.ErrorContext(ctx, "应用模型节点配置失败", "node_id", node.ID, "config_version", node.Version, "stage", "node_reconcile", "error_code", "node_runtime_start_failed", "error_reason", logsafe.Error(err))
 			continue
 		}
 		r.mu.Lock()

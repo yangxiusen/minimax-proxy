@@ -22,8 +22,8 @@ func TestOSSInputObjectMetadataMigration(t *testing.T) {
 	if err := store.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 21 {
-		t.Fatalf("user_version=%d want=21", version)
+	if version != 22 {
+		t.Fatalf("user_version=%d want=22", version)
 	}
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('task_input_spool_files') WHERE name='object_url' AND type='TEXT' AND "notnull"=0`).Scan(&columnCount); err != nil {
 		t.Fatal(err)
@@ -47,6 +47,36 @@ func TestOSSInputObjectMetadataMigrationRejectsNonHTTPS(t *testing.T) {
 	}
 	if _, err := db.Exec(`UPDATE task_input_spool_files SET object_url='http://cdn.example/input.png' WHERE id='existing'`); err == nil {
 		t.Fatal("non-HTTPS object URL was accepted")
+	}
+}
+
+func TestReusableInputObjectRefsMigrationAllowsSharedRelativePath(t *testing.T) {
+	store, err := Open(context.Background(), filepath.Join(t.TempDir(), "migration-v22.db"), Options{PerKeyLimit: 10, GlobalLimit: 10, Retention: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	first := domain.NewTask{
+		TaskID: "object-a", APIKeyID: "owner", Model: "MiniMax-H3", Scenario: "i2va", RequestJSON: `{}`, RequestHash: strings.Repeat("b", 64),
+		Resolution: "768P", Duration: 5, Ratio: "16:9", InputSpoolFiles: []domain.InputSpoolFile{{
+			ID: "input_a", TaskID: "object-a", ContentIndex: 0, ContentType: "image_url", Role: "reference_image",
+			SourceKind: "data_uri", MediaType: "image/png", Extension: ".png", RelativePath: "MiniMax-H3/inputs/shared/0-deadbeef.png",
+			ObjectURL: "https://cdn.example/MiniMax-H3/inputs/shared/0-deadbeef.png", SizeBytes: 12, SHA256: strings.Repeat("a", 64),
+		}},
+	}
+	second := domain.NewTask{
+		TaskID: "object-b", APIKeyID: "owner", Model: "MiniMax-H3", Scenario: "i2va", RequestJSON: `{}`, RequestHash: strings.Repeat("b", 64),
+		Resolution: "768P", Duration: 5, Ratio: "16:9", InputSpoolFiles: []domain.InputSpoolFile{{
+			ID: "input_b", TaskID: "object-b", ContentIndex: 0, ContentType: "image_url", Role: "reference_image",
+			SourceKind: "data_uri", MediaType: "image/png", Extension: ".png", RelativePath: "MiniMax-H3/inputs/shared/0-deadbeef.png",
+			ObjectURL: "https://cdn.example/MiniMax-H3/inputs/shared/0-deadbeef.png", SizeBytes: 12, SHA256: strings.Repeat("a", 64),
+		}},
+	}
+	if _, err := store.Create(context.Background(), first, "", func() bool { return true }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(context.Background(), second, "", func() bool { return true }); err != nil {
+		t.Fatal(err)
 	}
 }
 

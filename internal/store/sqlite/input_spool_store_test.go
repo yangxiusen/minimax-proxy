@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,8 +17,8 @@ func TestMigrationV15CreatesInputSpoolFiles(t *testing.T) {
 	if err := store.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil {
 		t.Fatalf("query user_version: %v", err)
 	}
-	if userVersion != 21 {
-		t.Fatalf("user_version=%d, want 21", userVersion)
+	if userVersion != 22 {
+		t.Fatalf("user_version=%d, want 22", userVersion)
 	}
 	var migrationCount int
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=15`).Scan(&migrationCount); err != nil {
@@ -42,8 +43,8 @@ func TestMigrationV17AllowsVideoInputSpoolFiles(t *testing.T) {
 	if err := store.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil {
 		t.Fatal(err)
 	}
-	if userVersion != 21 {
-		t.Fatalf("user_version=%d, want 21", userVersion)
+	if userVersion != 22 {
+		t.Fatalf("user_version=%d, want 22", userVersion)
 	}
 	input := newStoreTask("video-spool", "key-video-spool")
 	input.InputSpoolFiles = []domain.InputSpoolFile{{
@@ -131,6 +132,49 @@ func TestCreatePersistsInputSpoolFilesAndFindsIdempotentTaskBeforeSpooling(t *te
 	}
 	if _, err := store.FindIdempotentTask(ctx, input.APIKeyID, "key-hash-spool", "different-hash"); err != domain.ErrIdempotencyConflict {
 		t.Fatalf("FindIdempotentTask(conflict) error=%v, want ErrIdempotencyConflict", err)
+	}
+}
+
+func TestCreateAllowsMultipleTasksToReferenceSameObjectInput(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	first := newStoreTask("object-source", "key-object-reuse")
+	first.RequestJSON = `{"content":[{"type":"image_url","role":"first_frame","image_url":{"url":"https://cdn.example/input.png"}}]}`
+	first.RequestHash = strings.Repeat("b", 64)
+	first.InputSpoolFiles = []domain.InputSpoolFile{{
+		ID: "input_source", TaskID: first.TaskID, ContentIndex: 0, ContentType: "image_url", Role: "first_frame",
+		SourceKind: "data_uri", MediaType: "image/png", Extension: ".png", RelativePath: "MiniMax-H3/inputs/reused/0-hash.png",
+		ObjectURL: "https://cdn.example/input.png", SizeBytes: 68, SHA256: strings.Repeat("a", 64),
+	}}
+	if _, err := store.Create(ctx, first, "", func() bool { return true }); err != nil {
+		t.Fatal(err)
+	}
+
+	requestJSON, files, err := store.FindReusableInputObjects(ctx, first.APIKeyID, first.RequestHash)
+	if err != nil {
+		t.Fatalf("FindReusableInputObjects() error=%v", err)
+	}
+	if requestJSON != first.RequestJSON || len(files) != 1 || files[0].ObjectURL != first.InputSpoolFiles[0].ObjectURL {
+		t.Fatalf("reusable request=%s files=%+v", requestJSON, files)
+	}
+
+	second := newStoreTask("object-reuser", first.APIKeyID)
+	second.RequestJSON = requestJSON
+	second.RequestHash = first.RequestHash
+	second.InputSpoolFiles = files
+	for index := range second.InputSpoolFiles {
+		second.InputSpoolFiles[index].ID = "input_reuser"
+		second.InputSpoolFiles[index].TaskID = second.TaskID
+	}
+	if _, err := store.Create(ctx, second, "", func() bool { return true }); err != nil {
+		t.Fatal(err)
+	}
+	secondFiles, err := store.ListInputSpoolFiles(ctx, second.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secondFiles) != 1 || secondFiles[0].RelativePath != first.InputSpoolFiles[0].RelativePath {
+		t.Fatalf("second files=%+v", secondFiles)
 	}
 }
 

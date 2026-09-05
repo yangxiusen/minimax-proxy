@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/logsafe"
 	"minimax-h3-tc/internal/store/sqlite"
 	"minimax-h3-tc/internal/upstream/nodeapi"
 )
@@ -71,7 +72,7 @@ func (w Worker) RunOnce(ctx context.Context) {
 func (w Worker) runOnce(ctx context.Context) {
 	nodes, err := w.Store.ListModelNodes(ctx)
 	if err != nil {
-		w.logger().ErrorContext(ctx, "读取删除目标节点失败", "stage", "artifact_delete", "error_code", "node_list_failed")
+		w.logger().ErrorContext(ctx, "读取删除目标节点失败", "stage", "artifact_delete", "error_code", "node_list_failed", "error_reason", logsafe.Error(err))
 		return
 	}
 	for _, node := range nodes {
@@ -84,7 +85,7 @@ func (w Worker) runOnce(ctx context.Context) {
 				break
 			}
 			if err != nil {
-				w.logger().ErrorContext(ctx, "领取删除明细失败", "node_id", node.ID, "stage", "artifact_delete", "error_code", "delete_claim_failed")
+				w.logger().ErrorContext(ctx, "领取删除明细失败", "node_id", node.ID, "stage", "artifact_delete", "error_code", "delete_claim_failed", "error_reason", logsafe.Error(err))
 				break
 			}
 			w.process(ctx, node, item)
@@ -95,17 +96,17 @@ func (w Worker) runOnce(ctx context.Context) {
 func (w Worker) process(parent context.Context, node domain.ModelNode, item sqlite.ArtifactDeletionItem) {
 	location, err := w.Store.GetArtifactLocation(parent, item.LocationID)
 	if err != nil {
-		w.fail(parent, item, "artifact_location_missing", "产物位置不存在", true)
+		w.fail(parent, item, "artifact_location_missing", "产物位置不存在", true, err)
 		return
 	}
 	key, err := w.Secrets.Open(node.APIKeyNonce, node.APIKeyCiphertext)
 	if err != nil {
-		w.fail(parent, item, "node_key_unavailable", "节点密钥不可用", true)
+		w.fail(parent, item, "node_key_unavailable", "节点密钥不可用", true, err)
 		return
 	}
 	serviceURL, err := url.Parse(node.ServiceURL)
 	if err != nil || serviceURL.Host == "" {
-		w.fail(parent, item, "node_config_invalid", "节点服务地址无效", true)
+		w.fail(parent, item, "node_config_invalid", "节点服务地址无效", true, err)
 		return
 	}
 	timeout := w.RequestTimeout
@@ -135,11 +136,11 @@ func (w Worker) process(parent context.Context, node domain.ModelNode, item sqli
 		if terminal {
 			code = "node_authentication_failed"
 		}
-		w.fail(parent, item, code, "节点产物删除失败", terminal)
+		w.fail(parent, item, code, "节点产物删除失败", terminal, err)
 		return
 	}
 	if len(result.Items) != 1 || result.Items[0].ArtifactID != location.NodeArtifactID {
-		w.fail(parent, item, "node_delete_protocol_error", "节点删除响应不匹配", false)
+		w.fail(parent, item, "node_delete_protocol_error", "节点删除响应不匹配", false, nil)
 		return
 	}
 	response := result.Items[0]
@@ -149,26 +150,33 @@ func (w Worker) process(parent context.Context, node domain.ModelNode, item sqli
 	case "already_absent":
 		err = w.Store.CompleteDeletionItem(parent, item.ID, item.LeaseToken, true, 0)
 	case "artifact_locked":
-		w.fail(parent, item, "artifact_locked", "节点产物仍被执行锁定", false)
+		w.fail(parent, item, "artifact_locked", "节点产物仍被执行锁定", false, nil)
 		return
 	default:
-		w.fail(parent, item, "node_delete_failed", "节点拒绝删除产物", false)
+		w.fail(parent, item, "node_delete_failed", "节点拒绝删除产物", false, nil)
 		return
 	}
 	if err != nil {
-		w.logger().ErrorContext(parent, "回写删除完成状态失败", "item_id", item.ID, "stage", "artifact_delete", "error_code", "delete_complete_failed")
+		w.logger().ErrorContext(parent, "回写删除完成状态失败", "item_id", item.ID, "stage", "artifact_delete", "error_code", "delete_complete_failed", "error_reason", logsafe.Error(err))
 	}
 }
 
-func (w Worker) fail(ctx context.Context, item sqlite.ArtifactDeletionItem, code, message string, terminal bool) {
+func (w Worker) fail(ctx context.Context, item sqlite.ArtifactDeletionItem, code, message string, terminal bool, cause error) {
 	maxAttempts := w.MaxAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = 8
 	}
 	terminal = terminal || item.AttemptCount >= maxAttempts
 	delay := time.Duration(math.Min(math.Pow(2, float64(item.AttemptCount)), 300)) * time.Second
-	_ = w.Store.FailDeletionItem(ctx, item.ID, item.LeaseToken, code, message, w.now().Add(delay), terminal)
-	w.logger().WarnContext(ctx, "模型节点产物删除未完成", "item_id", item.ID, "node_id", item.NodeID, "stage", "artifact_delete", "error_code", code, "terminal", terminal)
+	if err := w.Store.FailDeletionItem(ctx, item.ID, item.LeaseToken, code, message, w.now().Add(delay), terminal); err != nil {
+		w.logger().ErrorContext(ctx, "回写删除失败状态失败", "item_id", item.ID, "stage", "artifact_delete", "error_code", "delete_fail_update_failed", "error_reason", logsafe.Error(err))
+		return
+	}
+	attributes := []any{"item_id", item.ID, "node_id", item.NodeID, "stage", "artifact_delete", "error_code", code, "terminal", terminal}
+	if cause != nil {
+		attributes = append(attributes, "error_reason", logsafe.Error(cause))
+	}
+	w.logger().WarnContext(ctx, "模型节点产物删除未完成", attributes...)
 }
 
 func (w Worker) leaseDuration() time.Duration {

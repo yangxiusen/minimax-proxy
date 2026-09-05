@@ -23,6 +23,7 @@ import (
 	"minimax-h3-tc/internal/domain"
 	"minimax-h3-tc/internal/inputobject"
 	"minimax-h3-tc/internal/inputspool"
+	"minimax-h3-tc/internal/logsafe"
 )
 
 type TaskStore interface {
@@ -50,6 +51,10 @@ type idempotentTaskFinder interface {
 
 type InputObjectPreparer interface {
 	Prepare(context.Context, string, []byte) (inputobject.PreparedRequest, error)
+}
+
+type reusableInputObjectFinder interface {
+	FindReusableInputObjects(context.Context, string, string) (string, []domain.InputSpoolFile, error)
 }
 
 type Dependencies struct {
@@ -261,22 +266,36 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 	var prepared inputspool.PreparedRequest
 	objectInputsEnabled := false
 	if h.inputObjects != nil {
-		objectPrepared, prepareErr := h.inputObjects.Prepare(r.Context(), inputObjectNamespace(owner(r.Context()), requestHashHex), persistedJSON)
-		if prepareErr != nil {
-			if errors.Is(prepareErr, inputobject.ErrNotReady) {
-				h.writeError(w, r, http.StatusServiceUnavailable, "object_storage_not_ready", "对象存储暂不可用")
-			} else {
-				h.writeError(w, r, http.StatusBadGateway, "input_object_upload_failed", "输入素材上传对象存储失败")
+		if finder, ok := h.store.(reusableInputObjectFinder); ok {
+			reusableJSON, reusableFiles, findErr := finder.FindReusableInputObjects(r.Context(), owner(r.Context()), requestHashHex)
+			switch {
+			case findErr == nil:
+				objectInputsEnabled = true
+				persistedJSON = []byte(reusableJSON)
+				prepared.Files = cloneReusableInputObjects(taskID, reusableFiles)
+				h.logger.InfoContext(r.Context(), "输入素材对象存储已复用", "request_id", requestID(r.Context()), "task_id", taskID, "api_key_id", owner(r.Context()), "input_count", len(prepared.Files))
+			case errors.Is(findErr, domain.ErrTaskNotFound):
+			default:
+				h.internalError(w, r, findErr)
+				return
 			}
-			return
 		}
-		objectInputsEnabled = objectPrepared.Enabled
-		if objectInputsEnabled {
-			persistedJSON = objectPrepared.JSON
-			prepared.Files = objectPrepared.Files
-			for index := range prepared.Files {
-				prepared.Files[index].TaskID = taskID
-				prepared.Files[index].ID = objectInputID(taskID, prepared.Files[index])
+		if !objectInputsEnabled {
+			objectPrepared, prepareErr := h.inputObjects.Prepare(r.Context(), inputObjectNamespace(owner(r.Context()), requestHashHex), persistedJSON)
+			if prepareErr != nil {
+				if errors.Is(prepareErr, inputobject.ErrNotReady) {
+					h.logger.WarnContext(r.Context(), "输入素材对象存储准备失败", "request_id", requestID(r.Context()), "task_id", taskID, "error_code", "object_storage_not_ready", "error_reason", logsafe.Error(prepareErr))
+					h.writeError(w, r, http.StatusServiceUnavailable, "object_storage_not_ready", "对象存储暂不可用")
+				} else {
+					h.logger.WarnContext(r.Context(), "输入素材对象存储上传失败", "request_id", requestID(r.Context()), "task_id", taskID, "error_code", "input_object_upload_failed", "error_reason", logsafe.Error(prepareErr))
+					h.writeError(w, r, http.StatusBadGateway, "input_object_upload_failed", "输入素材上传对象存储失败")
+				}
+				return
+			}
+			objectInputsEnabled = objectPrepared.Enabled
+			if objectInputsEnabled {
+				persistedJSON = objectPrepared.JSON
+				prepared.Files = cloneReusableInputObjects(taskID, objectPrepared.Files)
 			}
 		}
 	}
@@ -329,6 +348,16 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 func inputObjectNamespace(ownerID, requestHash string) string {
 	digest := sha256.Sum256([]byte(ownerID + "\x00" + requestHash))
 	return hex.EncodeToString(digest[:])
+}
+
+func cloneReusableInputObjects(taskID string, files []domain.InputSpoolFile) []domain.InputSpoolFile {
+	cloned := make([]domain.InputSpoolFile, len(files))
+	for index, file := range files {
+		file.TaskID = taskID
+		file.ID = objectInputID(taskID, file)
+		cloned[index] = file
+	}
+	return cloned
 }
 
 func objectInputID(taskID string, file domain.InputSpoolFile) string {
@@ -578,7 +607,7 @@ func (h *handler) storeError(w http.ResponseWriter, r *http.Request, err error) 
 }
 
 func (h *handler) internalError(w http.ResponseWriter, r *http.Request, err error) {
-	h.logger.ErrorContext(r.Context(), "接口处理失败", "request_id", requestID(r.Context()), "error_code", "internal_error", "error_type", fmt.Sprintf("%T", err))
+	h.logger.ErrorContext(r.Context(), "接口处理失败", "request_id", requestID(r.Context()), "error_code", "internal_error", "error_type", fmt.Sprintf("%T", err), "error_reason", logsafe.Error(err))
 	h.writeError(w, r, 500, "server_error", "internal error (1000)")
 }
 

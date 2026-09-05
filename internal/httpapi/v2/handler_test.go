@@ -822,6 +822,9 @@ func TestInternalErrorsDoNotLeakSensitiveDetailsToLogs(t *testing.T) {
 	if output := logs.String(); strings.Contains(output, "private.local") || strings.Contains(output, "secret") {
 		t.Fatalf("sensitive log = %s", output)
 	}
+	if output := logs.String(); !strings.Contains(output, `"error_reason"`) || !strings.Contains(output, "dial [redacted-url] failed") {
+		t.Fatalf("missing sanitized error reason: %s", output)
+	}
 }
 
 type failingStore struct{ err error }

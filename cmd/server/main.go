@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -22,6 +24,7 @@ import (
 	"minimax-h3-tc/internal/httpapi/v2"
 	"minimax-h3-tc/internal/inputobject"
 	"minimax-h3-tc/internal/inputspool"
+	"minimax-h3-tc/internal/logsafe"
 	monitorcache "minimax-h3-tc/internal/monitor"
 	"minimax-h3-tc/internal/objectstore"
 	objectucloud "minimax-h3-tc/internal/objectstore/ucloud"
@@ -34,15 +37,46 @@ import (
 	upstreamregistry "minimax-h3-tc/internal/upstream/registry"
 )
 
+const defaultLogDir = "/var/log/minimax-proxy"
+
 func main() {
 	configPath := flag.String("config", configPathDefault(), "YAML 配置文件路径")
 	flag.Parse()
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	slog.SetDefault(logger)
-	if err := run(*configPath, logger); err != nil {
-		logger.Error("服务启动或运行失败", "stage", "lifecycle", "error_code", "service_failed", "error", err.Error())
+	logger, closeLog, logErr := newServerLogger(os.Stdout, serverLogDir())
+	if logErr != nil {
+		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		logger.Error("日志初始化失败", "stage", "lifecycle", "error_code", "log_init_failed", "error_reason", logsafe.Error(logErr))
 		os.Exit(1)
 	}
+	defer closeLog()
+	slog.SetDefault(logger)
+	if err := run(*configPath, logger); err != nil {
+		logger.Error("服务启动或运行失败", "stage", "lifecycle", "error_code", "service_failed", "error_reason", logsafe.Error(err))
+		os.Exit(1)
+	}
+}
+
+func newServerLogger(stdout io.Writer, logDir string) (*slog.Logger, func() error, error) {
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	if err := os.MkdirAll(logDir, 0o750); err != nil {
+		return nil, nil, err
+	}
+	file, err := os.OpenFile(filepath.Join(logDir, "server.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
+	if err != nil {
+		return nil, nil, err
+	}
+	writer := io.MultiWriter(stdout, file)
+	logger := slog.New(slog.NewJSONHandler(writer, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	return logger, file.Close, nil
+}
+
+func serverLogDir() string {
+	if value := os.Getenv("MINIMAX_LOG_DIR"); value != "" {
+		return value
+	}
+	return defaultLogDir
 }
 
 func run(configPath string, logger *slog.Logger) error {
@@ -214,13 +248,13 @@ func run(configPath string, logger *slog.Logger) error {
 			},
 		}
 		if err := uploadWorker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			logger.Error("结果上传工作器已停止", "stage", "result_delivery", "error_code", "result_delivery_worker_stopped")
+			logger.Error("结果上传工作器已停止", "stage", "result_delivery", "error_code", "result_delivery_worker_stopped", "error_reason", logsafe.Error(err))
 		}
 	}()
 	go func() {
 		worker := callbackservice.Worker{Store: callbackStore, Service: callbackService, Logger: logger}
 		if err := worker.Run(ctx, time.Second); err != nil && !errors.Is(err, context.Canceled) {
-			logger.Error("callback worker 已停止", "stage", "callback", "error_code", "callback_worker_stopped")
+			logger.Error("callback worker 已停止", "stage", "callback", "error_code", "callback_worker_stopped", "error_reason", logsafe.Error(err))
 		}
 	}()
 	serverErrors := make(chan error, 1)
