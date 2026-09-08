@@ -79,19 +79,23 @@ func TestPrepareUploadsDataURIAndLeavesURLInputsUnchanged(t *testing.T) {
 	}
 }
 
-func TestPrepareRejectsUnknownOrMismatchedMediaBeforeUpload(t *testing.T) {
-	for _, test := range []struct{ name, dataURI string }{
-		{name: "unknown bytes", dataURI: "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte("not-an-image"))},
-		{name: "mismatched declaration", dataURI: "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte("\xff\xd8\xffjpeg"))},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			upload := &uploadFake{}
-			request := []byte(`{"content":[{"type":"image_url","image_url":{"url":"` + test.dataURI + `"}}]}`)
-			preparer := New(configStoreFake{domain.ObjectStorageConfig{UploadBase64Inputs: true, LastTestStatus: "passed", PublicKeyCiphertext: []byte("public"), PrivateKeyCiphertext: []byte("private")}}, secretFake{}, func(domain.ObjectStorageConfig, string, string) (objectstore.DataStore, error) { return upload, nil })
-			if _, err := preparer.Prepare(context.Background(), "request-namespace", request); err == nil || upload.calls != 0 {
-				t.Fatalf("calls=%d err=%v", upload.calls, err)
-			}
-		})
+func TestPrepareUploadsMismatchedDeclaredMediaType(t *testing.T) {
+	jpeg := []byte("\xff\xd8\xffjpeg")
+	dataURI := "data:image/png;base64," + base64.StdEncoding.EncodeToString(jpeg)
+	request := []byte(`{"content":[{"type":"image_url","image_url":{"url":"` + dataURI + `"}}]}`)
+	upload := &uploadFake{}
+	preparer := New(configStoreFake{domain.ObjectStorageConfig{UploadBase64Inputs: true, LastTestStatus: "passed", PublicKeyCiphertext: []byte("public"), PrivateKeyCiphertext: []byte("private")}}, secretFake{}, func(domain.ObjectStorageConfig, string, string) (objectstore.DataStore, error) { return upload, nil })
+
+	result, err := preparer.Prepare(context.Background(), "request-namespace", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upload.calls != 1 || upload.mime != "image/jpeg" || string(upload.payload) != string(jpeg) {
+		t.Fatalf("upload=%+v", upload)
+	}
+	file := result.Files[0]
+	if file.DeclaredMIME != "image/png" || file.DetectedMIME != "image/jpeg" || file.MediaType != "image/jpeg" || file.Extension != ".jpg" {
+		t.Fatalf("object input metadata=%+v", file)
 	}
 }
 

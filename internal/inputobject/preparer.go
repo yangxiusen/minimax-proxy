@@ -97,9 +97,6 @@ func (p *Preparer) Prepare(ctx context.Context, requestNamespace string, request
 		if err != nil {
 			return PreparedRequest{}, err
 		}
-		if decoded.DetectedMIME == "" || decoded.DeclaredMIME != decoded.DetectedMIME {
-			return PreparedRequest{}, errors.New("媒体文件格式与声明类型不匹配")
-		}
 		key := fmt.Sprintf("MiniMax-H3/inputs/%s/%d-%s%s", requestNamespace, index, decoded.SHA256[:16], decoded.Extension)
 		publicURL, err := store.Upload(ctx, decoded.Payload, key, decoded.MediaType)
 		if err != nil {
