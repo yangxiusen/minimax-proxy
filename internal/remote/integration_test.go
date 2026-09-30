@@ -42,6 +42,8 @@ type integrationJob struct {
 }
 
 type integrationUpstream struct {
+	model                                                           string
+	actualDuration                                                  float64
 	t                                                               *testing.T
 	mu                                                              sync.Mutex
 	server                                                          *httptest.Server
@@ -56,9 +58,13 @@ type integrationUpstream struct {
 	cancelStarted                                                   chan<- struct{}
 }
 
-func newIntegrationUpstream(t *testing.T) *integrationUpstream {
+func newIntegrationUpstream(t *testing.T, modelID ...string) *integrationUpstream {
 	t.Helper()
-	u := &integrationUpstream{t: t, jobs: map[string]*integrationJob{}, assets: map[string][]byte{}}
+	model := integrationModel
+	if len(modelID) > 0 {
+		model = modelID[0]
+	}
+	u := &integrationUpstream{t: t, model: model, actualDuration: 5.062, jobs: map[string]*integrationJob{}, assets: map[string][]byte{}}
 	u.server = httptest.NewServer(http.HandlerFunc(u.serveHTTP))
 	t.Cleanup(u.server.Close)
 	return u
@@ -76,7 +82,11 @@ func (u *integrationUpstream) serveHTTP(w http.ResponseWriter, r *http.Request) 
 		u.mu.Lock()
 		u.modelCalls++
 		u.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(map[string]any{"data": []tk2sd.Model{{ID: integrationModel, Mode: "text_to_video", Durations: []int{5}}, {ID: integrationModel, Mode: "image_to_video", Durations: []int{5}}, {ID: integrationModel, Mode: "reference_to_video", Durations: []int{5}}}})
+		models := []tk2sd.Model{{ID: u.model, Mode: "reference_to_video", Durations: []int{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}}}
+		if u.model == integrationModel {
+			models = append(models, tk2sd.Model{ID: u.model, Mode: "text_to_video", Durations: []int{5}}, tk2sd.Model{ID: u.model, Mode: "image_to_video", Durations: []int{5}})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": models})
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/assets":
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			u.t.Error(err)
@@ -163,8 +173,10 @@ func (u *integrationUpstream) serveHTTP(w http.ResponseWriter, r *http.Request) 
 		}
 		u.queryCalls++
 		status := job.Status
+		var submitted domain.GenerationRequest
+		_ = json.Unmarshal([]byte(job.Body), &submitted)
 		u.mu.Unlock()
-		result := map[string]any{"id": id, "model": integrationModel, "status": status, "duration": 5}
+		result := map[string]any{"id": id, "model": u.model, "status": status, "duration": submitted.Duration}
 		if status == "succeeded" {
 			result["content"] = map[string]string{"video_url": u.server.URL + "/media/tasks/" + id + "?expires=9999999999&signature=local-signed"}
 		}
@@ -174,12 +186,13 @@ func (u *integrationUpstream) serveHTTP(w http.ResponseWriter, r *http.Request) 
 		u.mu.Lock()
 		u.metadataCalls++
 		unavailable := u.metadataUnavailable
+		actualDuration := u.actualDuration
 		u.mu.Unlock()
 		if unavailable {
 			w.WriteHeader(503)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "status": "succeeded", "content": tk2sd.Metadata{Duration: 5.062, Width: 1280, Height: 720}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "status": "succeeded", "content": tk2sd.Metadata{Duration: actualDuration, Width: 1280, Height: 720}})
 	default:
 		u.t.Error("unexpected upstream endpoint", r.Method, r.URL.Path)
 		w.WriteHeader(404)
@@ -209,7 +222,7 @@ func (u *integrationUpstream) submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request domain.GenerationRequest
-	if err = json.Unmarshal(body, &request); err != nil || request.Model != integrationModel {
+	if err = json.Unmarshal(body, &request); err != nil || request.Model != u.model {
 		u.t.Error("invalid create body", err)
 		w.WriteHeader(400)
 		return
@@ -226,7 +239,11 @@ func (u *integrationUpstream) submit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		assetID := strings.TrimPrefix(item.Media().URL, "asset://")
-		if _, ok := u.assets[assetID]; !ok || item.Role != "first_frame" {
+		wantRole := "first_frame"
+		if u.model != integrationModel {
+			wantRole = "reference_image"
+		}
+		if _, ok := u.assets[assetID]; !ok || item.Role != wantRole {
 			u.t.Error("nonpersisted asset or missing normalized role")
 			w.WriteHeader(422)
 			return
@@ -276,6 +293,7 @@ func (u *integrationUpstream) setStatus(taskID, status string) {
 }
 
 type integrationFixture struct {
+	logger     *slog.Logger
 	t          *testing.T
 	store      *sqlite.Store
 	upstream   *integrationUpstream
@@ -286,9 +304,9 @@ type integrationFixture struct {
 	options    sqlite.Options
 }
 
-func newIntegrationFixture(t *testing.T) *integrationFixture {
+func newIntegrationFixture(t *testing.T, modelID ...string) *integrationFixture {
 	t.Helper()
-	f := &integrationFixture{t: t, upstream: newIntegrationUpstream(t), root: filepath.Join(t.TempDir(), "inputs"), path: filepath.Join(t.TempDir(), "tasks.db"), options: sqlite.Options{PerKeyLimit: 20, GlobalLimit: 100, Retention: time.Hour, IdempotencyTTL: time.Hour}}
+	f := &integrationFixture{t: t, upstream: newIntegrationUpstream(t, modelID...), root: filepath.Join(t.TempDir(), "inputs"), path: filepath.Join(t.TempDir(), "tasks.db"), options: sqlite.Options{PerKeyLimit: 20, GlobalLimit: 100, Retention: time.Hour, IdempotencyTTL: time.Hour}}
 	var err error
 	f.store, err = sqlite.Open(context.Background(), f.path, f.options)
 	if err != nil {
@@ -302,7 +320,11 @@ func newIntegrationFixture(t *testing.T) *integrationFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(catalog.Items) != 1 || len(catalog.Items[0].Capabilities.Modes) != 3 || catalog.Source != "discovered" {
+	wantModes := 3
+	if f.upstream.model != integrationModel {
+		wantModes = 1
+	}
+	if len(catalog.Items) != 1 || len(catalog.Items[0].Capabilities.Modes) != wantModes || catalog.Source != "discovered" {
 		t.Fatal("real discovery was not normalized", catalog)
 	}
 	input.ModelCatalog = &catalog
@@ -324,15 +346,19 @@ func (f *integrationFixture) wire() {
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	client := tk2sd.NewClient(base, integrationNodeKey, &http.Client{Timeout: 3 * time.Second}, 1<<20)
-	f.processor = &remote.Processor{Store: f.store, Client: client, Inputs: &remote.InputMaterializer{Store: f.store, Root: f.root, Timeout: 3 * time.Second}, NodeID: f.node.ID, NodeVersion: f.node.Version, NodeURL: base, Capacity: 2, PollInterval: time.Second}
+	logger := f.logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	client := tk2sd.NewClient(base, integrationNodeKey, &http.Client{Timeout: 3 * time.Second}, 1<<20).WithLogger(logger)
+	f.processor = &remote.Processor{Store: f.store, Client: client, Inputs: &remote.InputMaterializer{Store: f.store, Root: f.root, Timeout: 3 * time.Second}, NodeID: f.node.ID, NodeVersion: f.node.Version, NodeURL: base, Capacity: 2, PollInterval: time.Second, Logger: logger}
 	results := &remote.ResultAccess{Store: f.store, Resolve: func(_ context.Context, nodeID string) (remote.ResultClient, *url.URL, error) {
 		if nodeID != f.node.ID {
 			return nil, nil, domain.ErrNodeNotFound
 		}
 		return client, base, nil
 	}}
-	f.handler = v2.NewHandler(v2.Dependencies{Store: f.store, Routing: &routing.Service{Store: f.store, Healthy: func(string) bool { return true }}, RemoteResults: results, InputSpooler: inputspool.New(f.root), ActiveProfiles: f.store, APIKeys: []config.APIKeyConfig{{ID: "owner-a", Key: "key-a", Enabled: true}, {ID: "owner-b", Key: "key-b", Enabled: true}}, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	f.handler = v2.NewHandler(v2.Dependencies{Store: f.store, Routing: &routing.Service{Store: f.store, Healthy: func(string) bool { return true }}, RemoteResults: results, InputSpooler: inputspool.New(f.root), ActiveProfiles: f.store, APIKeys: []config.APIKeyConfig{{ID: "owner-a", Key: "key-a", Enabled: true}, {ID: "owner-b", Key: "key-b", Enabled: true}}, Logger: logger})
 }
 
 func (f *integrationFixture) request(method, path, key string, body []byte) *httptest.ResponseRecorder {

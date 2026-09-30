@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"path"
@@ -61,6 +62,7 @@ type Client struct {
 	maxBody   int64
 	guard     *netguard.Guard
 	configErr error
+	logger    *slog.Logger
 }
 
 func NewClient(baseURL *url.URL, apiKey string, httpClient *http.Client, maxBody int64) *Client {
@@ -114,8 +116,12 @@ func (c *Client) newRequest(ctx context.Context, method, endpoint string, body i
 }
 
 func (c *Client) do(r *http.Request) (*http.Response, error) {
+	c.logRequest(r)
 	response, err := c.http.Do(r)
 	if err == nil {
+		if response.Request == nil {
+			response.Request = r
+		}
 		return response, nil
 	}
 	var cause error
@@ -134,7 +140,9 @@ func (c *Client) do(r *http.Request) (*http.Response, error) {
 	if r.Context().Err() != nil {
 		cause = r.Context().Err()
 	}
-	return nil, &HTTPError{Class: ErrorTransport, Message: "request failed", cause: cause}
+	failure := &HTTPError{Class: ErrorTransport, Message: "request failed", cause: cause}
+	c.logTransportError(r, failure)
+	return nil, failure
 }
 
 func (c *Client) request(ctx context.Context, method, endpoint string, output any, allowTaskError bool) error {
@@ -173,8 +181,9 @@ func responseError(status int, cause error) *HTTPError {
 	return &HTTPError{StatusCode: status, Class: classify(status), Message: "upstream response rejected", cause: cause}
 }
 
-func (c *Client) decode(response *http.Response, expected int, output any, allowTaskError bool) error {
+func (c *Client) decode(response *http.Response, expected int, output any, allowTaskError bool) (resultErr error) {
 	data, err := io.ReadAll(io.LimitReader(response.Body, c.maxBody+1))
+	defer func() { c.logResponse(response, data, resultErr) }()
 	if err != nil {
 		cause := ErrInvalidResponse
 		if errors.Is(err, context.Canceled) {

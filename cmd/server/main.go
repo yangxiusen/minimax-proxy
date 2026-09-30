@@ -250,7 +250,7 @@ func run(configPath string, logger *slog.Logger) error {
 		if err != nil {
 			return nil, nil, err
 		}
-		return tk2sd.NewClient(upstream.ServiceURL, key, &http.Client{Timeout: upstream.RequestTimeout}, 1<<20), upstream.ServiceURL, nil
+		return tk2sd.NewClient(upstream.ServiceURL, key, &http.Client{Timeout: upstream.RequestTimeout}, 1<<20).WithLogger(logger), upstream.ServiceURL, nil
 	}}
 	callbackService := callbackservice.NewService(nil, callbackservice.Options{})
 	callbackStore := callbackservice.PersistentStore{Repository: store, Secrets: nodeSecrets}

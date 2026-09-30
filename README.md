@@ -57,6 +57,42 @@ Query with `GET /v2/query/video_generation/{task_id}`. Successful tasks return a
 
 `callback_url` is optional. When present it is challenged before task creation, encrypted at rest, and notified with a stable HMAC-signed body and retry policy. When absent it causes no callback network request. Callback and remote input URLs reject local, private, link-local, metadata, reserved, and DNS-rebinding targets.
 
+### tk2sd duration and task IDs
+
+Send this JSON to the Proxy's `POST /v2/video_generation` with its public Bearer key, after enabling a node that exposes the model:
+
+```json
+{
+  "model": "doubao-seedance-2-0-mini-260615",
+  "duration": 10,
+  "content": [
+    {"type": "text", "text": "Show the product details"},
+    {
+      "type": "image_url",
+      "image_url": {"url": "https://example.com/product.png"},
+      "role": "reference_image"
+    }
+  ]
+}
+```
+
+Replace the example image URL with a publicly reachable image. `duration` must be a top-level integer supported by the discovered model (4-15 seconds for these Seedance models). Omitting it defaults to 5 seconds; mentioning a length in the prompt does not set this field. Explicit invalid values are rejected. The Proxy forwards valid duration values unchanged to tk2sd's `/api/v3/contents/generations/tasks` endpoint.
+
+Successful creation and idempotent replay return `{"task_id":"<proxy-task-id>"}`. This ID is assigned when the Proxy queues the task, before the asynchronous upstream submission. Use it for Proxy queries. The later tk2sd `{"id":"<upstream-task-id>"}` response is stored against that task; it does not replace the public ID. An empty local task ID cannot produce a successful create response. An upstream response without a valid `id` remains subject to the existing uncertain-submission recovery policy.
+
+JSON logs expose the following diagnostic events:
+
+| Filter | What to check |
+| --- | --- |
+| `stage=proxy_create`, `event=request` | Received model and duration, plus `duration_provided`; correlate by `request_id`. |
+| `stage=proxy_create`, `event=normalized` | `effective_duration` and `duration_source=request` or `default`. An omitted tk2sd duration produces a warning. |
+| `stage=proxy_create`, `event=response` | HTTP status and the public `task_id`; links the request ID to the task ID. |
+| `stage=tk2sd_api`, `event=request` | Parameters actually sent, including `duration`; correlate by `task_id` and `node_id`. |
+| `stage=tk2sd_api`, `event=response` | Upstream HTTP status and sanitized response structure for upload, create, query, metadata and cancel. |
+| `stage=tk2sd_api`, `event=task_id_mapping` | The associated `task_id` and `upstream_task_id`. |
+
+If generation keeps using 5 seconds, compare the received and forwarded values first. `duration_source=default` means the JSON arriving at the Proxy omitted `duration`; inspect the caller or New API forwarding configuration. Logs preserve IDs, model parameters, numeric metadata and error codes. Prompts, raw Base64, credentials, signed URLs and unknown response strings (including error messages that can echo inputs) are redacted; multipart bodies are omitted. Logging does not change the HTTP bodies sent or returned. See the log directory information below.
+
 ## Deletion and cleanup
 
 Deleting a terminal task immediately hides it and transactionally creates a durable physical deletion intent. Node outages are retried. The management console also provides an age-based cleanup flow: preview candidates, enter the exact confirmation string, execute asynchronously, inspect per-node progress, and retry failures. Preview alone never mutates tasks or files.

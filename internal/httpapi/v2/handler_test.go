@@ -870,7 +870,7 @@ func (s *createSpyStore) Create(_ context.Context, task domain.NewTask, _ string
 	}
 	s.createCalls++
 	s.lastTask = task
-	return domain.Task{}, nil
+	return domain.Task{TaskID: task.TaskID, Model: task.Model, ProtocolVersion: task.ProtocolVersion}, nil
 }
 func (s *createSpyStore) Get(context.Context, string, string) (domain.Task, error) {
 	return domain.Task{}, domain.ErrTaskNotFound

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/logsafe"
 	"minimax-h3-tc/internal/netguard"
 	"minimax-h3-tc/internal/upstream/tk2sd"
 )
@@ -111,6 +112,7 @@ func (a *ResultAccess) refresh(ctx context.Context, task domain.Task) (domain.Ta
 	if err != nil || run.NodeID != task.UpstreamID || run.UpstreamTaskID == "" || run.UpstreamStatus != "succeeded" {
 		return fallbackResult(task, now)
 	}
+	ctx = logsafe.WithTask(ctx, task.TaskID, run.NodeID)
 	client, base, err := a.Resolve(ctx, run.NodeID)
 	if err != nil {
 		return fallbackResult(task, now)

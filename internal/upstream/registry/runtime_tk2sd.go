@@ -40,7 +40,7 @@ func (f NodeRuntimeFactory) startTK2SD(parent context.Context, node domain.Model
 	if err = f.initializeSnapshot(parent, node, input, upstream); err != nil {
 		return nil, err
 	}
-	client := tk2sd.NewClient(upstream.ServiceURL, key, &http.Client{Timeout: upstream.RequestTimeout}, 1<<20)
+	client := tk2sd.NewClient(upstream.ServiceURL, key, &http.Client{Timeout: upstream.RequestTimeout}, 1<<20).WithLogger(f.Logger)
 	processor := &remote.Processor{Store: store, Client: client, Inputs: &remote.InputMaterializer{Store: store, Root: f.InputSpoolRoot, Timeout: upstream.RequestTimeout}, NodeID: node.ID, NodeVersion: node.Version, NodeURL: upstream.ServiceURL, Capacity: input.MaxConcurrency, PollInterval: input.PollInterval, Now: f.Now, Logger: f.Logger}
 	ctx, cancel := context.WithCancel(parent)
 	wake := make(chan struct{}, 1)

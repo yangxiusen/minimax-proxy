@@ -166,6 +166,9 @@ type TaskUsage struct {
 }
 
 func (h *handler) create(w http.ResponseWriter, r *http.Request) {
+	logged := &createLogWriter{ResponseWriter: w}
+	w = logged
+	defer h.logCreateResponse(r, logged)
 	if mediaType := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0])); mediaType != "application/json" {
 		h.writeError(w, r, http.StatusBadRequest, "bad_request_error", "Content-Type 必须为 application/json (2013)")
 		return
@@ -192,6 +195,7 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 	var fields map[string]json.RawMessage
 	_ = json.Unmarshal(raw, &fields)
 	_, request.DurationPresent = fields["duration"]
+	h.logger.InfoContext(r.Context(), "Proxy 创建任务请求", "stage", "proxy_create", "event", "request", "request_id", requestID(r.Context()), "duration_provided", request.DurationPresent, "request", logsafe.Generation(request, requestSecrets(r)...))
 	if h.routing != nil {
 		h.createRouted(w, r, request)
 		return
@@ -270,7 +274,7 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 			existing, findErr := finder.FindIdempotentTask(r.Context(), owner(r.Context()), idempotencyHash, requestHashHex)
 			switch {
 			case findErr == nil:
-				h.writeJSON(w, http.StatusOK, map[string]string{"task_id": existing.TaskID})
+				h.writeCreateResult(w, r, existing)
 				return
 			case errors.Is(findErr, domain.ErrIdempotencyConflict):
 				h.storeError(w, r, findErr)
@@ -366,7 +370,7 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 		h.wake()
 	}
 	h.logger.InfoContext(r.Context(), "视频生成任务已入队", "request_id", requestID(r.Context()), "task_id", task.TaskID, "api_key_id", task.APIKeyID, "scenario", task.Scenario)
-	h.writeJSON(w, http.StatusOK, map[string]string{"task_id": task.TaskID})
+	h.writeCreateResult(w, r, task)
 }
 
 func inputObjectNamespace(ownerID, requestHash string) string {

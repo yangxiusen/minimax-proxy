@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/logsafe"
 	"minimax-h3-tc/internal/upstream/tk2sd"
 )
 
@@ -83,6 +84,7 @@ func (p *Processor) ProcessTask(ctx context.Context, task domain.Task) (err erro
 	if p.Store == nil || p.Client == nil || task.TaskID == "" || task.UpstreamID != p.NodeID || task.ProtocolVersion != domain.ProtocolTK2SD {
 		return domain.ErrStateConflict
 	}
+	ctx = logsafe.WithTask(ctx, task.TaskID, p.NodeID)
 	ttl := p.LeaseDuration
 	if ttl <= 0 {
 		ttl = 60 * time.Second

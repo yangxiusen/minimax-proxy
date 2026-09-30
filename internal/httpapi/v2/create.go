@@ -91,7 +91,7 @@ func (h *handler) replayRouted(w http.ResponseWriter, r *http.Request, request d
 		h.storeError(w, r, domain.ErrIdempotencyConflict)
 		return true
 	}
-	h.writeJSON(w, http.StatusOK, map[string]string{"task_id": existing.TaskID})
+	h.writeCreateResult(w, r, existing)
 	return true
 }
 
@@ -114,6 +114,16 @@ func (h *handler) createRouted(w http.ResponseWriter, r *http.Request, request d
 		return
 	}
 	n := decision.Normalized
+	durationSource := "request"
+	if !request.DurationPresent {
+		durationSource = "default"
+	}
+	attributes := []any{"stage", "proxy_create", "event", "normalized", "request_id", requestID(r.Context()), "protocol", decision.Snapshot.ProtocolVersion, "duration_provided", request.DurationPresent, "duration_source", durationSource, "effective_duration", n.Request.Duration, "request", logsafe.Generation(n.Request, requestSecrets(r)...)}
+	if decision.Snapshot.ProtocolVersion == domain.ProtocolTK2SD && !request.DurationPresent {
+		h.logger.WarnContext(r.Context(), "请求未提供 duration，使用协议默认时长", attributes...)
+	} else {
+		h.logger.InfoContext(r.Context(), "模型请求参数已按协议校验", attributes...)
+	}
 	validated := ValidatedRequest{CreateRequest: n.Request, Scenario: n.Scenario, Prompt: n.Prompt, InputImageCount: n.InputImageCount}
 	var activeProfile domain.ModelRequestProfile
 	if decision.Snapshot.ParameterPlan == "h3_profile" {
@@ -222,7 +232,7 @@ func (h *handler) createRouted(w http.ResponseWriter, r *http.Request, request d
 		h.wake()
 	}
 	h.logger.InfoContext(r.Context(), "视频生成任务已按模型协议入队", "task_id", task.TaskID, "model", task.Model, "protocol", task.ProtocolVersion)
-	h.writeJSON(w, 200, map[string]string{"task_id": task.TaskID})
+	h.writeCreateResult(w, r, task)
 }
 func (h *handler) prepareRoutedInputs(ctx context.Context, id, ownerID, hash string, payload []byte) (inputspool.PreparedRequest, error) {
 	if h.inputObjects != nil {

@@ -76,8 +76,10 @@ func (c *Client) Submit(ctx context.Context, body []byte, idempotencyKey string)
 		return "", err
 	}
 	if !validID(result.ID) {
+		c.logTaskID(ctx, result.ID, false)
 		return "", ErrInvalidResponse
 	}
+	c.logTaskID(ctx, result.ID, true)
 	return result.ID, nil
 }
 
