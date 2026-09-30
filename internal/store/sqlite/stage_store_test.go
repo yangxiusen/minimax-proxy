@@ -572,7 +572,7 @@ func TestClaimStageRecoversActiveTaskOnlyOnCurrentNode(t *testing.T) {
 
 func TestClaimStageQueryPlanUsesClaimAndPredecessorIndexes(t *testing.T) {
 	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 10})
-	rows, err := store.db.QueryContext(context.Background(), "EXPLAIN QUERY PLAN "+claimStageCandidateSelect, int64(1), int64(1), "gpu-1", "gpu-1")
+	rows, err := store.db.QueryContext(context.Background(), "EXPLAIN QUERY PLAN "+claimStageCandidateSelect, "gpu-1", int64(1), int64(1), "gpu-1", "gpu-1", "gpu-1", int64(0), int64(0), -1)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -101,3 +101,8 @@ var UpstreamFeedback string
 //
 //go:embed 021_oss_input_object_metadata.sql
 var OSSInputObjectMetadata string
+
+// MultiModelProtocolRouting 保存多模型目录、冻结路由及远程任务提交证据。
+//
+//go:embed 022_multi_model_protocol_routing.sql
+var MultiModelProtocolRouting string

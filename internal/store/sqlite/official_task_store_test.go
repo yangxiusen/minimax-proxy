@@ -230,6 +230,7 @@ func TestClaimNextInternalSkipsMMFileMedia(t *testing.T) {
 		officialTaskWithContent("official-only", `[{"type":"video_url","video_url":{"url":"mm_file://video-1"}}]`),
 		officialTask("internal-compatible", false, false),
 	} {
+		task.ProtocolVersion = domain.ProtocolLegacy
 		if _, err := store.Create(ctx, task, "", nil); err != nil {
 			t.Fatal(err)
 		}
@@ -248,6 +249,7 @@ func TestClaimStageInternalSkipsMMFileMedia(t *testing.T) {
 		officialTaskWithContent("official-stage-only", `[{"type":"video_url","video_url":{"url":"mm_file://video-1"}}]`),
 		officialTask("internal-stage-compatible", false, false),
 	} {
+		task.ProtocolVersion = domain.ProtocolH3
 		if _, err := store.Create(ctx, task, "", nil); err != nil {
 			t.Fatal(err)
 		}
@@ -331,10 +333,42 @@ func officialTask(id string, withLoRA, withRestoration bool) domain.NewTask {
 		)
 	}
 	return domain.NewTask{
-		TaskID: id, APIKeyID: "owner", Model: "MiniMax-H3", Scenario: "t2va",
+		ProtocolVersion: domain.ProtocolOfficial,
+		TaskID:          id, APIKeyID: "owner", Model: "MiniMax-H3", Scenario: "t2va",
 		RequestJSON: `{"model":"MiniMax-H3","content":[{"type":"text","text":"hello"}],"resolution":"2K","duration":5,"ratio":"16:9"}`,
 		RequestHash: id, Resolution: "2K", Duration: 5, Ratio: "16:9", Stages: stages,
 		ConfigSnapshotJSON: `{}`, ConfigHash: "hash-" + id,
+	}
+}
+
+func TestOfficialClaimRechecksStoredCapacityAndFreezesAlias(t *testing.T) {
+	s := newStore(t, Options{PerKeyLimit: 10, GlobalLimit: 10})
+	ctx := context.Background()
+	n, err := s.CreateModelNode(ctx, officialNodeInput("official", 1, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE model_service_nodes SET legacy_model_compat=1,upstream_model='historical-alias' WHERE id=?`, n.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"one", "two"} {
+		if _, err := s.Create(ctx, officialTask(id, false, false), "", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claimed, err := s.ClaimNextOfficial(ctx, n.ID, n.Version, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var alias string
+	if err := s.db.QueryRow(`SELECT json_extract(dispatch_snapshot_json,'$.upstream_model') FROM video_tasks WHERE task_id=?`, claimed.TaskID).Scan(&alias); err != nil {
+		t.Fatal(err)
+	}
+	if alias != "historical-alias" {
+		t.Fatalf("frozen alias=%s", alias)
+	}
+	if _, err := s.ClaimNextOfficial(ctx, n.ID, n.Version, 10); !errors.Is(err, domain.ErrUpstreamBusy) {
+		t.Fatalf("capacity overclaim=%v", err)
 	}
 }
 

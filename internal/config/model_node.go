@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -35,11 +36,22 @@ func normalizeNodeAPIModelNode(input domain.ModelNodeInput) (domain.ModelNodeInp
 	if input.ProtocolVersion == "" {
 		input.ProtocolVersion = "h3-node-v1"
 	}
-	if input.ProtocolVersion != "h3-node-v1" && input.ProtocolVersion != "minimax-v2" {
-		return domain.ModelNodeInput{}, UpstreamConfig{}, fmt.Errorf("protocol_version 仅支持 h3-node-v1 或 minimax-v2")
+	if input.ProtocolVersion != "h3-node-v1" && input.ProtocolVersion != "minimax-v2" && input.ProtocolVersion != domain.ProtocolTK2SD {
+		return domain.ModelNodeInput{}, UpstreamConfig{}, fmt.Errorf("protocol_version 仅支持 h3-node-v1、minimax-v2 或 tk2sd-v1")
 	}
 	if input.ProtocolVersion == "minimax-v2" && serviceURL.Scheme != "https" {
 		return domain.ModelNodeInput{}, UpstreamConfig{}, fmt.Errorf("minimax-v2 service_url 必须使用 HTTPS")
+	}
+	if input.ProtocolVersion == domain.ProtocolTK2SD {
+		cleanPath := path.Clean(serviceURL.Path)
+		if serviceURL.ForceQuery || serviceURL.RawPath != "" || strings.ContainsAny(serviceURL.Path, "\\%") || (serviceURL.Path != "" && cleanPath != serviceURL.Path) {
+			return domain.ModelNodeInput{}, UpstreamConfig{}, fmt.Errorf("tk2sd service_url 必须使用服务根地址")
+		}
+		for _, segment := range strings.Split(strings.ToLower(serviceURL.Path), "/") {
+			if segment == "ui" || segment == "tasks" || segment == "generations" {
+				return domain.ModelNodeInput{}, UpstreamConfig{}, fmt.Errorf("tk2sd service_url 不能使用 /ui 或任务路径")
+			}
+		}
 	}
 	if input.ProtocolVersion == "h3-node-v1" {
 		if strings.TrimSpace(input.UpstreamModel) != "" || input.MaxConcurrency > 1 || input.ReplaceResultURL {
@@ -49,8 +61,9 @@ func normalizeNodeAPIModelNode(input domain.ModelNodeInput) (domain.ModelNodeInp
 		input.MaxConcurrency = 1
 		input.ReplaceResultURL = false
 	} else {
+		rawModel := input.UpstreamModel
 		input.UpstreamModel = strings.TrimSpace(input.UpstreamModel)
-		if count := utf8.RuneCountInString(input.UpstreamModel); count < 1 || count > 128 || strings.IndexFunc(input.UpstreamModel, unicode.IsControl) >= 0 {
+		if count := utf8.RuneCountInString(input.UpstreamModel); (rawModel != "" && count == 0) || count > 128 || strings.IndexFunc(input.UpstreamModel, unicode.IsControl) >= 0 {
 			return domain.ModelNodeInput{}, UpstreamConfig{}, fmt.Errorf("upstream_model 必须是 1 至 128 个无控制字符的文本")
 		}
 		if input.MaxConcurrency < 1 || input.MaxConcurrency > 100 {

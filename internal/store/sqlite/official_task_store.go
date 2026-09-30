@@ -15,12 +15,12 @@ func (s *Store) SaveOfficialSubmissionBaseline(ctx context.Context, taskID, node
 	if err != nil {
 		return err
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE video_tasks SET upstream_jobs_before_json=?,official_submission_baseline_saved=1,updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND upstream_slot_active=1 AND status='dispatching'`, string(data), s.nowUnix(), taskID, nodeID)
+	result, err := s.db.ExecContext(ctx, `UPDATE video_tasks SET upstream_jobs_before_json=?,official_submission_baseline_saved=1,updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND upstream_slot_active=1 AND status='dispatching' AND protocol_version='minimax-v2' AND route_state='ready'`, string(data), s.nowUnix(), taskID, nodeID)
 	return oneRow(result, err)
 }
 
 func (s *Store) ListActiveOfficialTasks(ctx context.Context, nodeID string) ([]domain.Task, error) {
-	rows, err := s.db.QueryContext(ctx, taskSelect+` WHERE upstream_id=? AND upstream_slot_active=1 AND status IN ('dispatching','running') ORDER BY queue_seq`, nodeID)
+	rows, err := s.db.QueryContext(ctx, taskSelect+` WHERE upstream_id=? AND upstream_slot_active=1 AND deleted_at IS NULL AND protocol_version='minimax-v2' AND route_state='ready' AND status IN ('dispatching','running') ORDER BY queue_seq`, nodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -54,14 +54,16 @@ func (s *Store) ClaimNextOfficial(ctx context.Context, nodeID string, nodeVersio
 	}
 	defer completeTransaction(finish, &err)
 
-	var replaceResultURL int
-	checkErr := conn.QueryRowContext(ctx, `SELECT replace_result_url FROM model_service_nodes WHERE id=? AND version=? AND enabled=1 AND deleted_at IS NULL AND protocol_version='minimax-v2'`, nodeID, nodeVersion).Scan(&replaceResultURL)
+	var replaceResultURL, configuredCapacity, legacyCompat int
+	var serviceURL, upstreamModel string
+	checkErr := conn.QueryRowContext(ctx, `SELECT replace_result_url,max_concurrency,legacy_model_compat,service_url,upstream_model FROM model_service_nodes WHERE id=? AND version=? AND enabled=1 AND deleted_at IS NULL AND protocol_version='minimax-v2'`, nodeID, nodeVersion).Scan(&replaceResultURL, &configuredCapacity, &legacyCompat, &serviceURL, &upstreamModel)
 	if errors.Is(checkErr, sql.ErrNoRows) {
 		return taskResult, domain.ErrNodeConfigStale
 	}
 	if checkErr != nil {
 		return taskResult, checkErr
 	}
+	capacity = min(capacity, configuredCapacity)
 	var active int
 	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM video_tasks WHERE upstream_id=? AND upstream_slot_active=1`, nodeID).Scan(&active); err != nil {
 		return taskResult, err
@@ -70,61 +72,21 @@ func (s *Store) ClaimNextOfficial(ctx context.Context, nodeID string, nodeVersio
 		return taskResult, domain.ErrUpstreamBusy
 	}
 
-	wanted := domain.StatusQueuedOpen
-	if s.options.ProtectedSlots > 0 {
-		wanted = domain.StatusQueuedLocked
+	selected, err := nextEligibleTask(ctx, conn, nodeID, s.nowUnix())
+	if err != nil {
+		return taskResult, err
 	}
-	var taskID, owner string
-	err = conn.QueryRowContext(ctx, `
-		SELECT task.task_id,task.api_key_id
-		FROM video_tasks task
-		WHERE task.status=? AND task.deleted_at IS NULL
-		  AND task.resolution IN ('768P','2K') AND task.duration BETWEEN 4 AND 15
-		  AND NOT EXISTS (
-		    SELECT 1 FROM json_each(task.request_json,'$.content') content
-		    WHERE json_extract(content.value,'$.type') IN ('image_url','video_url','audio_url')
-		      AND NOT (
-		        lower(COALESCE(json_extract(content.value,'$.image_url.url'),json_extract(content.value,'$.video_url.url'),json_extract(content.value,'$.audio_url.url'),'')) LIKE 'http://%'
-		        OR lower(COALESCE(json_extract(content.value,'$.image_url.url'),json_extract(content.value,'$.video_url.url'),json_extract(content.value,'$.audio_url.url'),'')) LIKE 'https://%'
-		        OR (
-		          substr(lower(COALESCE(json_extract(content.value,'$.image_url.url'),json_extract(content.value,'$.video_url.url'),json_extract(content.value,'$.audio_url.url'),'')),1,10) = 'mm_file://'
-		          AND length(COALESCE(json_extract(content.value,'$.image_url.url'),json_extract(content.value,'$.video_url.url'),json_extract(content.value,'$.audio_url.url'),'')) > 10
-		        )
-		        OR (
-		          json_extract(content.value,'$.type')='image_url'
-		          AND lower(COALESCE(json_extract(content.value,'$.image_url.url'),'')) GLOB 'data:image/*;base64,?*'
-		        )
-		        OR (
-		          json_extract(content.value,'$.type')='video_url'
-		          AND lower(COALESCE(json_extract(content.value,'$.video_url.url'),'')) GLOB 'data:video/mp4;base64,?*'
-		        )
-		        OR (
-		          json_extract(content.value,'$.type')='audio_url'
-		          AND (
-		            lower(COALESCE(json_extract(content.value,'$.audio_url.url'),'')) GLOB 'data:audio/wav;base64,?*'
-		            OR lower(COALESCE(json_extract(content.value,'$.audio_url.url'),'')) GLOB 'data:audio/mpeg;base64,?*'
-		            OR lower(COALESCE(json_extract(content.value,'$.audio_url.url'),'')) GLOB 'data:audio/mp3;base64,?*'
-		          )
-		        )
-		        OR EXISTS (
-		          SELECT 1 FROM task_input_spool_files input
-		          WHERE input.task_id=task.task_id
-		            AND input.content_index=CAST(content.key AS INTEGER)
-		            AND input.content_type=json_extract(content.value,'$.type')
-		            AND input.role=COALESCE(json_extract(content.value,'$.role'),'')
-		            AND COALESCE(json_extract(content.value,'$.' || input.content_type || '.url'),'')='proxy-input://' || task.task_id || '/' || input.id
-		        )
-		      )
-		  )
-		ORDER BY task.queue_seq LIMIT 1`, wanted).Scan(&taskID, &owner)
-	if errors.Is(err, sql.ErrNoRows) {
-		return taskResult, domain.ErrQueueEmpty
+	taskID, owner, wanted := selected.TaskID, selected.APIKeyID, selected.Status
+	model := selected.Model
+	if legacyCompat == 1 {
+		model = upstreamModel
 	}
+	dispatch, err := json.Marshal(map[string]any{"schema_version": 1, "node_id": nodeID, "node_version": nodeVersion, "protocol_version": domain.ProtocolOfficial, "service_url": serviceURL, "upstream_model": model})
 	if err != nil {
 		return taskResult, err
 	}
 	now := s.nowUnix()
-	updated, err := conn.ExecContext(ctx, `UPDATE video_tasks SET status='dispatching',cancel_locked=1,upstream_id=?,upstream_slot_active=1,upstream_node_version=?,delivery_required=?,started_at=COALESCE(started_at,?),attempt_started_at=?,updated_at=?,version=version+1 WHERE task_id=? AND status=?`, nodeID, nodeVersion, replaceResultURL, now, now, now, taskID, wanted)
+	updated, err := conn.ExecContext(ctx, `UPDATE video_tasks SET status='dispatching',cancel_locked=1,upstream_id=?,upstream_slot_active=1,upstream_node_version=?,delivery_required=?,dispatch_snapshot_json=?,started_at=COALESCE(started_at,?),attempt_started_at=?,updated_at=?,version=version+1 WHERE task_id=? AND status=?`, nodeID, nodeVersion, replaceResultURL, string(dispatch), now, now, now, taskID, wanted)
 	if err := oneRow(updated, err); err != nil {
 		return taskResult, err
 	}
@@ -135,7 +97,7 @@ func (s *Store) ClaimNextOfficial(ctx context.Context, nodeID string, nodeVersio
 }
 
 func (s *Store) BindOfficialTask(ctx context.Context, taskID, nodeID, upstreamTaskID string) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE video_tasks SET upstream_job_id=?,status='running',updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND upstream_slot_active=1 AND status='dispatching'`, upstreamTaskID, s.nowUnix(), taskID, nodeID)
+	result, err := s.db.ExecContext(ctx, `UPDATE video_tasks SET upstream_job_id=?,status='running',updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND upstream_slot_active=1 AND status='dispatching' AND protocol_version='minimax-v2' AND route_state='ready'`, upstreamTaskID, s.nowUnix(), taskID, nodeID)
 	return oneRow(result, err)
 }
 
@@ -153,7 +115,7 @@ func (s *Store) MarkOfficialGenerated(ctx context.Context, taskID, nodeID, origi
 	if uploadJob != nil {
 		status, publicURL, finishedAt = domain.StatusReconciling, "", nil
 	}
-	updated, err := conn.ExecContext(ctx, `UPDATE video_tasks SET status=?,result_internal_url=?,result_public_url=NULLIF(?,''),ratio_actual=?,usage_total_seconds=duration,usage_output_seconds=duration,upstream_slot_active=0,finished_at=?,updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND upstream_slot_active=1 AND status IN ('dispatching','running')`, status, originURL, publicURL, ratio, finishedAt, now, taskID, nodeID)
+	updated, err := conn.ExecContext(ctx, `UPDATE video_tasks SET status=?,result_internal_url=?,result_public_url=NULLIF(?,''),ratio_actual=?,usage_total_seconds=duration,usage_output_seconds=duration,upstream_slot_active=0,finished_at=?,updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND upstream_slot_active=1 AND status IN ('dispatching','running') AND protocol_version='minimax-v2' AND route_state='ready'`, status, originURL, publicURL, ratio, finishedAt, now, taskID, nodeID)
 	if err := oneRow(updated, err); err != nil {
 		return err
 	}
@@ -182,7 +144,7 @@ func (s *Store) MarkOfficialFailed(ctx context.Context, taskID, nodeID, code, me
 	}
 	defer completeTransaction(finish, &err)
 	now, nowMS := s.nowUnix(), s.nowMillis()
-	updated, err := conn.ExecContext(ctx, `UPDATE video_tasks SET status='failed',error_code=?,error_message=?,upstream_feedback_json=?,upstream_slot_active=0,finished_at=?,updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND upstream_slot_active=1 AND status IN ('dispatching','running')`, code, message, feedbackJSON, now, now, taskID, nodeID)
+	updated, err := conn.ExecContext(ctx, `UPDATE video_tasks SET status='failed',error_code=?,error_message=?,upstream_feedback_json=?,upstream_slot_active=0,finished_at=?,updated_at=?,version=version+1 WHERE task_id=? AND upstream_id=? AND upstream_slot_active=1 AND status IN ('dispatching','running') AND protocol_version='minimax-v2' AND route_state='ready'`, code, message, feedbackJSON, now, now, taskID, nodeID)
 	if err := oneRow(updated, err); err != nil {
 		return err
 	}

@@ -69,7 +69,7 @@ func Open(ctx context.Context, path string, options Options) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) migrate(ctx context.Context) error {
-	return s.applyMigrations(ctx, []migration{
+	if err := s.applyMigrations(ctx, []migration{
 		{version: 1, name: "初始化", sql: migrations.Initial},
 		{version: 2, name: "分辨率档位", sql: migrations.ResolutionTiers},
 		{version: 3, name: "任务生命周期", sql: migrations.TaskLifecycleClosure},
@@ -90,7 +90,10 @@ func (s *Store) migrate(ctx context.Context) error {
 		{version: 19, name: "官方提交基线状态", sql: migrations.OfficialSubmissionBaselineState},
 		{version: 20, name: "上游反馈信息", sql: migrations.UpstreamFeedback},
 		{version: 21, name: "对象存储输入元数据", sql: migrations.OSSInputObjectMetadata},
-	})
+	}); err != nil {
+		return err
+	}
+	return s.migrateV22(ctx)
 }
 
 type migration struct {
@@ -100,20 +103,15 @@ type migration struct {
 }
 
 func (s *Store) applyMigrations(ctx context.Context, plan []migration) (err error) {
-	conn, err := s.db.Conn(ctx)
+	conn, finish, err := s.migrationConnection(ctx)
 	if err != nil {
 		return fmt.Errorf("获取数据库迁移连接: %w", err)
 	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		return fmt.Errorf("开始数据库迁移: %w", err)
+	defer finish(&err)
+	var originalVersion int
+	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&originalVersion); err != nil {
+		return err
 	}
-	defer func() {
-		if err != nil {
-			_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
-			err = errors.Join(err, rollbackErr)
-		}
-	}()
 	for _, item := range plan {
 		applied := 0
 		if item.version > 1 {
@@ -141,12 +139,9 @@ func (s *Store) applyMigrations(ctx context.Context, plan []migration) (err erro
 		}
 	}
 	if len(plan) > 0 {
-		if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version=%d", plan[len(plan)-1].version)); err != nil {
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version=%d", max(originalVersion, plan[len(plan)-1].version))); err != nil {
 			return fmt.Errorf("更新数据库用户版本: %w", err)
 		}
-	}
-	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
-		return fmt.Errorf("提交数据库迁移: %w", err)
 	}
 	return nil
 }
@@ -184,22 +179,28 @@ func (s *Store) Create(ctx context.Context, input domain.NewTask, keyHash string
 		}
 	}
 	var count int
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM video_tasks WHERE api_key_id=? AND deleted_at IS NULL AND status IN ('queued_open','queued_locked','dispatching','running','reconciling')`, input.APIKeyID).Scan(&count); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM video_tasks WHERE api_key_id=? AND deleted_at IS NULL AND status IN ('queued_open','queued_locked','dispatching','running','reconciling','cancelling')`, input.APIKeyID).Scan(&count); err != nil {
 		return domain.Task{}, err
 	}
 	if count >= s.options.PerKeyLimit {
 		return domain.Task{}, domain.ErrPerKeyLimit
 	}
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM video_tasks WHERE deleted_at IS NULL AND status IN ('queued_open','queued_locked','dispatching','running','reconciling')`).Scan(&count); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM video_tasks WHERE deleted_at IS NULL AND status IN ('queued_open','queued_locked','dispatching','running','reconciling','cancelling')`).Scan(&count); err != nil {
 		return domain.Task{}, err
 	}
 	if count >= s.options.GlobalLimit {
 		return domain.Task{}, domain.ErrGlobalLimit
 	}
 	expires := now + int64(s.options.Retention/time.Second)
+	if err := s.prepareTaskRouting(ctx, conn, &input); err != nil {
+		return domain.Task{}, err
+	}
 	_, err = conn.ExecContext(ctx, `INSERT INTO video_tasks(task_id,api_key_id,model,scenario,request_json,request_hash,status,resolution,duration,ratio_requested,usage_input_image_count,callback_url_ciphertext,callback_url_nonce,profile_id,profile_version,config_snapshot_json,config_hash,created_at,updated_at,expires_at) VALUES(?,?,?,?,?,?,'queued_open',?,?,?,?,NULLIF(?,X''),NULLIF(?,X''),NULLIF(?,''),NULLIF(?,0),NULLIF(?,''),NULLIF(?,''),?,?,?)`, input.TaskID, input.APIKeyID, input.Model, input.Scenario, input.RequestJSON, input.RequestHash, input.Resolution, input.Duration, input.Ratio, input.InputImageCount, input.CallbackURLCiphertext, input.CallbackURLNonce, input.ProfileID, input.ProfileVersion, input.ConfigSnapshotJSON, input.ConfigHash, now, now, expires)
 	if err != nil {
 		return domain.Task{}, fmt.Errorf("插入任务: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE video_tasks SET protocol_version=?,route_state=?,routing_snapshot_json=?,request_normalizer=? WHERE task_id=?`, input.ProtocolVersion, input.RouteState, input.RoutingSnapshotJSON, input.RequestNormalizer, input.TaskID); err != nil {
+		return domain.Task{}, err
 	}
 	if len(input.CallbackURLCiphertext) > 0 {
 		if input.CallbackDeliveryID == "" || input.CallbackRequestBody == "" || input.CallbackRequestBodyHash == "" {
@@ -272,18 +273,24 @@ func (s *Store) ActiveForUpstream(ctx context.Context, upstreamID string) (domai
 }
 
 func (s *Store) List(ctx context.Context, owner string, filter domain.TaskFilter) ([]domain.Task, int, error) {
+	tx, beginErr := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if beginErr != nil {
+		return nil, 0, beginErr
+	}
+	defer tx.Rollback()
 	conditions := []string{"api_key_id=?", "deleted_at IS NULL", "expires_at>?"}
 	args := []any{owner, s.nowUnix()}
+	if filter.Model != "" {
+		conditions = append(conditions, "model=?")
+		args = append(args, filter.Model)
+	}
 	if filter.Status != "" {
 		statuses := internalStatuses(filter.Status)
 		if len(statuses) == 0 {
 			return []domain.Task{}, 0, nil
 		}
-		marks := make([]string, len(statuses))
-		for i, status := range statuses {
-			marks[i], args = "?", append(args, status)
-		}
-		conditions = append(conditions, "status IN ("+strings.Join(marks, ",")+")")
+		conditions = append(conditions, "("+taskPublicStatusSQL+")=?")
+		args = append(args, string(filter.Status))
 	}
 	if len(filter.TaskIDs) > 0 {
 		marks := make([]string, len(filter.TaskIDs))
@@ -294,7 +301,7 @@ func (s *Store) List(ctx context.Context, owner string, filter domain.TaskFilter
 	}
 	where := strings.Join(conditions, " AND ")
 	var total int
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM video_tasks WHERE "+where, args...).Scan(&total); err != nil {
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM video_tasks WHERE "+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	if filter.PageNum <= 0 {
@@ -304,7 +311,7 @@ func (s *Store) List(ctx context.Context, owner string, filter domain.TaskFilter
 		filter.PageSize = 20
 	}
 	queryArgs := append(append([]any{}, args...), filter.PageSize, (filter.PageNum-1)*filter.PageSize)
-	rows, err := s.db.QueryContext(ctx, taskSelect+" WHERE "+where+" ORDER BY created_at DESC,queue_seq DESC LIMIT ? OFFSET ?", queryArgs...)
+	rows, err := tx.QueryContext(ctx, taskSelect+" WHERE "+where+" ORDER BY created_at DESC,queue_seq DESC LIMIT ? OFFSET ?", queryArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -317,22 +324,40 @@ func (s *Store) List(ctx context.Context, owner string, filter domain.TaskFilter
 		}
 		items = append(items, task)
 	}
-	return items, total, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	rows.Close()
+	return items, total, tx.Commit()
 }
 
 func (s *Store) ListAdminTasks(ctx context.Context, filter domain.AdminTaskFilter) ([]domain.AdminTaskSummary, int, error) {
+	tx, beginErr := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if beginErr != nil {
+		return nil, 0, beginErr
+	}
+	defer tx.Rollback()
 	conditions := []string{"deleted_at IS NULL", "expires_at>?"}
 	args := []any{s.nowUnix()}
+	if filter.Model != "" {
+		conditions = append(conditions, "model=?")
+		args = append(args, filter.Model)
+	}
+	if filter.ProtocolVersion != "" {
+		conditions = append(conditions, "protocol_version=?")
+		args = append(args, filter.ProtocolVersion)
+	}
+	if filter.RouteState != "" {
+		conditions = append(conditions, "route_state=?")
+		args = append(args, filter.RouteState)
+	}
 	if filter.Status != "" {
 		statuses := internalStatuses(filter.Status)
 		if len(statuses) == 0 {
 			return []domain.AdminTaskSummary{}, 0, nil
 		}
-		marks := make([]string, len(statuses))
-		for i, status := range statuses {
-			marks[i], args = "?", append(args, status)
-		}
-		conditions = append(conditions, "status IN ("+strings.Join(marks, ",")+")")
+		conditions = append(conditions, "("+taskPublicStatusSQL+")=?")
+		args = append(args, string(filter.Status))
 	}
 	if filter.UpstreamID != "" {
 		conditions = append(conditions, "upstream_id=?")
@@ -344,7 +369,7 @@ func (s *Store) ListAdminTasks(ctx context.Context, filter domain.AdminTaskFilte
 	}
 	where := strings.Join(conditions, " AND ")
 	var total int
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM video_tasks WHERE "+where, args...).Scan(&total); err != nil {
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM video_tasks WHERE "+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	if filter.PageNum <= 0 {
@@ -359,7 +384,7 @@ func (s *Store) ListAdminTasks(ctx context.Context, filter domain.AdminTaskFilte
 		return []domain.AdminTaskSummary{}, total, nil
 	}
 	queryArgs := append(append([]any{}, args...), pageSize, (pageNum-1)*pageSize)
-	rows, err := s.db.QueryContext(ctx, adminTaskSelect+" WHERE "+where+" ORDER BY created_at DESC,queue_seq DESC LIMIT ? OFFSET ?", queryArgs...)
+	rows, err := tx.QueryContext(ctx, adminTaskSelect+" WHERE "+where+" ORDER BY created_at DESC,queue_seq DESC LIMIT ? OFFSET ?", queryArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -372,7 +397,11 @@ func (s *Store) ListAdminTasks(ctx context.Context, filter domain.AdminTaskFilte
 		}
 		items = append(items, item)
 	}
-	return items, total, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	rows.Close()
+	return items, total, tx.Commit()
 }
 
 func (s *Store) LatestFinishedForUpstream(ctx context.Context, upstreamID string) (domain.AdminTaskSummary, error) {
@@ -405,32 +434,11 @@ func (s *Store) ClaimNext(ctx context.Context, upstreamID string, expectedVersio
 	if active > 0 {
 		return domain.Task{}, domain.ErrUpstreamBusy
 	}
-	wanted := domain.StatusQueuedOpen
-	if s.options.ProtectedSlots > 0 {
-		wanted = domain.StatusQueuedLocked
-	}
-	var taskID, owner string
-	err = conn.QueryRowContext(ctx, `
-		SELECT task.task_id,task.api_key_id
-		FROM video_tasks task
-		WHERE task.status=? AND task.deleted_at IS NULL
-		  AND NOT EXISTS (
-		    SELECT 1 FROM json_each(task.request_json,'$.content') content
-		    WHERE json_extract(content.value,'$.type') IN ('image_url','video_url','audio_url')
-		      AND substr(lower(COALESCE(
-		        json_extract(content.value,'$.image_url.url'),
-		        json_extract(content.value,'$.video_url.url'),
-		        json_extract(content.value,'$.audio_url.url'),
-		        ''
-		      )),1,10) = 'mm_file://'
-		  )
-		ORDER BY task.queue_seq LIMIT 1`, wanted).Scan(&taskID, &owner)
-	if errors.Is(err, sql.ErrNoRows) {
-		return domain.Task{}, domain.ErrQueueEmpty
-	}
+	selected, err := nextEligibleTask(ctx, conn, upstreamID, s.nowUnix())
 	if err != nil {
-		return domain.Task{}, err
+		return taskResult, err
 	}
+	taskID, owner, wanted := selected.TaskID, selected.APIKeyID, selected.Status
 	now := s.nowUnix()
 	result, err := conn.ExecContext(ctx, `UPDATE video_tasks SET status='dispatching',cancel_locked=1,upstream_id=?,started_at=COALESCE(started_at,?),updated_at=?,version=version+1 WHERE task_id=? AND status=?`, upstreamID, now, now, taskID, wanted)
 	if err != nil {
@@ -550,6 +558,11 @@ func (s *Store) BeginRetry(ctx context.Context, taskID, upstreamID string, jobID
 }
 
 func (s *Store) RequestAdminCancel(ctx context.Context, taskID string) (err error) {
+	var protocolID string
+	var active int
+	if queryErr := s.db.QueryRowContext(ctx, `SELECT COALESCE(protocol_version,''),upstream_slot_active FROM video_tasks WHERE task_id=? AND deleted_at IS NULL`, taskID).Scan(&protocolID, &active); queryErr == nil && protocolID == domain.ProtocolTK2SD && active == 1 {
+		return s.RequestRemoteCancel(ctx, taskID)
+	}
 	conn, finish, err := s.immediate(ctx)
 	if err != nil {
 		return err
@@ -830,7 +843,7 @@ func oneRow(result sql.Result, err error) error {
 }
 
 func (s *Store) rebalance(ctx context.Context, conn *sql.Conn, now int64) error {
-	_, err := conn.ExecContext(ctx, `WITH ranked AS (SELECT queue_seq,ROW_NUMBER() OVER (ORDER BY queue_seq) rn FROM video_tasks WHERE deleted_at IS NULL AND status IN ('queued_open','queued_locked')) UPDATE video_tasks SET status=CASE WHEN queue_seq IN (SELECT queue_seq FROM ranked WHERE rn<=?) THEN 'queued_locked' ELSE 'queued_open' END,cancel_locked=CASE WHEN queue_seq IN (SELECT queue_seq FROM ranked WHERE rn<=?) THEN 1 ELSE 0 END,updated_at=?,version=version+1 WHERE queue_seq IN (SELECT queue_seq FROM ranked)`, s.options.ProtectedSlots, s.options.ProtectedSlots, now)
+	_, err := conn.ExecContext(ctx, `WITH ranked AS (SELECT queue_seq,ROW_NUMBER() OVER (ORDER BY queue_seq) rn FROM video_tasks WHERE deleted_at IS NULL AND route_state='ready' AND status IN ('queued_open','queued_locked')) UPDATE video_tasks SET status=CASE WHEN queue_seq IN (SELECT queue_seq FROM ranked WHERE rn<=?) THEN 'queued_locked' ELSE 'queued_open' END,cancel_locked=CASE WHEN queue_seq IN (SELECT queue_seq FROM ranked WHERE rn<=?) THEN 1 ELSE 0 END,updated_at=?,version=version+1 WHERE deleted_at IS NULL AND status IN ('queued_open','queued_locked')`, s.options.ProtectedSlots, s.options.ProtectedSlots, now)
 	return err
 }
 
@@ -870,9 +883,9 @@ type rowQuerier interface {
 
 type rowScanner interface{ Scan(...any) error }
 
-const taskSelect = `SELECT queue_seq,task_id,api_key_id,model,scenario,request_json,request_hash,status,cancel_locked,COALESCE(upstream_id,''),COALESCE(gradio_event_id,''),COALESCE(upstream_job_id,''),upstream_slot_active,COALESCE(upstream_node_version,0),delivery_required,upstream_jobs_before_json,official_submission_baseline_saved,retry_count,COALESCE(attempt_started_at,0),COALESCE(cancel_requested_at,0),COALESCE(gallery_before_json,''),COALESCE(result_internal_url,''),COALESCE(result_public_url,''),resolution,duration,ratio_requested,COALESCE(ratio_actual,''),usage_total_seconds,usage_input_seconds,usage_output_seconds,usage_input_image_count,COALESCE(error_code,''),COALESCE(error_message,''),COALESCE(upstream_feedback_json,''),created_at,updated_at,COALESCE(started_at,0),COALESCE(finished_at,0),expires_at,version,COALESCE(profile_id,''),COALESCE(profile_version,0),COALESCE(config_snapshot_json,''),COALESCE(config_hash,''),COALESCE(active_stage_id,''),COALESCE(result_artifact_id,'') FROM video_tasks`
+const taskSelect = `SELECT queue_seq,task_id,api_key_id,model,scenario,request_json,request_hash,status,cancel_locked,COALESCE(upstream_id,''),COALESCE(gradio_event_id,''),COALESCE(upstream_job_id,''),upstream_slot_active,COALESCE(upstream_node_version,0),delivery_required,upstream_jobs_before_json,official_submission_baseline_saved,retry_count,COALESCE(attempt_started_at,0),COALESCE(cancel_requested_at,0),COALESCE(gallery_before_json,''),COALESCE(result_internal_url,''),COALESCE(result_public_url,''),resolution,duration,ratio_requested,COALESCE(ratio_actual,''),usage_total_seconds,usage_input_seconds,usage_output_seconds,usage_input_image_count,COALESCE(error_code,''),COALESCE(error_message,''),COALESCE(upstream_feedback_json,''),created_at,updated_at,COALESCE(started_at,0),COALESCE(finished_at,0),expires_at,version,COALESCE(profile_id,''),COALESCE(profile_version,0),COALESCE(config_snapshot_json,''),COALESCE(config_hash,''),COALESCE(active_stage_id,''),COALESCE(result_artifact_id,''),COALESCE(protocol_version,''),route_state,COALESCE(routing_snapshot_json,''),COALESCE(dispatch_snapshot_json,''),request_normalizer,routing_wait_reason,COALESCE(latest_result_url,''),COALESCE(latest_result_expires_at,0),COALESCE(result_metadata_json,''),metadata_status,COALESCE((SELECT phase FROM task_remote_runs rr WHERE rr.task_id=video_tasks.task_id),''),COALESCE((SELECT upstream_status FROM task_remote_runs rr WHERE rr.task_id=video_tasks.task_id),''),COALESCE((SELECT cancel_state FROM task_remote_runs rr WHERE rr.task_id=video_tasks.task_id),'') FROM video_tasks`
 
-const adminTaskSelect = `SELECT task_id,api_key_id,COALESCE(upstream_id,''),COALESCE((SELECT protocol_version FROM model_service_nodes WHERE id=video_tasks.upstream_id),''),scenario,resolution,status,retry_count,COALESCE(result_public_url,''),COALESCE(result_artifact_id,''),duration,created_at,COALESCE(started_at,0),COALESCE(finished_at,0) FROM video_tasks`
+const adminTaskSelect = `SELECT task_id,api_key_id,COALESCE(upstream_id,''),COALESCE(protocol_version,''),scenario,resolution,status,retry_count,COALESCE(result_public_url,''),COALESCE(result_artifact_id,''),duration,created_at,COALESCE(started_at,0),COALESCE(finished_at,0),model,route_state,routing_wait_reason,COALESCE((SELECT phase FROM task_remote_runs rr WHERE rr.task_id=video_tasks.task_id),''),` + taskPublicStatusSQL + ` FROM video_tasks`
 
 func getWith(ctx context.Context, query rowQuerier, owner, taskID string, now int64) (domain.Task, error) {
 	statement := taskSelect + ` WHERE task_id=? AND api_key_id=? AND deleted_at IS NULL AND expires_at>?`
@@ -888,7 +901,7 @@ func scanTask(scanner rowScanner) (domain.Task, error) {
 	var upstreamFeedbackJSON string
 	var locked, upstreamSlotActive, deliveryRequired, officialSubmissionBaselineSaved int
 	var created, updated, started, finished, expires, attemptStarted, cancelRequested int64
-	err := scanner.Scan(&task.QueueSeq, &task.TaskID, &task.APIKeyID, &task.Model, &task.Scenario, &task.RequestJSON, &task.RequestHash, &task.Status, &locked, &task.UpstreamID, &task.GradioEventID, &task.UpstreamJobID, &upstreamSlotActive, &task.UpstreamNodeVersion, &deliveryRequired, &task.UpstreamJobsBeforeJSON, &officialSubmissionBaselineSaved, &task.RetryCount, &attemptStarted, &cancelRequested, &task.GalleryBeforeJSON, &task.ResultInternalURL, &task.ResultPublicURL, &task.Resolution, &task.Duration, &task.RatioRequested, &task.RatioActual, &task.UsageTotalSeconds, &task.UsageInputSeconds, &task.UsageOutputSeconds, &task.UsageInputImageCount, &task.ErrorCode, &task.ErrorMessage, &upstreamFeedbackJSON, &created, &updated, &started, &finished, &expires, &task.Version, &task.ProfileID, &task.ProfileVersion, &task.ConfigSnapshotJSON, &task.ConfigHash, &task.ActiveStageID, &task.ResultArtifactID)
+	err := scanner.Scan(&task.QueueSeq, &task.TaskID, &task.APIKeyID, &task.Model, &task.Scenario, &task.RequestJSON, &task.RequestHash, &task.Status, &locked, &task.UpstreamID, &task.GradioEventID, &task.UpstreamJobID, &upstreamSlotActive, &task.UpstreamNodeVersion, &deliveryRequired, &task.UpstreamJobsBeforeJSON, &officialSubmissionBaselineSaved, &task.RetryCount, &attemptStarted, &cancelRequested, &task.GalleryBeforeJSON, &task.ResultInternalURL, &task.ResultPublicURL, &task.Resolution, &task.Duration, &task.RatioRequested, &task.RatioActual, &task.UsageTotalSeconds, &task.UsageInputSeconds, &task.UsageOutputSeconds, &task.UsageInputImageCount, &task.ErrorCode, &task.ErrorMessage, &upstreamFeedbackJSON, &created, &updated, &started, &finished, &expires, &task.Version, &task.ProfileID, &task.ProfileVersion, &task.ConfigSnapshotJSON, &task.ConfigHash, &task.ActiveStageID, &task.ResultArtifactID, &task.ProtocolVersion, &task.RouteState, &task.RoutingSnapshotJSON, &task.DispatchSnapshotJSON, &task.RequestNormalizer, &task.RoutingWaitReason, &task.LatestResultURL, &task.LatestResultExpiresAt, &task.ResultMetadataJSON, &task.MetadataStatus, &task.RemotePhase, &task.RemoteUpstreamStatus, &task.RemoteCancelState)
 	if err != nil {
 		return domain.Task{}, err
 	}
@@ -921,11 +934,12 @@ func scanTask(scanner rowScanner) (domain.Task, error) {
 func scanAdminTaskSummary(scanner rowScanner) (domain.AdminTaskSummary, error) {
 	var item domain.AdminTaskSummary
 	var status domain.InternalStatus
+	var publicStatus domain.V2Status
 	var created, started, finished int64
-	if err := scanner.Scan(&item.TaskID, &item.APIKeyID, &item.UpstreamID, &item.UpstreamProtocol, &item.Scenario, &item.Resolution, &status, &item.RetryCount, &item.ResultPublicURL, &item.ResultArtifactID, &item.Duration, &created, &started, &finished); err != nil {
+	if err := scanner.Scan(&item.TaskID, &item.APIKeyID, &item.UpstreamID, &item.UpstreamProtocol, &item.Scenario, &item.Resolution, &status, &item.RetryCount, &item.ResultPublicURL, &item.ResultArtifactID, &item.Duration, &created, &started, &finished, &item.Model, &item.RouteState, &item.RoutingWaitReason, &item.RemotePhase, &publicStatus); err != nil {
 		return domain.AdminTaskSummary{}, err
 	}
-	item.InternalStatus, item.Status = status, status.V2()
+	item.InternalStatus, item.Status = status, publicStatus
 	item.CreatedAt = unix(created)
 	if started > 0 {
 		item.StartedAt = unix(started)

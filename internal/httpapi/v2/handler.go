@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -15,6 +16,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	artifactservice "minimax-h3-tc/internal/artifact"
@@ -23,6 +25,7 @@ import (
 	"minimax-h3-tc/internal/domain"
 	"minimax-h3-tc/internal/inputobject"
 	"minimax-h3-tc/internal/inputspool"
+	"minimax-h3-tc/internal/routing"
 )
 
 type TaskStore interface {
@@ -53,6 +56,8 @@ type InputObjectPreparer interface {
 }
 
 type Dependencies struct {
+	RemoteResults   RemoteResultAccess
+	Routing         *routing.Service
 	Store           TaskStore
 	APIKeys         []config.APIKeyConfig
 	Authenticator   BearerAuthenticator
@@ -69,6 +74,8 @@ type Dependencies struct {
 }
 
 type handler struct {
+	remoteResults   RemoteResultAccess
+	routing         *routing.Service
 	store           TaskStore
 	keys            []authKey
 	authenticator   BearerAuthenticator
@@ -94,6 +101,8 @@ const ownerKey contextKey = "api_key_id"
 
 func NewHandler(dependencies Dependencies) http.Handler {
 	h := &handler{store: dependencies.Store, authenticator: dependencies.Authenticator, profiles: dependencies.Profiles, logger: dependencies.Logger, wake: dependencies.Wake, available: dependencies.Available, callbackService: dependencies.CallbackService, callbackCipher: dependencies.CallbackCipher, activeProfiles: dependencies.ActiveProfiles, artifactURLs: dependencies.ArtifactURLs, inputSpooler: dependencies.InputSpooler, inputObjects: dependencies.InputObjects}
+	h.routing = dependencies.Routing
+	h.remoteResults = dependencies.RemoteResults
 	if h.logger == nil {
 		h.logger = slog.Default()
 	}
@@ -122,19 +131,20 @@ type ErrorDetail struct {
 }
 
 type TaskResponse struct {
-	ID         string          `json:"id"`
-	Model      string          `json:"model"`
-	Status     domain.V2Status `json:"status"`
-	Error      *TaskError      `json:"error,omitempty"`
-	CreatedAt  int64           `json:"created_at"`
-	UpdatedAt  int64           `json:"updated_at"`
-	Content    *TaskContent    `json:"content,omitempty"`
-	Resolution string          `json:"resolution"`
-	Duration   int             `json:"duration"`
-	Usage      TaskUsage       `json:"usage"`
-	Ratio      string          `json:"ratio"`
-	TaskType   string          `json:"task_type"`
-	Modality   string          `json:"modality"`
+	ID            string          `json:"id"`
+	Model         string          `json:"model"`
+	Status        domain.V2Status `json:"status"`
+	Error         *TaskError      `json:"error,omitempty"`
+	CreatedAt     int64           `json:"created_at"`
+	UpdatedAt     int64           `json:"updated_at"`
+	Content       *TaskContent    `json:"content,omitempty"`
+	Resolution    *string         `json:"resolution"`
+	Duration      *float64        `json:"duration"`
+	Usage         *TaskUsage      `json:"usage"`
+	Ratio         *string         `json:"ratio"`
+	DeliveryError *TaskError      `json:"delivery_error,omitempty"`
+	TaskType      string          `json:"task_type"`
+	Modality      string          `json:"modality"`
 }
 type TaskContent struct {
 	URL string `json:"url"`
@@ -158,13 +168,27 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<20)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
-	var request CreateRequest
-	if err := decoder.Decode(&request); err != nil {
+	var raw json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
 		h.writeError(w, r, http.StatusBadRequest, "bad_request_error", "请求 JSON 无效 (2013)")
 		return
 	}
 	if err := ensureJSONEnd(decoder); err != nil {
 		h.writeError(w, r, http.StatusBadRequest, "bad_request_error", "请求只能包含一个 JSON 对象 (2013)")
+		return
+	}
+	var request CreateRequest
+	strict := json.NewDecoder(bytes.NewReader(raw))
+	strict.DisallowUnknownFields()
+	if err := strict.Decode(&request); err != nil {
+		h.writeError(w, r, 400, "bad_request_error", "请求 JSON 无效 (2013)")
+		return
+	}
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &fields)
+	_, request.DurationPresent = fields["duration"]
+	if h.routing != nil {
+		h.createRouted(w, r, request)
 		return
 	}
 	validationProfiles := h.profiles
@@ -450,6 +474,10 @@ func (h *handler) get(w http.ResponseWriter, r *http.Request) {
 	}
 	response, err := h.mapTask(r.Context(), task)
 	if err != nil {
+		if errors.Is(err, domain.ErrResultRefreshUnavailable) {
+			h.writeError(w, r, 503, "result_refresh_unavailable", "结果链接暂不可刷新")
+			return
+		}
 		h.internalError(w, r, err)
 		return
 	}
@@ -485,23 +513,66 @@ func (h *handler) list(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	model, taskType := r.URL.Query().Get("filter.model"), r.URL.Query().Get("filter.task_type")
-	if (model != "" && model != "MiniMax-H3") || (taskType != "" && taskType != "generation") {
+	if model != "" && !domain.ValidModelID(model) {
+		h.writeError(w, r, 400, "bad_request_error", "filter.model 无效 (2013)")
+		return
+	}
+	if taskType != "" && taskType != "generation" {
 		h.writeJSON(w, http.StatusOK, map[string]any{"items": []TaskResponse{}, "total": 0})
 		return
 	}
-	items, total, err := h.store.List(r.Context(), owner(r.Context()), domain.TaskFilter{Status: status, TaskIDs: taskIDs, PageNum: pageNum, PageSize: pageSize})
+	items, total, err := h.store.List(r.Context(), owner(r.Context()), domain.TaskFilter{Model: model, Status: status, TaskIDs: taskIDs, PageNum: pageNum, PageSize: pageSize})
 	if err != nil {
 		h.internalError(w, r, err)
 		return
 	}
-	responses := make([]TaskResponse, 0, len(items))
-	for _, item := range items {
-		response, err := h.mapTask(r.Context(), item)
-		if err != nil {
-			h.internalError(w, r, err)
-			return
+	responses := make([]TaskResponse, len(items))
+	var group sync.WaitGroup
+	limit := make(chan struct{}, 4)
+	requestCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	var failed error
+	var mu sync.Mutex
+	for index, item := range items {
+		if item.ProtocolVersion != domain.ProtocolTK2SD || item.Status != domain.StatusSucceeded {
+			response, err := h.mapTask(r.Context(), item)
+			if err != nil {
+				mu.Lock()
+				failed = err
+				mu.Unlock()
+			}
+			responses[index] = response
+			continue
 		}
-		responses = append(responses, response)
+		group.Add(1)
+		go func(index int, item domain.Task) {
+			defer group.Done()
+			select {
+			case limit <- struct{}{}:
+				defer func() { <-limit }()
+			case <-requestCtx.Done():
+				responses[index] = remoteResponse(item)
+				responses[index].DeliveryError = &TaskError{Code: "result_refresh_unavailable", Message: "结果链接暂不可刷新"}
+				return
+			}
+			response, err := h.mapTask(requestCtx, item)
+			if err != nil {
+				if item.ProtocolVersion == domain.ProtocolTK2SD {
+					response = remoteResponse(item)
+					response.DeliveryError = &TaskError{Code: "result_refresh_unavailable", Message: "结果链接暂不可刷新"}
+				} else {
+					mu.Lock()
+					failed = err
+					mu.Unlock()
+				}
+			}
+			responses[index] = response
+		}(index, item)
+	}
+	group.Wait()
+	if failed != nil {
+		h.internalError(w, r, failed)
+		return
 	}
 	h.writeJSON(w, http.StatusOK, map[string]any{"items": responses, "total": total})
 }
@@ -511,6 +582,30 @@ func (h *handler) cancelOrDelete(w http.ResponseWriter, r *http.Request) {
 	if len(taskID) < 1 || len(taskID) > 64 {
 		h.writeError(w, r, 400, "bad_request_error", "invalid task_id (2001)")
 		return
+	}
+	if cancelStore, ok := h.store.(interface {
+		RequestRemoteCancel(context.Context, string) error
+	}); ok {
+		task, err := h.store.Get(r.Context(), owner(r.Context()), taskID)
+		if err != nil {
+			h.storeError(w, r, err)
+			return
+		}
+		if task.ProtocolVersion == domain.ProtocolTK2SD && task.UpstreamSlotActive {
+			if err := cancelStore.RequestRemoteCancel(r.Context(), taskID); err != nil {
+				if errors.Is(err, domain.ErrRemoteNotCancellable) {
+					h.writeError(w, r, 409, "task_not_cancellable", "远程任务已开始执行，不支持取消")
+				} else {
+					h.storeError(w, r, err)
+				}
+				return
+			}
+			if h.wake != nil {
+				h.wake()
+			}
+			h.writeJSON(w, 202, map[string]string{"task_id": taskID, "action": "cancel_requested", "status": "running"})
+			return
+		}
 	}
 	action, err := h.store.CancelOrDelete(r.Context(), owner(r.Context()), taskID)
 	if err != nil {
@@ -592,11 +687,15 @@ func (h *handler) writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func (h *handler) mapTask(ctx context.Context, task domain.Task) (TaskResponse, error) {
+	if task.ProtocolVersion == domain.ProtocolTK2SD {
+		return h.mapRemoteTask(ctx, task)
+	}
 	ratio := task.RatioActual
 	if ratio == "" {
 		ratio = task.RatioRequested
 	}
-	response := TaskResponse{ID: task.TaskID, Model: task.Model, Status: task.Status.V2(), CreatedAt: task.CreatedAt.Unix(), UpdatedAt: task.UpdatedAt.Unix(), Resolution: task.Resolution, Duration: task.Duration, Usage: TaskUsage{TotalSeconds: task.UsageTotalSeconds, InputSeconds: task.UsageInputSeconds, OutputSeconds: task.UsageOutputSeconds, InputImageCount: task.UsageInputImageCount}, Ratio: ratio, TaskType: "generation", Modality: "video"}
+	duration := float64(task.Duration)
+	response := TaskResponse{ID: task.TaskID, Model: task.Model, Status: task.PublicStatus(), CreatedAt: task.CreatedAt.Unix(), UpdatedAt: task.UpdatedAt.Unix(), Resolution: &task.Resolution, Duration: &duration, Usage: &TaskUsage{TotalSeconds: task.UsageTotalSeconds, InputSeconds: task.UsageInputSeconds, OutputSeconds: task.UsageOutputSeconds, InputImageCount: task.UsageInputImageCount}, Ratio: &ratio, TaskType: "generation", Modality: "video"}
 	if task.Status == domain.StatusSucceeded {
 		if task.ResultArtifactID != "" {
 			if h.artifactURLs == nil {

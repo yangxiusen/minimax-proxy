@@ -36,6 +36,7 @@ type Store interface {
 	GetActiveArtifactLocation(context.Context, string, string) (sqlite.ArtifactLocation, error)
 	GetPrimaryArtifactLocation(context.Context, string) (sqlite.ArtifactLocation, error)
 	GetTaskForExecution(context.Context, string) (domain.Task, error)
+	GetModelNode(context.Context, string) (domain.ModelNode, error)
 	GetInputSpoolFile(context.Context, string, string) (domain.InputSpoolFile, error)
 	RegisterInputArtifact(context.Context, string, string, string, string, string, int64, string, string) error
 }
@@ -91,6 +92,9 @@ func (processor *Processor) ProcessOne(ctx context.Context) error {
 	if cancelled, err := processor.taskCancelled(ctx, stage.TaskID); err != nil || cancelled {
 		return err
 	}
+	if resumed, err := processor.resumeStageAttempt(ctx, stage); resumed || err != nil {
+		return err
+	}
 	stageForNode, err := processor.localizeInput(ctx, stage)
 	if err != nil {
 		return processor.fail(ctx, stage, sqlite.StageAttempt{}, "artifact_migration_failed", operationErrorMessage("输入产物无法迁移到目标节点", err), false)
@@ -114,32 +118,6 @@ func (processor *Processor) ProcessOne(ctx context.Context) error {
 			return err
 		}
 		processor.logger().InfoContext(ctx, "输入素材处理完成", "task_id", stage.TaskID, "stage_id", stage.ID, "node_id", processor.NodeID, "input_count", len(request.InputArtifacts), "stage", "input_materialization")
-	}
-	if stage.AttemptCount > 0 {
-		attempt, attemptErr := processor.Store.GetRunningStageAttempt(ctx, stage.ID, stage.LeaseToken)
-		if attemptErr == nil && (attempt.Status == "dispatching" || attempt.Status == "running" || attempt.Status == "validating" || attempt.Status == "unknown") {
-			request.OperationID = attempt.OperationID
-			request.ExternalTaskID = stage.TaskID
-			request.StageID = stage.ID
-			if attempt.ExecutionID == "" {
-				processor.logger().InfoContext(ctx, "节点阶段恢复提交开始", "task_id", stage.TaskID, "stage_id", stage.ID, "attempt_id", attempt.ID, "node_id", processor.NodeID, "stage", "stage_submit")
-				reference, submitErr := processor.Client.CreateExecution(ctx, "stage-resubmit-"+attempt.ID, request)
-				if submitErr != nil {
-					return processor.fail(ctx, stage, attempt, classifySubmitError(submitErr), operationErrorMessage("节点阶段恢复提交失败", submitErr), false)
-				}
-				if reference.ExecutionID == "" {
-					return processor.fail(ctx, stage, attempt, "node_protocol_error", "节点未返回 execution_id", false)
-				}
-				attempt.ExecutionID = reference.ExecutionID
-			}
-			if bindErr := processor.Store.BindStageExecution(ctx, stage.ID, stage.LeaseToken, attempt.ID, attempt.ExecutionID); bindErr != nil {
-				return bindErr
-			}
-			return processor.poll(ctx, stage, attempt)
-		}
-		if attemptErr != nil && !errors.Is(attemptErr, sqlite.ErrNoClaimableStage) {
-			return attemptErr
-		}
 	}
 	attempt := sqlite.StageAttempt{
 		ID: uuid.NewString(), StageID: stage.ID, AttemptNo: stage.AttemptCount + 1,
@@ -172,7 +150,65 @@ func (processor *Processor) ProcessOne(ctx context.Context) error {
 	return processor.poll(ctx, stage, attempt)
 }
 
+func (processor *Processor) resumeStageAttempt(ctx context.Context, stage sqlite.TaskStage) (bool, error) {
+	if stage.AttemptCount == 0 {
+		return false, nil
+	}
+	attempt, err := processor.Store.GetRunningStageAttempt(ctx, stage.ID, stage.LeaseToken)
+	if errors.Is(err, sqlite.ErrNoClaimableStage) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if attempt.Status != "dispatching" && attempt.Status != "running" && attempt.Status != "validating" && attempt.Status != "unknown" {
+		return false, nil
+	}
+	if attempt.NodeID != processor.NodeID {
+		return true, domain.ErrStateConflict
+	}
+	// 已有执行只查询原节点；尚无执行ID时按原操作与已保存正文恢复。
+	if attempt.ExecutionID == "" {
+		var request nodeapi.ExecutionRequest
+		if attempt.RequestSnapshotJSON != "" {
+			if err := json.Unmarshal([]byte(attempt.RequestSnapshotJSON), &request); err != nil {
+				return true, err
+			}
+			if request.OperationID != attempt.OperationID || request.ExternalTaskID != stage.TaskID || request.StageID != stage.ID || request.StageType != stage.StageType {
+				return true, domain.ErrStateConflict
+			}
+		} else {
+			request, err = executionRequest(stage)
+			if err != nil {
+				return true, err
+			}
+			if stage.InputArtifactID != "" || generationUsesInputs(request.Parameters) {
+				return true, domain.ErrStateConflict
+			}
+			request.OperationID, request.ExternalTaskID, request.StageID = attempt.OperationID, stage.TaskID, stage.ID
+		}
+		reference, err := processor.Client.CreateExecution(ctx, "stage-resubmit-"+attempt.ID, request)
+		if err != nil {
+			return true, err
+		}
+		if reference.ExecutionID == "" {
+			return true, errors.New("恢复执行响应缺少 execution_id")
+		}
+		attempt.ExecutionID = reference.ExecutionID
+	}
+	if err := processor.Store.BindStageExecution(ctx, stage.ID, stage.LeaseToken, attempt.ID, attempt.ExecutionID); err != nil {
+		return true, err
+	}
+	return true, processor.poll(ctx, stage, attempt)
+}
+
 func (processor *Processor) reconcileCancellationBarrier(ctx context.Context, barrier sqlite.NodeDispatchBarrier) error {
+	if _, err := processor.taskCancelled(ctx, barrier.TaskID); err != nil {
+		return err
+	}
+	if barrier.NodeID != processor.NodeID {
+		return domain.ErrStateConflict
+	}
 	if barrier.ExecutionID == "" {
 		if barrier.RequestSnapshotJSON == "" {
 			return processor.deferCancellationBarrier(ctx, barrier, "execution_request_snapshot_missing")
@@ -269,6 +305,20 @@ func (processor *Processor) localizeInput(ctx context.Context, stage sqlite.Task
 	if stage.InputArtifactID == "" {
 		return stage, nil
 	}
+	task, err := processor.Store.GetTaskForExecution(ctx, stage.TaskID)
+	if err != nil {
+		return stage, err
+	}
+	if task.ProtocolVersion != domain.ProtocolH3 || task.RouteState != "ready" {
+		return stage, domain.ErrStateConflict
+	}
+	target, err := processor.Store.GetModelNode(ctx, processor.NodeID)
+	if err != nil {
+		return stage, err
+	}
+	if target.ProtocolVersion != task.ProtocolVersion {
+		return stage, domain.ErrStateConflict
+	}
 	logicalID := stage.InputArtifactID
 	local, err := processor.Store.GetActiveArtifactLocation(ctx, logicalID, processor.NodeID)
 	if err == nil {
@@ -287,6 +337,13 @@ func (processor *Processor) localizeInput(ctx context.Context, stage sqlite.Task
 	}
 	if primary.NodeID == processor.NodeID {
 		return stage, errors.New("目标节点主产物位置异常")
+	}
+	source, err := processor.Store.GetModelNode(ctx, primary.NodeID)
+	if err != nil {
+		return stage, err
+	}
+	if source.ProtocolVersion != task.ProtocolVersion {
+		return stage, domain.ErrStateConflict
 	}
 	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(logicalID+"\x00"+processor.NodeID)))
 	local, err = processor.Migrator.Migrate(ctx, MigrationCommand{
@@ -402,6 +459,9 @@ func (processor *Processor) taskCancelled(ctx context.Context, taskID string) (b
 	task, err := processor.Store.GetTaskForExecution(ctx, taskID)
 	if err != nil {
 		return false, err
+	}
+	if task.ProtocolVersion != domain.ProtocolH3 || task.RouteState != "ready" {
+		return false, domain.ErrStateConflict
 	}
 	return task.Status == domain.StatusCancelled, nil
 }

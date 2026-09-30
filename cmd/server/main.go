@@ -6,6 +6,7 @@ import (
 	"flag"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -27,11 +28,14 @@ import (
 	objectucloud "minimax-h3-tc/internal/objectstore/ucloud"
 	"minimax-h3-tc/internal/orchestrator"
 	profileservice "minimax-h3-tc/internal/profile"
+	"minimax-h3-tc/internal/remote"
 	"minimax-h3-tc/internal/resultdelivery"
+	"minimax-h3-tc/internal/routing"
 	"minimax-h3-tc/internal/secretbox"
 	storepkg "minimax-h3-tc/internal/store/sqlite"
 	"minimax-h3-tc/internal/upstream/minimaxv2"
 	upstreamregistry "minimax-h3-tc/internal/upstream/registry"
+	"minimax-h3-tc/internal/upstream/tk2sd"
 )
 
 func main() {
@@ -142,11 +146,35 @@ func run(configPath string, logger *slog.Logger) error {
 	nodeRegistry := upstreamregistry.New(store, runtimeFactory.Start, cache, time.Second, logger)
 	maxHealthAge := 3 * cfg.Admin.MonitorInterval
 	available := cacheAvailability(cache, time.Now, maxHealthAge)
+	modelRouter := &routing.Service{Store: store, Healthy: func(id string) bool {
+		n, ok := cache.Get(id)
+		return ok && !n.Disabled && !n.Applying && (n.Health == monitorcache.HealthHealthy || n.SchedulingBlocked) && !n.CheckedAt.IsZero() && time.Since(n.CheckedAt) <= maxHealthAge
+	}}
+	inventory := &routing.Inventory{Store: store, Secrets: nodeSecrets, Wake: nodeRegistry.Wake}
+	remoteResults := &remote.ResultAccess{Store: store, Resolve: func(ctx context.Context, id string) (remote.ResultClient, *url.URL, error) {
+		node, err := store.GetModelNode(ctx, id)
+		if err != nil {
+			return nil, nil, err
+		}
+		if node.ProtocolVersion != domain.ProtocolTK2SD {
+			return nil, nil, domain.ErrRouteUnavailable
+		}
+		_, upstream, err := config.NormalizeModelNode(node.ModelNodeInput)
+		if err != nil {
+			return nil, nil, err
+		}
+		key, err := nodeSecrets.Open(node.APIKeyNonce, node.APIKeyCiphertext)
+		if err != nil {
+			return nil, nil, err
+		}
+		return tk2sd.NewClient(upstream.ServiceURL, key, &http.Client{Timeout: upstream.RequestTimeout}, 1<<20), upstream.ServiceURL, nil
+	}}
 	callbackService := callbackservice.NewService(nil, callbackservice.Options{})
 	callbackStore := callbackservice.PersistentStore{Repository: store, Secrets: nodeSecrets}
 	prober := upstreamregistry.NodeProber{}
 	profileService := profileservice.New(store, profileservice.CapabilityMatcher{Source: profileservice.RuntimeCapabilitySource{Nodes: store, Cache: cache}}, nil)
 	managerHandler := managerapi.NewHandler(managerapi.Dependencies{
+		Inventory: inventory, Routing: modelRouter, RouteStore: store, RemoteResults: remoteResults,
 		Admin: cfg.Admin, Cache: cache, Store: store, Nodes: store, Logger: logger, Wake: nodeRegistry.Wake, NodeSecrets: nodeSecrets,
 		ObjectStorage:  store,
 		ProfileService: profileService,
@@ -155,6 +183,16 @@ func run(configPath string, logger *slog.Logger) error {
 		ArtifactURLs:   artifactService,
 		InputSpooler:   inputSpooler,
 		ProbeNode: func(ctx context.Context, input managerapi.NodeProbeInput) managerapi.NodeProbeResult {
+			if input.Node.ProtocolVersion == domain.ProtocolTK2SD {
+				_, upstream, err := config.NormalizeModelNode(input.Node)
+				if err == nil {
+					err = tk2sd.NewClient(upstream.ServiceURL, input.APIKey, &http.Client{Timeout: upstream.RequestTimeout}, 1<<20).Health(ctx)
+				}
+				if err != nil {
+					return managerapi.NodeProbeResult{ProtocolVersion: domain.ProtocolTK2SD, Checks: []managerapi.NodeCheck{{Name: "tk2sd_api", Status: "failed", ErrorCode: "tk2sd_api_unhealthy"}}}
+				}
+				return managerapi.NodeProbeResult{ProtocolVersion: domain.ProtocolTK2SD, Reachable: true, Authenticated: true, Checks: []managerapi.NodeCheck{{Name: "tk2sd_api", Status: "passed"}}}
+			}
 			if input.Node.UsesOfficialV2() {
 				_, upstream, err := config.NormalizeModelNode(input.Node)
 				if err != nil {
@@ -192,7 +230,7 @@ func run(configPath string, logger *slog.Logger) error {
 	inputObjects := inputobject.New(store, nodeSecrets, func(storage domain.ObjectStorageConfig, publicKey, privateKey string) (objectstore.DataStore, error) {
 		return objectucloud.New(objectucloud.Config{BucketName: storage.BucketName, FileHost: storage.FileHost, PublicBaseURL: storage.PublicBaseURL, PublicKey: publicKey, PrivateKey: privateKey, Client: &http.Client{Timeout: storage.RequestTimeout}})
 	})
-	v2Handler := v2.NewHandler(v2.Dependencies{Store: store, Authenticator: keyAuthenticator, Profiles: cfg.GenerationProfiles, Logger: logger, Wake: nodeRegistry.Wake, Available: available, CallbackService: callbackService, CallbackCipher: nodeSecrets, ActiveProfiles: store, ArtifactURLs: artifactService, InputSpooler: inputSpooler, InputObjects: inputObjects})
+	v2Handler := v2.NewHandler(v2.Dependencies{Routing: modelRouter, RemoteResults: remoteResults, Store: store, Authenticator: keyAuthenticator, Profiles: cfg.GenerationProfiles, Logger: logger, Wake: nodeRegistry.Wake, Available: available, CallbackService: callbackService, CallbackCipher: nodeSecrets, ActiveProfiles: store, ArtifactURLs: artifactService, InputSpooler: inputSpooler, InputObjects: inputObjects})
 	filesHandler := v2.NewFilesHandler(v2.FilesDependencies{Service: artifactService, Authenticator: keyAuthenticator, Logger: logger})
 	handler := newAppHandler(v2Handler, filesHandler, managerHandler)
 	server := &http.Server{Addr: cfg.Server.Address, Handler: handler, ReadTimeout: cfg.Server.ReadTimeout, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: cfg.Server.WriteTimeout, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
@@ -205,10 +243,12 @@ func run(configPath string, logger *slog.Logger) error {
 	go (cleaner.Cleaner{Store: store, Interval: time.Hour, BatchSize: 100, Logger: logger}).Run(ctx)
 	go (cleanupworker.Worker{Store: store, Secrets: nodeSecrets, Logger: logger}).Run(ctx)
 	go apiKeyService.Run(ctx, time.Second)
+	go inventory.Run(ctx)
 	go func() {
 		uploadWorker := resultdelivery.Worker{
 			Store: store, Secrets: nodeSecrets, Logger: logger,
-			Downloader: resultdelivery.Downloader{MaxBytes: resultdelivery.DefaultMaxVideoBytes},
+			Downloader:     resultdelivery.Downloader{MaxBytes: resultdelivery.DefaultMaxVideoBytes},
+			TaskDownloader: resultdelivery.TaskSource{Store: store, Remote: remoteResults, Public: resultdelivery.Downloader{MaxBytes: resultdelivery.DefaultMaxVideoBytes}},
 			ObjectStoreFactory: func(storage domain.ObjectStorageConfig, publicKey, privateKey string) (objectstore.Store, error) {
 				return objectucloud.New(objectucloud.Config{BucketName: storage.BucketName, FileHost: storage.FileHost, PublicBaseURL: storage.PublicBaseURL, PublicKey: publicKey, PrivateKey: privateKey, Client: &http.Client{Timeout: storage.RequestTimeout}})
 			},

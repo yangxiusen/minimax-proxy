@@ -85,6 +85,9 @@ func (f NodeRuntimeFactory) Start(parent context.Context, node domain.ModelNode)
 	if normalized.UsesOfficialV2() {
 		return f.startOfficialV2(parent, node, normalized, upstream)
 	}
+	if normalized.ProtocolVersion == domain.ProtocolTK2SD {
+		return f.startTK2SD(parent, node, normalized, upstream)
+	}
 	logger := f.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -165,7 +168,11 @@ func (f NodeRuntimeFactory) startOfficialV2(parent context.Context, node domain.
 			return minimaxv2.NewClient(serviceURL, apiKey, model, client, maxBody)
 		}
 	}
-	client := factory(upstream.ServiceURL, apiKey, input.UpstreamModel, &http.Client{Timeout: upstream.RequestTimeout}, 1<<20)
+	modelOverride := ""
+	if input.LegacyModelCompat {
+		modelOverride = input.UpstreamModel
+	}
+	client := factory(upstream.ServiceURL, apiKey, modelOverride, &http.Client{Timeout: upstream.RequestTimeout}, 1<<20)
 	if client == nil {
 		return nil, errors.New("官方节点 API 客户端未创建")
 	}

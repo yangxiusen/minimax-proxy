@@ -487,6 +487,9 @@ type stageStoreFake struct {
 	barrierResolved   bool
 	barrierDeferred   string
 	claimed           int
+	nodeProtocols     map[string]string
+	primaryLocation   *sqlite.ArtifactLocation
+	claimedNode       string
 }
 
 func (s *stageStoreFake) GetNodeDispatchBarrier(context.Context, string) (sqlite.NodeDispatchBarrier, error) {
@@ -527,13 +530,102 @@ func (s *stageStoreFake) GetActiveArtifactLocation(context.Context, string, stri
 	return sqlite.ArtifactLocation{}, sqlite.ErrArtifactNotFound
 }
 func (s *stageStoreFake) GetPrimaryArtifactLocation(context.Context, string) (sqlite.ArtifactLocation, error) {
+	if s.primaryLocation != nil {
+		return *s.primaryLocation, nil
+	}
 	return sqlite.ArtifactLocation{}, sqlite.ErrArtifactNotFound
 }
-func (s *stageStoreFake) GetTaskForExecution(context.Context, string) (domain.Task, error) {
-	if s.task.TaskID != "" {
-		return s.task, nil
+
+func TestLocalizeInputNeverMigratesAcrossProtocols(t *testing.T) {
+	for _, p := range []string{domain.ProtocolOfficial, domain.ProtocolTK2SD, domain.ProtocolH3} {
+		t.Run(p, func(t *testing.T) {
+			stub := &migrationStub{}
+			store := &stageStoreFake{nodeProtocols: map[string]string{"source": p}, primaryLocation: &sqlite.ArtifactLocation{NodeID: "source", ArtifactID: "logical"}}
+			processor := Processor{Store: store, NodeID: "target", Migrator: MigrationService{Artifacts: stub}}
+			_, err := processor.localizeInput(context.Background(), sqlite.TaskStage{TaskID: "task", InputArtifactID: "logical"})
+			if p == domain.ProtocolH3 {
+				if err != nil || stub.calls != 1 {
+					t.Fatalf("same protocol calls=%d err=%v", stub.calls, err)
+				}
+			} else if !errors.Is(err, domain.ErrStateConflict) || stub.calls != 0 {
+				t.Fatalf("foreign source calls=%d err=%v", stub.calls, err)
+			}
+		})
 	}
-	return domain.Task{TaskID: s.stage.TaskID, Status: domain.StatusRunning}, nil
+}
+
+func TestProcessorRecoversBoundStageWithoutRematerializingInputs(t *testing.T) {
+	stage := frozenStage()
+	stage.AttemptCount = 1
+	stage.InputArtifactID = "already-submitted-input"
+	store := &stageStoreFake{stage: stage, attempt: sqlite.StageAttempt{ID: "attempt", StageID: stage.ID, NodeID: "node-1", AttemptNo: 1, OperationID: "operation", ExecutionID: "execution", Status: "running"}}
+	client := &nodeClientFake{executions: []nodeapi.Execution{{ExecutionID: "execution", Status: "succeeded", ResultArtifactID: "result"}}, artifact: nodeArtifact("result")}
+	processor := Processor{Store: store, Client: client, NodeID: "node-1"}
+	if err := processor.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if store.failedCode != "" || store.completedArtifact == "" || client.created.OperationID != "" {
+		t.Fatalf("failed=%s complete=%s created=%s", store.failedCode, store.completedArtifact, client.created.OperationID)
+	}
+}
+
+func TestProcessorReplaysOriginalStageRequestWithoutNewInputs(t *testing.T) {
+	stage := frozenStage()
+	stage.AttemptCount = 1
+	stage.InputArtifactID = "logical-input"
+	request := nodeapi.ExecutionRequest{OperationID: "operation", ExternalTaskID: stage.TaskID, StageID: stage.ID, StageType: stage.StageType, Parameters: json.RawMessage(`{"prompt":"original"}`), InputArtifacts: []nodeapi.InputArtifact{{ArtifactID: "original-node-asset"}}}
+	snapshot, _ := json.Marshal(request)
+	store := &stageStoreFake{stage: stage, attempt: sqlite.StageAttempt{ID: "attempt", StageID: stage.ID, NodeID: "node-1", AttemptNo: 1, OperationID: "operation", Status: "dispatching", RequestSnapshotJSON: string(snapshot)}}
+	client := &nodeClientFake{reference: nodeapi.ExecutionReference{ExecutionID: "execution"}, executions: []nodeapi.Execution{{ExecutionID: "execution", Status: "succeeded", ResultArtifactID: "result"}}, artifact: nodeArtifact("result")}
+	p := Processor{Store: store, Client: client, NodeID: "node-1"}
+	if err := p.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if string(client.created.Parameters) != string(request.Parameters) || len(client.created.InputArtifacts) != 1 || client.created.InputArtifacts[0].ArtifactID != "original-node-asset" || store.createdAttempts != 0 {
+		t.Fatalf("replay=%+v attempts=%d", client.created, store.createdAttempts)
+	}
+}
+func (s *stageStoreFake) GetTaskForExecution(_ context.Context, id string) (domain.Task, error) {
+	task := s.task
+	if task.TaskID == "" {
+		task = domain.Task{TaskID: id, Status: domain.StatusRunning}
+	}
+	if task.ProtocolVersion == "" {
+		task.ProtocolVersion = domain.ProtocolH3
+	}
+	if task.RouteState == "" {
+		task.RouteState = "ready"
+	}
+	return task, nil
+}
+
+func (s *stageStoreFake) GetModelNode(_ context.Context, id string) (domain.ModelNode, error) {
+	p := domain.ProtocolH3
+	if value, ok := s.nodeProtocols[id]; ok {
+		p = value
+	}
+	return domain.ModelNode{ModelNodeInput: domain.ModelNodeInput{ID: id, ProtocolVersion: p}}, nil
+}
+
+func TestProcessorRejectsForeignTaskBeforeStageIO(t *testing.T) {
+	store := &stageStoreFake{stage: frozenStage(), task: domain.Task{TaskID: "task-1", ProtocolVersion: domain.ProtocolOfficial, RouteState: "ready"}}
+	client := &nodeClientFake{}
+	p := Processor{Store: store, Client: client, NodeID: "node-1"}
+	if err := p.ProcessOne(context.Background()); !errors.Is(err, domain.ErrStateConflict) {
+		t.Fatalf("process=%v", err)
+	}
+	if client.created.OperationID != "" || store.createdAttempts != 0 || store.failedCode != "" {
+		t.Fatal("foreign task caused stage side effects")
+	}
+}
+
+func TestLocalizeInputRejectsOtherProtocolTarget(t *testing.T) {
+	store := &stageStoreFake{nodeProtocols: map[string]string{"target": domain.ProtocolOfficial}}
+	p := Processor{Store: store, NodeID: "target"}
+	_, err := p.localizeInput(context.Background(), sqlite.TaskStage{TaskID: "task", InputArtifactID: "artifact"})
+	if !errors.Is(err, domain.ErrStateConflict) {
+		t.Fatalf("migration=%v", err)
+	}
 }
 func (s *stageStoreFake) GetInputSpoolFile(context.Context, string, string) (domain.InputSpoolFile, error) {
 	return domain.InputSpoolFile{}, domain.ErrTaskNotFound
@@ -542,7 +634,8 @@ func (s *stageStoreFake) RegisterInputArtifact(context.Context, string, string, 
 	return nil
 }
 
-func (s *stageStoreFake) ClaimStage(_ context.Context, _ string, lease string, _ time.Duration) (sqlite.TaskStage, error) {
+func (s *stageStoreFake) ClaimStage(_ context.Context, node string, lease string, _ time.Duration) (sqlite.TaskStage, error) {
+	s.claimedNode = node
 	s.claimed++
 	if s.claimErr != nil {
 		return sqlite.TaskStage{}, s.claimErr
@@ -573,7 +666,11 @@ func (s *stageStoreFake) GetRunningStageAttempt(context.Context, string, string)
 	if s.attempt.ID == "" {
 		return sqlite.StageAttempt{}, sqlite.ErrNoClaimableStage
 	}
-	return s.attempt, nil
+	attempt := s.attempt
+	if attempt.NodeID == "" {
+		attempt.NodeID = s.claimedNode
+	}
+	return attempt, nil
 }
 func (s *stageStoreFake) CompleteStage(_ context.Context, _, _, _ string, artifactID string) error {
 	s.completedArtifact = artifactID

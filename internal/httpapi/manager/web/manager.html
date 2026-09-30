@@ -2,10 +2,12 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
+  <link rel="icon" href="data:,">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MiniMax H3 管理后台</title>
   <link rel="stylesheet" href="/manager/assets/styles.css">
   <script defer src="/manager/assets/manager.js"></script>
+  <script defer src="/manager/assets/model-routing.js"></script>
 </head>
 <body>
   <header class="topbar">
@@ -13,6 +15,7 @@
     <div class="session-info"><span id="freshness" class="freshness loading">正在加载</span><span>管理员</span><button id="open-object-storage" type="button">对象存储</button><button id="open-api-keys" type="button">密钥管理</button><button id="open-profile-config" type="button">模型请求参数</button><button id="open-cleanup" type="button">视频清理</button><button id="open-node-config" type="button">节点配置</button><button id="logout" class="link-button" type="button">退出</button></div>
   </header>
   <main class="console">
+    <div class="routing-entry"><button id="open-model-routes" type="button">模型线路</button></div>
     <p class="section-label">全部任务</p>
     <section id="tasks-section" class="panel" aria-labelledby="tasks-title">
       <div class="section-head">
@@ -94,7 +97,7 @@
           <label><span>节点 ID</span><input name="id" maxlength="64" pattern="[A-Za-z0-9._\-]{1,64}" title="节点 ID 仅支持 1 至 64 位字母、数字、点、下划线或短横线" placeholder="gpu-1" autocomplete="off" required></label>
           <label><span>模型服务地址</span><input name="service_url" type="url" placeholder="https://model.example.com:7860" autocomplete="off" required></label>
           <div class="form-grid">
-            <label><span>协议版本</span><select name="protocol_version"><option value="h3-node-v1">内部节点协议</option><option value="minimax-v2">官方 V2 协议</option></select></label>
+            <label><span>协议版本</span><select name="protocol_version"><option value="h3-node-v1">内部节点协议</option><option value="minimax-v2">官方 V2 协议</option><option value="tk2sd-v1">tk2sd</option></select></label>
             <label><span>轮询间隔</span><input name="poll_interval" value="3s" required></label>
             <label><span>请求超时</span><input name="request_timeout" value="30s" required></label>
           </div>
@@ -104,6 +107,16 @@
             <label class="toggle-control"><input name="replace_result_url" type="checkbox"><span>使用 UCloud 替换生成地址</span></label>
           </div>
           <label><span>API Key</span><input name="api_key" type="password" minlength="32" maxlength="32" pattern="[A-Za-z0-9]{32}" autocomplete="new-password" placeholder="编辑时留空表示沿用已保存 Key" required></label>
+          <fieldset id="node-models" class="node-models" hidden>
+            <legend>支持模型</legend>
+            <div class="model-toolbar"><span id="model-source" class="muted"></span><button id="discover-models" type="button">发现模型</button><button id="reload-models" type="button">重新读取</button></div>
+            <p id="model-catalog-status" class="form-status" aria-live="polite"></p>
+            <div id="legacy-model-controls" hidden><p class="muted">历史模型别名只读。退出兼容模式须无活动任务，并声明真实模型。</p><label class="toggle-control"><input id="exit-legacy-model" type="checkbox"><span>退出旧别名兼容模式</span></label></div>
+            <label id="manual-model-field" hidden><span>声明模型 ID（每行一个）</span><textarea id="manual-models" rows="4" spellcheck="false"></textarea></label>
+            <label><span>搜索模型</span><input id="model-search" type="search" maxlength="128" autocomplete="off"></label>
+            <div id="node-model-items" class="node-model-items"></div>
+            <div class="model-pager"><button id="models-previous" type="button" aria-label="上一页模型">上一页</button><span id="models-page"></span><button id="models-next" type="button" aria-label="下一页模型">下一页</button></div>
+          </fieldset>
           <label class="toggle-control"><input name="enabled" type="checkbox" checked><span>启用节点</span></label>
           <p id="node-form-status" class="form-status" aria-live="polite"></p>
           <footer class="form-actions">
@@ -113,6 +126,18 @@
             <button id="save-node" class="primary-button" type="submit">保存</button>
           </footer>
         </form>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="model-routes-dialog" class="config-dialog routing-dialog" aria-labelledby="model-routes-title">
+    <div class="dialog-shell">
+      <header class="dialog-head"><h2 id="model-routes-title">模型线路</h2><button id="close-model-routes" class="icon-button" type="button" title="关闭" aria-label="关闭">×</button></header>
+      <div class="routing-body">
+        <form id="route-search-form" class="model-toolbar"><label><span>模型 ID</span><input id="route-search" type="search" maxlength="128" autocomplete="off"></label><label><span>状态</span><select id="route-state"><option value="">全部</option><option value="ready">可用</option><option value="ambiguous">协议冲突</option><option value="unavailable">不可用</option><option value="pending">待配置</option></select></label><button type="submit">查询</button></form>
+        <p id="model-routes-status" class="form-status" aria-live="polite"></p>
+        <div id="model-route-items"></div>
+        <div class="model-pager"><button id="routes-previous" type="button">上一页</button><span id="routes-page"></span><button id="routes-next" type="button">下一页</button></div>
       </div>
     </div>
   </dialog>
