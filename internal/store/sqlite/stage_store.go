@@ -56,7 +56,7 @@ type StageAttempt struct {
 
 const stageSelect = `SELECT id,task_id,stage_order,stage_type,required,status,attempt_count,max_attempts,COALESCE(preferred_node_id,''),COALESCE(current_node_id,''),COALESCE(input_artifact_id,''),COALESCE(output_artifact_id,''),config_snapshot_json,COALESCE(lease_token,''),COALESCE(lease_expires_at,0),COALESCE(next_attempt_at,0),created_at,updated_at,row_version FROM task_stages`
 
-const claimStageCandidateSelect = `SELECT candidate.id FROM task_stages candidate JOIN video_tasks task ON task.task_id=candidate.task_id WHERE task.deleted_at IS NULL AND task.status IN ('queued_open','queued_locked','dispatching','running','reconciling') AND ((candidate.status='pending' AND candidate.attempt_count<candidate.max_attempts) OR (candidate.status='leased' AND candidate.attempt_count<=candidate.max_attempts) OR candidate.status IN ('dispatching','running','validating','unknown')) AND (candidate.next_attempt_at IS NULL OR candidate.next_attempt_at<=?) AND (candidate.lease_expires_at IS NULL OR candidate.lease_expires_at<=?) AND (candidate.preferred_node_id IS NULL OR candidate.preferred_node_id=?) AND (candidate.status NOT IN ('dispatching','running','validating','unknown') OR candidate.current_node_id=?) AND NOT EXISTS (SELECT 1 FROM task_stages earlier WHERE earlier.task_id=candidate.task_id AND earlier.stage_order<candidate.stage_order AND earlier.status NOT IN ('succeeded','skipped')) AND NOT EXISTS (SELECT 1 FROM json_each(task.request_json,'$.content') content WHERE json_extract(content.value,'$.type') IN ('image_url','video_url','audio_url') AND substr(lower(COALESCE(json_extract(content.value,'$.image_url.url'),json_extract(content.value,'$.video_url.url'),json_extract(content.value,'$.audio_url.url'),'')),1,10)='mm_file://') ORDER BY task.queue_seq,candidate.stage_order,candidate.id LIMIT 1`
+const claimStageCandidateSelect = `SELECT candidate.id,task.queue_seq,candidate.stage_order FROM task_stages candidate JOIN video_tasks task ON task.task_id=candidate.task_id WHERE task.deleted_at IS NULL AND task.route_state='ready' AND task.protocol_version='h3-node-v1' AND EXISTS(SELECT 1 FROM model_service_nodes WHERE id=? AND protocol_version='h3-node-v1') AND task.status IN ('queued_open','queued_locked','dispatching','running','reconciling') AND ((candidate.status='pending' AND candidate.attempt_count<candidate.max_attempts) OR (candidate.status='leased' AND candidate.attempt_count<=candidate.max_attempts) OR candidate.status IN ('dispatching','running','validating','unknown')) AND (candidate.next_attempt_at IS NULL OR candidate.next_attempt_at<=?) AND (candidate.lease_expires_at IS NULL OR candidate.lease_expires_at<=?) AND (candidate.preferred_node_id IS NULL OR candidate.preferred_node_id=?) AND (candidate.status NOT IN ('dispatching','running','validating','unknown') OR candidate.current_node_id=?) AND NOT EXISTS (SELECT 1 FROM stage_attempts active WHERE active.stage_id=candidate.id AND active.status IN ('dispatching','running','validating','unknown') AND active.node_id<>?) AND NOT EXISTS (SELECT 1 FROM task_stages earlier WHERE earlier.task_id=candidate.task_id AND earlier.stage_order<candidate.stage_order AND earlier.status NOT IN ('succeeded','skipped')) AND NOT EXISTS (SELECT 1 FROM json_each(task.request_json,'$.content') content WHERE json_extract(content.value,'$.type') IN ('image_url','video_url','audio_url') AND substr(lower(COALESCE(json_extract(content.value,'$.image_url.url'),json_extract(content.value,'$.video_url.url'),json_extract(content.value,'$.audio_url.url'),'')),1,10)='mm_file://') AND (task.queue_seq>? OR (task.queue_seq=? AND candidate.stage_order>?)) ORDER BY task.queue_seq,candidate.stage_order,candidate.id LIMIT 100`
 
 func (s *Store) CreateStages(ctx context.Context, stages []TaskStage) (err error) {
 	conn, finish, err := s.immediate(ctx)
@@ -91,10 +91,7 @@ func (s *Store) ClaimStage(ctx context.Context, nodeID, leaseToken string, lease
 		return TaskStage{}, ErrNoClaimableStage
 	}
 	now := s.nowMillis()
-	stage, err := scanStage(conn.QueryRowContext(ctx, stageSelect+` WHERE task_stages.id=(`+claimStageCandidateSelect+`)`, now, now, nodeID, nodeID))
-	if errors.Is(err, sql.ErrNoRows) {
-		return TaskStage{}, ErrNoClaimableStage
-	}
+	stage, err := nextEligibleStage(ctx, conn, nodeID, now)
 	if err != nil {
 		return TaskStage{}, err
 	}
@@ -104,6 +101,64 @@ func (s *Store) ClaimStage(ctx context.Context, nodeID, leaseToken string, lease
 		return TaskStage{}, ErrNoClaimableStage
 	}
 	return scanStage(conn.QueryRowContext(ctx, stageSelect+` WHERE id=?`, stage.ID))
+}
+
+func nextEligibleStage(ctx context.Context, conn *sql.Conn, nodeID string, now int64) (TaskStage, error) {
+	var sequence int64
+	order := -1
+	for {
+		rows, err := conn.QueryContext(ctx, claimStageCandidateSelect, nodeID, now, now, nodeID, nodeID, nodeID, sequence, sequence, order)
+		if err != nil {
+			return TaskStage{}, err
+		}
+		type candidate struct {
+			id       string
+			sequence int64
+			order    int
+		}
+		var batch []candidate
+		for rows.Next() {
+			var c candidate
+			if err = rows.Scan(&c.id, &c.sequence, &c.order); err != nil {
+				rows.Close()
+				return TaskStage{}, err
+			}
+			batch = append(batch, c)
+		}
+		err = errors.Join(rows.Err(), rows.Close())
+		if err != nil {
+			return TaskStage{}, err
+		}
+		for _, c := range batch {
+			sequence, order = c.sequence, c.order
+			stage, err := scanStage(conn.QueryRowContext(ctx, stageSelect+` WHERE id=?`, c.id))
+			if err != nil {
+				return TaskStage{}, err
+			}
+			var active int
+			if err = conn.QueryRowContext(ctx, `SELECT count(*) FROM stage_attempts WHERE stage_id=? AND node_id=? AND status IN ('dispatching','running','validating','unknown')`, c.id, nodeID).Scan(&active); err != nil {
+				return TaskStage{}, err
+			}
+			// 已提交尝试必须由原节点恢复，不再依赖当前开放模型或目录有效期。
+			if active > 0 || stage.CurrentNodeID == nodeID && (stage.Status == "dispatching" || stage.Status == "running" || stage.Status == "validating" || stage.Status == "unknown") {
+				return stage, nil
+			}
+			task, err := scanTask(conn.QueryRowContext(ctx, taskSelect+` WHERE task_id=?`, stage.TaskID))
+			if err != nil {
+				return TaskStage{}, err
+			}
+			eligible, err := taskEligibleForNode(ctx, conn, task, nodeID, now/1000)
+			if err != nil {
+				return TaskStage{}, err
+			}
+			if eligible {
+				return stage, nil
+			}
+		}
+		if len(batch) < 100 {
+			return TaskStage{}, ErrNoClaimableStage
+		}
+	}
 }
 
 func (s *Store) RenewStageLease(ctx context.Context, stageID, leaseToken string, leaseDuration time.Duration) error {
@@ -119,12 +174,27 @@ func (s *Store) CreateStageAttempt(ctx context.Context, attempt StageAttempt) (e
 	}
 	defer completeTransaction(finish, &err)
 	var currentCount, maxAttempts int
-	var stageStatus, leaseToken, currentNodeID string
+	var stageStatus, leaseToken, currentNodeID, taskID string
+	var leaseExpires int64
 	var taskStatus domain.InternalStatus
-	if err := conn.QueryRowContext(ctx, `SELECT s.attempt_count,s.max_attempts,s.status,COALESCE(s.lease_token,''),COALESCE(s.current_node_id,''),t.status FROM task_stages s JOIN video_tasks t ON t.task_id=s.task_id WHERE s.id=? AND t.deleted_at IS NULL`, attempt.StageID).Scan(&currentCount, &maxAttempts, &stageStatus, &leaseToken, &currentNodeID, &taskStatus); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT s.attempt_count,s.max_attempts,s.status,COALESCE(s.lease_token,''),COALESCE(s.current_node_id,''),t.status,t.task_id,COALESCE(s.lease_expires_at,0) FROM task_stages s JOIN video_tasks t ON t.task_id=s.task_id WHERE s.id=? AND t.deleted_at IS NULL`, attempt.StageID).Scan(&currentCount, &maxAttempts, &stageStatus, &leaseToken, &currentNodeID, &taskStatus, &taskID, &leaseExpires); err != nil {
 		return err
 	}
-	if stageStatus != "leased" || attempt.LeaseToken == "" || attempt.LeaseToken != leaseToken || attempt.NodeID != currentNodeID || !taskStatus.AdminCanCancel() {
+	if stageStatus != "leased" || attempt.LeaseToken == "" || attempt.LeaseToken != leaseToken || attempt.NodeID != currentNodeID || !taskStatus.AdminCanCancel() || leaseExpires <= s.nowMillis() {
+		return domain.ErrStateConflict
+	}
+	task, err := scanTask(conn.QueryRowContext(ctx, taskSelect+` WHERE task_id=?`, taskID))
+	if err != nil {
+		return err
+	}
+	if task.ProtocolVersion != domain.ProtocolH3 {
+		return domain.ErrStateConflict
+	}
+	eligible, err := taskEligibleForNode(ctx, conn, task, attempt.NodeID, s.nowUnix())
+	if err != nil {
+		return err
+	}
+	if !eligible {
 		return domain.ErrStateConflict
 	}
 	if attempt.AttemptNo != currentCount+1 || attempt.AttemptNo > maxAttempts {
@@ -137,7 +207,15 @@ func (s *Store) CreateStageAttempt(ctx context.Context, attempt StageAttempt) (e
 		return err
 	}
 	result, err := conn.ExecContext(ctx, `UPDATE task_stages SET attempt_count=attempt_count+1,updated_at=?,row_version=row_version+1 WHERE id=? AND attempt_count=?`, attempt.StartedAt, attempt.StageID, currentCount)
-	return oneRow(result, err)
+	if err := oneRow(result, err); err != nil {
+		return err
+	}
+	// 提交意图与父任务归属一起保存，确保停用节点后仍可发现无 execution_id 的恢复任务。
+	result, err = conn.ExecContext(ctx, `UPDATE video_tasks SET status='dispatching',cancel_locked=1,upstream_id=?,active_stage_id=?,attempt_started_at=?,started_at=COALESCE(started_at,?),upstream_node_version=(SELECT version FROM model_service_nodes WHERE id=?),dispatch_snapshot_json=(SELECT json_object('schema_version',1,'node_id',id,'node_version',version,'protocol_version',protocol_version,'service_url',service_url,'upstream_model',video_tasks.model) FROM model_service_nodes WHERE id=?),updated_at=?,version=version+1 WHERE task_id=? AND route_state='ready' AND protocol_version='h3-node-v1' AND deleted_at IS NULL`, attempt.NodeID, attempt.StageID, attempt.StartedAt/1000, attempt.StartedAt/1000, attempt.NodeID, attempt.NodeID, s.nowUnix(), taskID)
+	if err := oneRow(result, err); err != nil {
+		return err
+	}
+	return s.rebalance(ctx, conn, s.nowUnix())
 }
 
 func (s *Store) BindStageExecution(ctx context.Context, stageID, leaseToken, attemptID, executionID string) error {

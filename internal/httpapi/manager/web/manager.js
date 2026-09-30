@@ -193,7 +193,7 @@ function renderHealthSummary(summary) {
 function nodeStatusText(node) {
   if (node.applying) return "配置应用中";
   if (node.enabled === false) return "已停用";
-  if (node.protocol_version === "minimax-v2") {
+  if (node.protocol_version === "minimax-v2" || node.protocol_version === "tk2sd-v1") {
     if (node.health === "healthy") return "连接正常";
     if (node.health === "unhealthy") return "连接异常";
     return "等待检查";
@@ -221,7 +221,7 @@ function renderNodes(upstreams) {
     button.append(
       makeElement("span", "node-name", node.id || "未命名实例"),
       makeElement("span", `node-state summary-${node.health || "unknown"}`, `● ${nodeStatusText(node)}`),
-      makeElement("span", "node-meta", node.protocol_version === "minimax-v2" ? `官方节点 · ${nodeCapacityText(node)}` : node.private_queue == null ? "私有队列未知" : `私有队列 ${node.private_queue}`)
+      makeElement("span", "node-meta", node.protocol_version === "tk2sd-v1" ? `tk2sd 节点 · ${nodeCapacityText(node)}` : node.protocol_version === "minimax-v2" ? `官方节点 · ${nodeCapacityText(node)}` : node.private_queue == null ? "私有队列未知" : `私有队列 ${node.private_queue}`)
     );
     button.addEventListener("click", () => {
       state.selectedNodeID = node.id;
@@ -314,7 +314,7 @@ function renderNodeDetail(node) {
     makeElement("div", "detail-subtitle", `${node.address || "地址未知"} · 最后检查 ${localTime(node.checked_at)}`)
   );
   head.append(identity, statusPill(node.enabled === false ? "idle" : node.applying ? "queued" : node.health, nodeStatusText(node)));
-  if (node.protocol_version === "minimax-v2") {
+  if (node.protocol_version === "minimax-v2" || node.protocol_version === "tk2sd-v1") {
     const capacity = makeElement("div", "official-capacity");
     capacity.append(makeElement("span", "box-label", "运行任务"), makeElement("strong", "official-capacity-value", nodeCapacityText(node)));
     elements.nodeDetail.replaceChildren(head, capacity);
@@ -490,10 +490,11 @@ function formField(name) {
 
 function setNodeBusy(busy) {
   state.nodeBusy = busy;
-  elements.configForm.querySelectorAll("input, button, select").forEach((control) => { control.disabled = busy; });
+  elements.configForm.querySelectorAll("input, button, select, textarea").forEach((control) => { control.disabled = busy; });
   formField("id").disabled = busy || Boolean(state.editingNode);
   document.getElementById("new-node").disabled = busy;
   document.getElementById("close-node-config").disabled = busy;
+  syncNodeProtocolFields();
 }
 
 function setNodeFormStatus(message, kind = "") {
@@ -515,10 +516,12 @@ function resetNodeForm() {
   state.formDirty = false;
   syncNodeProtocolFields();
   setNodeFormStatus("");
+  window.modelRouting?.editNode(null);
 }
 
 function fillNodeForm(node) {
   elements.configForm.reset();
+  window.modelRouting?.ensureProtocol(node.protocol_version);
   ["id", "service_url", "protocol_version", "poll_interval", "request_timeout", "version"].forEach((name) => {
     formField(name).value = node[name] ?? "";
   });
@@ -534,6 +537,7 @@ function fillNodeForm(node) {
   state.formDirty = false;
   syncNodeProtocolFields();
   setNodeFormStatus("");
+  window.modelRouting?.editNode(node);
 }
 
 function renderConfiguredNodes() {
@@ -548,10 +552,12 @@ function renderConfiguredNodes() {
     button.append(
       makeElement("strong", "", node.id),
       makeElement("span", node.enabled ? "summary-healthy" : "muted", node.enabled ? "已启用" : "已停用"),
-      makeElement("span", "muted", node.protocol_version === "minimax-v2" ? `${node.upstream_model || "MiniMax-H3"} · ${node.active_tasks || 0} / ${node.max_concurrency || 1}` : "内部节点 · 0 / 1")
+      makeElement("span", "muted", ["minimax-v2", "tk2sd-v1"].includes(node.protocol_version) ? `${node.protocol_version} · ${node.active_tasks || 0} / ${node.max_concurrency || 1}` : "内部节点 · 0 / 1")
     );
+    if (node.model_catalog) button.append(makeElement("span", "muted", window.modelRouting?.catalogSummary(node.model_catalog) || node.model_catalog.status));
+    if (node.legacy_model_compat) button.append(makeElement("span", "muted", "旧别名兼容"));
     button.addEventListener("click", () => {
-      if (selected || !confirmDiscard()) return;
+      if (state.nodeBusy || selected || !confirmDiscard()) return;
       fillNodeForm(node);
       renderConfiguredNodes();
     });
@@ -580,7 +586,7 @@ function nodePayload(includeVersion) {
     request_timeout: formField("request_timeout").value.trim(),
     enabled: formField("enabled").checked
   };
-  if (payload.protocol_version === "minimax-v2") {
+  if (payload.protocol_version === "minimax-v2" || payload.protocol_version === "tk2sd-v1") {
     payload.upstream_model = formField("upstream_model").value.trim();
     payload.max_concurrency = Number(formField("max_concurrency").value);
     payload.replace_result_url = formField("replace_result_url").checked;
@@ -592,7 +598,7 @@ function nodePayload(includeVersion) {
 }
 
 function syncNodeProtocolFields() {
-  const official = formField("protocol_version").value === "minimax-v2";
+  const official = ["minimax-v2", "tk2sd-v1"].includes(formField("protocol_version").value);
   elements.officialNodeFields.hidden = !official;
   elements.officialNodeFields.querySelectorAll("input").forEach((input) => { input.disabled = !official || state.nodeBusy; });
   formField("upstream_model").required = official;
@@ -601,6 +607,7 @@ function syncNodeProtocolFields() {
   key.minLength = official ? 1 : 32;
   key.maxLength = official ? 512 : 32;
   if (official) key.removeAttribute("pattern"); else key.setAttribute("pattern", "[A-Za-z0-9]{32}");
+  window.modelRouting?.syncControls();
 }
 
 function validateNodeForm() {
@@ -827,6 +834,7 @@ function renderTaskDetail(detail) {
   );
   if (detail.result_upload_error) deliverySection.append(detailRow("失败原因", `${detail.result_upload_error.code}：${detail.result_upload_error.summary || "上传失败"}`));
   elements.taskDetailBody.replaceChildren(summary, feedbackSection, textSection, mediaSection, deliverySection, configSection);
+  window.modelRouting?.renderTaskRouting(detail, elements.taskDetailBody);
 }
 
 function storageField(name) { return elements.storageForm.elements.namedItem(name); }
@@ -1025,6 +1033,7 @@ async function testNodeConnection() {
   setNodeFormStatus("正在测试连接...");
   try {
     const payload = nodePayload(false);
+    window.modelRouting?.prepareProbe(payload);
     if (state.editingNode && !payload.api_key) payload.use_stored_api_key = true;
     const checks = await requestJSON("/manager/api/nodes/test", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
@@ -1042,6 +1051,7 @@ async function saveNode(event) {
   if (state.nodeBusy || !validateNodeForm()) return;
   const editing = state.editingNode;
   const payload = nodePayload(Boolean(editing));
+  if (window.modelRouting && !window.modelRouting.prepareSave(payload)) return;
   if (editing && editing.enabled && !payload.enabled && !window.confirm(`确认停用节点 ${editing.id}？`)) return;
   const url = editing ? `/manager/api/nodes/${encodeURIComponent(editing.id)}` : "/manager/api/nodes";
   if (editing) delete payload.id;
@@ -1090,6 +1100,7 @@ async function openNodeConfiguration() {
   if (!elements.configDialog.open) elements.configDialog.showModal();
   setNodeBusy(true);
   try {
+    await window.modelRouting?.loadProtocols();
     await loadConfiguredNodes();
   } catch (error) {
     if (error.message !== "unauthorized") setNodeFormStatus("节点配置加载失败", "error");
@@ -1331,6 +1342,8 @@ elements.testObjectStorage.addEventListener("click", testObjectStorage);
 document.getElementById("logout").addEventListener("click", async () => {
   try { await fetch("/manager/api/session", { method: "DELETE" }); } finally { window.location.replace("/manager/login"); }
 });
+
+window.managerUI = { state, elements, formField, requestJSON, makeElement, localTime, detailRow, setNodeBusy, setNodeFormStatus, renderTaskDetail, loadTasks };
 
 poll();
 window.setInterval(poll, 5000);

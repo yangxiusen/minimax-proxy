@@ -2,6 +2,14 @@
 
 MiniMax-H3-Proxy manages multiple MiniMax-H3 inference nodes, exposes the authenticated V2 task API, and distributes work across healthy compatible nodes. SQLite persists tasks, published request profiles, stages, attempts, artifacts, callbacks, and physical deletion jobs.
 
+## Multi-model protocols (v0.0.2)
+
+The V2 endpoints now accept exact model IDs from configured nodes. Manager supports model discovery for `tk2sd-v1`, manual model declarations for `minimax-v2`, and the existing H3 model. A model is bound to one protocol; ambiguous names require an administrator choice. Tasks retain their selected protocol across retries and restarts, with no cross-protocol fallback.
+
+For tk2sd, configure its service root and Bearer Token, discover the models, select the exposed models, and enable the node. Existing JSON media URLs and Base64 inputs are automatically uploaded to that node. H3 request profiles are not used, and `resolution` may be omitted. Output duration/resolution/ratio reflect actual metadata or `null`; they are not copied from ignored request fields. Unknown submissions recover on the same node with the same persisted request and idempotency key.
+
+Deployments using only direct protocols may omit `generation_profiles`. Existing H3 profiles and nodes remain supported. SQLite migration 023 follows main's reusable-input migration 022, preserves historical configuration and flags legacy model aliases for compatibility. Databases already using the feature branch's routing migration 022 retain their routing identity when upgraded. Back up the database and master key before upgrading. Real upstream generation, media reachability and old-database acceptance still require environment-specific validation.
+
 ## Security and configuration
 
 Start from `config.example.yaml`. Configure the administrator password and a separate 32-byte master key:

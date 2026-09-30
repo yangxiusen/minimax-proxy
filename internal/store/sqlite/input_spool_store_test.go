@@ -17,8 +17,8 @@ func TestMigrationV15CreatesInputSpoolFiles(t *testing.T) {
 	if err := store.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil {
 		t.Fatalf("query user_version: %v", err)
 	}
-	if userVersion != 22 {
-		t.Fatalf("user_version=%d, want 22", userVersion)
+	if userVersion != latestSchemaVersion {
+		t.Fatalf("user_version=%d, want 23", userVersion)
 	}
 	var migrationCount int
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=15`).Scan(&migrationCount); err != nil {
@@ -43,8 +43,8 @@ func TestMigrationV17AllowsVideoInputSpoolFiles(t *testing.T) {
 	if err := store.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil {
 		t.Fatal(err)
 	}
-	if userVersion != 22 {
-		t.Fatalf("user_version=%d, want 22", userVersion)
+	if userVersion != latestSchemaVersion {
+		t.Fatalf("user_version=%d, want 23", userVersion)
 	}
 	input := newStoreTask("video-spool", "key-video-spool")
 	input.InputSpoolFiles = []domain.InputSpoolFile{{

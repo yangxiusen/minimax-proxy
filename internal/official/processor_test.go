@@ -91,7 +91,7 @@ func TestProcessorResumesBoundTaskWithoutSubmittingAgain(t *testing.T) {
 	store := &storeFake{}
 	client := &clientFake{queries: []minimaxv2.Task{{ID: "official-existing", Status: minimaxv2.StatusSucceeded, Content: minimaxv2.Content{URL: "https://origin.example/video.mp4"}}}}
 	processor := Processor{Store: store, Client: client, NodeID: "node-1", PollInterval: time.Millisecond}
-	if err := processor.ProcessTask(context.Background(), domain.Task{TaskID: "proxy-1", UpstreamID: "node-1", UpstreamJobID: "official-existing"}); err != nil {
+	if err := processor.ProcessTask(context.Background(), domain.Task{TaskID: "proxy-1", ProtocolVersion: domain.ProtocolOfficial, RouteState: "ready", UpstreamID: "node-1", UpstreamJobID: "official-existing"}); err != nil {
 		t.Fatal(err)
 	}
 	if client.submitCalls != 0 {
@@ -243,7 +243,7 @@ func TestProcessorLocalizesKnownGenerationErrorsAndFallsBackForUnmappedCodes(t *
 			client := &clientFake{queries: []minimaxv2.Task{{ID: "official-existing", Status: test.status, Error: test.upstream}}}
 			processor := Processor{Store: store, Client: client, NodeID: "node-1", PollInterval: time.Millisecond}
 
-			if err := processor.ProcessTask(context.Background(), domain.Task{TaskID: "proxy-1", UpstreamID: "node-1", UpstreamJobID: "official-existing"}); err != nil {
+			if err := processor.ProcessTask(context.Background(), domain.Task{TaskID: "proxy-1", ProtocolVersion: domain.ProtocolOfficial, RouteState: "ready", UpstreamID: "node-1", UpstreamJobID: "official-existing"}); err != nil {
 				t.Fatal(err)
 			}
 			if store.failedCode != test.wantCode || store.failedMessage != test.wantMessage {
@@ -311,8 +311,43 @@ func (s *storeFake) SaveOfficialSubmissionBaseline(context.Context, string, stri
 	return nil
 }
 
-func (s *storeFake) ClaimNextOfficial(context.Context, string, int64, int) (domain.Task, error) {
-	return s.claimed, nil
+func (s *storeFake) ClaimNextOfficial(_ context.Context, node string, _ int64, _ int) (domain.Task, error) {
+	task := s.claimed
+	if task.ProtocolVersion == "" {
+		task.ProtocolVersion = domain.ProtocolOfficial
+	}
+	if task.RouteState == "" {
+		task.RouteState = "ready"
+	}
+	if task.UpstreamID == "" {
+		task.UpstreamID = node
+	}
+	return task, nil
+}
+
+func TestProcessorRejectsForeignProtocolAndOwnerBeforeIO(t *testing.T) {
+	for _, mode := range []string{"protocol", "owner", "blocked"} {
+		t.Run(mode, func(t *testing.T) {
+			store := &storeFake{}
+			client := &clientFake{queries: []minimaxv2.Task{{ID: "existing", Status: minimaxv2.StatusSucceeded, Content: minimaxv2.Content{URL: "https://result.example/video"}}}}
+			p := Processor{Store: store, Client: client, NodeID: "original"}
+			task := domain.Task{TaskID: "task", ProtocolVersion: domain.ProtocolOfficial, RouteState: "ready", UpstreamID: "original", UpstreamJobID: "existing"}
+			switch mode {
+			case "protocol":
+				task.ProtocolVersion = domain.ProtocolTK2SD
+			case "owner":
+				task.UpstreamID = "other"
+			case "blocked":
+				task.RouteState = "migration_blocked"
+			}
+			if err := p.ProcessTask(context.Background(), task); !errors.Is(err, domain.ErrStateConflict) {
+				t.Fatalf("process=%v", err)
+			}
+			if len(client.queries) != 1 || client.submitCalls != 0 || store.failedCode != "" || store.generatedURL != "" {
+				t.Fatal("foreign task caused side effects")
+			}
+		})
+	}
 }
 func (s *storeFake) BindOfficialTask(_ context.Context, _, _, upstreamID string) error {
 	s.boundID = upstreamID

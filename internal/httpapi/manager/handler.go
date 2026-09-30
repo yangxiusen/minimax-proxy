@@ -29,6 +29,7 @@ import (
 	"minimax-h3-tc/internal/inputspool"
 	"minimax-h3-tc/internal/logsafe"
 	monitorcache "minimax-h3-tc/internal/monitor"
+	"minimax-h3-tc/internal/routing"
 	"minimax-h3-tc/internal/upstream/nodeapi"
 )
 
@@ -60,6 +61,14 @@ type ArtifactURLSigner interface {
 	SignURL(context.Context, string, string) (string, error)
 }
 
+type RemoteResultAccess interface {
+	Refresh(context.Context, domain.Task) (domain.Task, error)
+}
+
+type executionTaskStore interface {
+	GetTaskForExecution(context.Context, string) (domain.Task, error)
+}
+
 type NodeStore interface {
 	ListModelNodes(context.Context) ([]domain.ModelNode, error)
 	GetModelNode(context.Context, string) (domain.ModelNode, error)
@@ -88,6 +97,10 @@ type Dependencies struct {
 	Cache              *monitorcache.Cache
 	Store              TaskStore
 	Nodes              NodeStore
+	Inventory          *routing.Inventory
+	Routing            *routing.Service
+	RouteStore         ModelRouteStore
+	RemoteResults      RemoteResultAccess
 	Logger             *slog.Logger
 	Now                func() time.Time
 	Rand               io.Reader
@@ -110,6 +123,12 @@ type handler struct {
 	cache              *monitorcache.Cache
 	store              TaskStore
 	nodes              NodeStore
+	inventory          *routing.Inventory
+	routing            *routing.Service
+	routeStore         ModelRouteStore
+	remoteResults      RemoteResultAccess
+	catalogs           ModelCatalogStore
+	adminUsername      string
 	logger             *slog.Logger
 	now                func() time.Time
 	random             io.Reader
@@ -172,6 +191,11 @@ func NewHandler(dependencies Dependencies) http.Handler {
 		cache:              cache,
 		store:              dependencies.Store,
 		nodes:              dependencies.Nodes,
+		inventory:          dependencies.Inventory,
+		routing:            dependencies.Routing,
+		routeStore:         dependencies.RouteStore,
+		remoteResults:      dependencies.RemoteResults,
+		adminUsername:      dependencies.Admin.Username,
 		logger:             logger,
 		now:                now,
 		random:             random,
@@ -191,6 +215,17 @@ func NewHandler(dependencies Dependencies) http.Handler {
 		sessions:           make(map[[sha256.Size]byte]time.Time),
 		failures:           make(map[string]loginFailure),
 	}
+	for _, candidate := range []any{dependencies.Nodes, dependencies.Store} {
+		if h.catalogs == nil {
+			h.catalogs, _ = candidate.(ModelCatalogStore)
+		}
+		if h.routeStore == nil {
+			h.routeStore, _ = candidate.(ModelRouteStore)
+		}
+	}
+	if h.catalogs == nil && h.inventory != nil {
+		h.catalogs = h.inventory.Store
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /manager/api/session", h.createSession)
@@ -207,6 +242,13 @@ func NewHandler(dependencies Dependencies) http.Handler {
 	mux.Handle("PUT /manager/api/nodes/{node_id}", h.authenticate(http.HandlerFunc(h.updateNode)))
 	mux.Handle("DELETE /manager/api/nodes/{node_id}", h.authenticate(http.HandlerFunc(h.deleteNode)))
 	mux.Handle("POST /manager/api/nodes/test", h.authenticate(http.HandlerFunc(h.testNode)))
+	mux.Handle("GET /manager/api/protocols", h.authenticate(http.HandlerFunc(h.listProtocols)))
+	mux.Handle("POST /manager/api/nodes/discover-models", h.authenticate(http.HandlerFunc(h.discoverModels)))
+	mux.Handle("GET /manager/api/nodes/{node_id}/models", h.authenticate(http.HandlerFunc(h.listNodeModels)))
+	mux.Handle("POST /manager/api/nodes/{node_id}/models/refresh", h.authenticate(http.HandlerFunc(h.refreshNodeModels)))
+	mux.Handle("GET /manager/api/model-routes", h.authenticate(http.HandlerFunc(h.listModelRoutes)))
+	mux.Handle("PUT /manager/api/model-routes", h.authenticate(http.HandlerFunc(h.bindModelRoute)))
+	mux.Handle("POST /manager/api/tasks/{task_id}/route", h.authenticate(http.HandlerFunc(h.bindLegacyTaskRoute)))
 	mux.Handle("GET /manager/api/object-storage", h.authenticate(http.HandlerFunc(h.getObjectStorage)))
 	mux.Handle("PUT /manager/api/object-storage", h.authenticate(http.HandlerFunc(h.putObjectStorage)))
 	mux.Handle("POST /manager/api/object-storage/test", h.authenticate(http.HandlerFunc(h.testObjectStorage)))
@@ -499,7 +541,7 @@ func (h *handler) snapshot(w http.ResponseWriter, r *http.Request) {
 		}
 		if configured, ok := configuredNodes[node.ID]; ok {
 			item.ProtocolVersion = configured.ProtocolVersion
-			if configured.UsesOfficialV2() {
+			if configured.UsesOfficialV2() || configured.ProtocolVersion == domain.ProtocolTK2SD {
 				if configured.MaxConcurrency > 0 {
 					item.MaxConcurrency = configured.MaxConcurrency
 				}
@@ -556,7 +598,12 @@ type taskDTO struct {
 	Status               domain.V2Status `json:"status"`
 	UpstreamID           string          `json:"upstream_id"`
 	Scenario             string          `json:"scenario"`
-	Resolution           string          `json:"resolution"`
+	Resolution           any             `json:"resolution"`
+	Model                string          `json:"model,omitempty"`
+	ProtocolVersion      string          `json:"protocol_version,omitempty"`
+	RouteState           string          `json:"route_state,omitempty"`
+	RoutingWaitReason    string          `json:"routing_wait_reason,omitempty"`
+	DeliveryError        *errorDTO       `json:"delivery_error,omitempty"`
 	DurationSeconds      *int64          `json:"duration_seconds,omitempty"`
 	CreatedAt            int64           `json:"created_at"`
 	Phase                string          `json:"phase"`
@@ -573,7 +620,7 @@ type taskDTO struct {
 
 func (h *handler) tasks(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
-	allowed := map[string]bool{"page_num": true, "page_size": true, "status": true, "upstream_id": true, "search": true}
+	allowed := map[string]bool{"page_num": true, "page_size": true, "status": true, "upstream_id": true, "search": true, "model": true, "protocol_version": true, "route_state": true}
 	for key, values := range query {
 		if !allowed[key] || len(values) != 1 {
 			h.writeError(w, http.StatusBadRequest, "bad_request_error", "未知或重复的查询参数")
@@ -599,11 +646,15 @@ func (h *handler) tasks(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusBadRequest, "bad_request_error", "status 无效")
 		return
 	}
+	if !validTaskRoutingFilters(query) {
+		h.writeError(w, 400, "bad_request_error", "模型线路过滤参数无效")
+		return
+	}
 	if h.store == nil {
 		h.internalError(w, r, errors.New("monitor task store is nil"))
 		return
 	}
-	filter := domain.AdminTaskFilter{Status: status, UpstreamID: query.Get("upstream_id"), Search: query.Get("search"), PageNum: pageNum, PageSize: pageSize}
+	filter := domain.AdminTaskFilter{Status: status, UpstreamID: query.Get("upstream_id"), Search: query.Get("search"), PageNum: pageNum, PageSize: pageSize, Model: query.Get("model"), ProtocolVersion: query.Get("protocol_version"), RouteState: query.Get("route_state")}
 	items, total, err := h.store.ListAdminTasks(r.Context(), filter)
 	if err != nil {
 		h.internalError(w, r, err)
@@ -612,8 +663,36 @@ func (h *handler) tasks(w http.ResponseWriter, r *http.Request) {
 	response := tasksResponse{Items: make([]taskDTO, 0, len(items)), Total: total, PageNum: pageNum, PageSize: pageSize}
 	now := h.now()
 	for _, item := range items {
-		videoURL, err := h.publicVideoURL(r.Context(), item)
+		frozen, found, err := h.presentationTask(r.Context(), item.TaskID)
 		if err != nil {
+			h.internalError(w, r, err)
+			return
+		}
+		var videoURL *string
+		var deliveryError *errorDTO
+		var resolution any = item.Resolution
+		if found && frozen.ProtocolVersion != "" {
+			item.UpstreamProtocol = frozen.ProtocolVersion
+			item.Model = frozen.Model
+			item.RouteState = frozen.RouteState
+			item.RoutingWaitReason = frozen.RoutingWaitReason
+		}
+		if found && frozen.ProtocolVersion == domain.ProtocolTK2SD {
+			frozen, videoURL, err = h.remoteManagerResult(r.Context(), frozen)
+			item.Status = frozen.PublicStatus()
+			resolution = actualManagerMetadata(frozen).Resolution
+			if err != nil {
+				deliveryError = &errorDTO{Code: "result_refresh_unavailable", Summary: "结果链接暂时不可用"}
+			}
+		} else if item.UpstreamProtocol == domain.ProtocolTK2SD {
+			resolution = nil
+			if item.Status == domain.V2Succeeded {
+				deliveryError = &errorDTO{Code: "result_refresh_unavailable", Summary: "结果链接暂时不可用"}
+			}
+		} else {
+			videoURL, err = h.legacyPublicVideoURL(r.Context(), item)
+		}
+		if err != nil && deliveryError == nil {
 			h.internalError(w, r, err)
 			return
 		}
@@ -621,8 +700,15 @@ func (h *handler) tasks(w http.ResponseWriter, r *http.Request) {
 		if item.UpstreamProtocol == "minimax-v2" && (item.InternalStatus == domain.StatusDispatching || item.InternalStatus == domain.StatusRunning || item.InternalStatus == domain.StatusReconciling) {
 			canCancel = false
 		}
+		if item.UpstreamProtocol == domain.ProtocolTK2SD && item.Status == domain.V2Running {
+			canCancel = false
+		}
+		phase := taskPhase(item)
+		if found && frozen.ProtocolVersion == domain.ProtocolTK2SD {
+			phase = remoteManagerPhase(frozen)
+		}
 		delivery := h.resultDeliverySummary(r.Context(), item.TaskID)
-		response.Items = append(response.Items, taskDTO{ID: item.TaskID, APIKeyID: item.APIKeyID, Status: item.Status, UpstreamID: item.UpstreamID, Scenario: item.Scenario, Resolution: item.Resolution, DurationSeconds: taskDurationSeconds(item, now), CreatedAt: unixTime(item.CreatedAt), Phase: taskPhase(item), RetryCount: item.RetryCount, CanCancel: canCancel, CanDelete: item.InternalStatus.AdminCanDelete(), VideoURL: videoURL, ResultDeliveryStatus: delivery.Status, ResultUploadRound: delivery.Round, ResultUploadAttempts: delivery.Attempts, CanRetryUpload: delivery.CanRetry, ResultUploadError: delivery.Error})
+		response.Items = append(response.Items, taskDTO{ID: item.TaskID, APIKeyID: item.APIKeyID, Status: item.Status, UpstreamID: item.UpstreamID, Scenario: item.Scenario, Resolution: resolution, Model: item.Model, ProtocolVersion: item.UpstreamProtocol, RouteState: item.RouteState, RoutingWaitReason: item.RoutingWaitReason, DeliveryError: deliveryError, DurationSeconds: taskDurationSeconds(item, now), CreatedAt: unixTime(item.CreatedAt), Phase: phase, RetryCount: item.RetryCount, CanCancel: canCancel, CanDelete: item.InternalStatus.AdminCanDelete(), VideoURL: videoURL, ResultDeliveryStatus: delivery.Status, ResultUploadRound: delivery.Round, ResultUploadAttempts: delivery.Attempts, CanRetryUpload: delivery.CanRetry, ResultUploadError: delivery.Error})
 	}
 	h.writeJSON(w, http.StatusOK, response)
 }
@@ -655,9 +741,18 @@ type taskDetailDTO struct {
 	Phase                string                   `json:"phase"`
 	Scenario             string                   `json:"scenario"`
 	Model                string                   `json:"model"`
-	Resolution           string                   `json:"resolution"`
-	Ratio                string                   `json:"ratio"`
-	Duration             int                      `json:"duration"`
+	Resolution           any                      `json:"resolution"`
+	Ratio                any                      `json:"ratio"`
+	Duration             any                      `json:"duration"`
+	Width                *int                     `json:"width,omitempty"`
+	Height               *int                     `json:"height,omitempty"`
+	VideoURL             *string                  `json:"video_url,omitempty"`
+	Version              int64                    `json:"version"`
+	Routing              *taskRoutingDTO          `json:"routing,omitempty"`
+	Remote               *managerRemoteDTO        `json:"remote,omitempty"`
+	IgnoredRequestFields []string                 `json:"ignored_request_fields,omitempty"`
+	MetadataStatus       string                   `json:"metadata_status,omitempty"`
+	DeliveryError        *errorDTO                `json:"delivery_error,omitempty"`
 	CreatedAt            int64                    `json:"created_at"`
 	UpdatedAt            int64                    `json:"updated_at"`
 	Request              any                      `json:"request"`
@@ -686,6 +781,16 @@ func (h *handler) taskDetail(w http.ResponseWriter, r *http.Request) {
 		h.writeTaskActionError(w, r, err)
 		return
 	}
+	var videoURL *string
+	var deliveryError *errorDTO
+	var remoteSummary *managerRemoteDTO
+	if detail.Task.ProtocolVersion == domain.ProtocolTK2SD {
+		detail.Task, remoteSummary = h.loadManagerRemoteState(r.Context(), detail.Task)
+		detail.Task, videoURL, err = h.remoteManagerResult(r.Context(), detail.Task)
+		if err != nil {
+			deliveryError = &errorDTO{Code: "result_refresh_unavailable", Summary: "结果链接暂时不可用"}
+		}
+	}
 	requestBody, legacy := sanitizedTaskRequest(detail.Task.RequestJSON, detail.InputSpoolFiles)
 	h.enrichHistoricalObjectInputs(r.Context(), requestBody)
 	var config any
@@ -693,12 +798,32 @@ func (h *handler) taskDetail(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal([]byte(detail.Task.ConfigSnapshotJSON), &config)
 	}
 	response := taskDetailDTO{
-		ID: detail.Task.TaskID, APIKeyID: detail.Task.APIKeyID, Status: detail.Task.Status.V2(), Phase: taskPhaseFromTask(detail.Task),
+		ID: detail.Task.TaskID, APIKeyID: detail.Task.APIKeyID, Status: detail.Task.PublicStatus(), Phase: taskPhaseFromTask(detail.Task),
 		Scenario: detail.Task.Scenario, Model: detail.Task.Model, Resolution: detail.Task.Resolution,
 		Ratio: detail.Task.RatioRequested, Duration: detail.Task.Duration,
 		CreatedAt: unixTime(detail.Task.CreatedAt), UpdatedAt: unixTime(detail.Task.UpdatedAt),
 		Request: requestBody, Config: config, LegacyBase64Present: detail.LegacyBase64Present || legacy,
 		UpstreamFeedback: detail.Task.UpstreamFeedback,
+		Version:          detail.Task.Version, VideoURL: videoURL, DeliveryError: deliveryError,
+		Remote: remoteSummary,
+	}
+	if detail.Task.ProtocolVersion != "" || detail.Task.RouteState != "" {
+		response.Routing = taskRoutingSummary(detail.Task)
+	}
+	if detail.Task.ProtocolVersion == domain.ProtocolTK2SD {
+		metadata := actualManagerMetadata(detail.Task)
+		response.Duration, response.Ratio, response.Resolution = metadata.Duration, metadata.Ratio, metadata.Resolution
+		response.Width, response.Height = metadata.Width, metadata.Height
+		response.MetadataStatus = detail.Task.MetadataStatus
+		response.Phase = remoteManagerPhase(detail.Task)
+		var input map[string]json.RawMessage
+		if json.Unmarshal([]byte(detail.Task.RequestJSON), &input) == nil {
+			for _, name := range []string{"resolution", "ratio", "aigc_watermark"} {
+				if _, ok := input[name]; ok {
+					response.IgnoredRequestFields = append(response.IgnoredRequestFields, name)
+				}
+			}
+		}
 	}
 	delivery := h.resultDeliverySummary(r.Context(), taskID)
 	response.ResultDeliveryStatus, response.ResultUploadRound, response.ResultUploadAttempts = delivery.Status, delivery.Round, delivery.Attempts
@@ -1024,6 +1149,8 @@ func (h *handler) deleteRemoteTaskArtifacts(ctx context.Context, taskID string) 
 
 func (h *handler) writeTaskActionError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
+	case errors.Is(err, domain.ErrRemoteNotCancellable):
+		h.writeError(w, http.StatusConflict, "task_not_cancellable", "远程任务已开始执行，不支持取消")
 	case errors.Is(err, domain.ErrTaskNotFound):
 		h.writeError(w, http.StatusNotFound, "task_not_found", "任务不存在")
 	case errors.Is(err, domain.ErrCancelReconcilePending):
@@ -1038,6 +1165,9 @@ func (h *handler) writeTaskActionError(w http.ResponseWriter, r *http.Request, e
 }
 
 func taskPhase(item domain.AdminTaskSummary) string {
+	if item.UpstreamProtocol == domain.ProtocolTK2SD && item.RemotePhase != "" {
+		return remoteManagerPhase(domain.Task{ProtocolVersion: item.UpstreamProtocol, Status: item.InternalStatus, RemotePhase: item.RemotePhase})
+	}
 	if item.InternalStatus == domain.StatusRunning && item.UpstreamID == "" {
 		return "waiting"
 	}
@@ -1055,6 +1185,24 @@ func taskPhase(item domain.AdminTaskSummary) string {
 }
 
 func (h *handler) publicVideoURL(ctx context.Context, item domain.AdminTaskSummary) (*string, error) {
+	if item.Status != domain.V2Succeeded {
+		return nil, nil
+	}
+	task, found, err := h.presentationTask(ctx, item.TaskID)
+	if err != nil {
+		return nil, err
+	}
+	if found && task.ProtocolVersion == domain.ProtocolTK2SD {
+		_, result, err := h.remoteManagerResult(ctx, task)
+		return result, err
+	}
+	if !found && item.UpstreamProtocol == domain.ProtocolTK2SD {
+		return nil, domain.ErrResultRefreshUnavailable
+	}
+	return h.legacyPublicVideoURL(ctx, item)
+}
+
+func (h *handler) legacyPublicVideoURL(ctx context.Context, item domain.AdminTaskSummary) (*string, error) {
 	if item.Status != domain.V2Succeeded {
 		return nil, nil
 	}

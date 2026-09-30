@@ -10,7 +10,7 @@ import (
 	"minimax-h3-tc/internal/domain"
 )
 
-const modelNodeSelect = `SELECT id,service_url,protocol_version,COALESCE(api_key_ciphertext,X''),COALESCE(api_key_nonce,X''),COALESCE(api_key_fingerprint,''),COALESCE(api_key_id,''),base_url,jobs_base_url,public_base_url,health_path,submit_api_name,check_api_name,poll_interval_ms,request_timeout_ms,enabled,upstream_model,max_concurrency,replace_result_url,version,created_at,updated_at FROM model_service_nodes`
+const modelNodeSelect = `SELECT id,service_url,protocol_version,COALESCE(api_key_ciphertext,X''),COALESCE(api_key_nonce,X''),COALESCE(api_key_fingerprint,''),COALESCE(api_key_id,''),base_url,jobs_base_url,public_base_url,health_path,submit_api_name,check_api_name,poll_interval_ms,request_timeout_ms,enabled,upstream_model,max_concurrency,replace_result_url,version,created_at,updated_at,legacy_model_compat FROM model_service_nodes`
 
 func (s *Store) ListModelNodes(ctx context.Context) ([]domain.ModelNode, error) {
 	rows, err := s.db.QueryContext(ctx, modelNodeSelect+` WHERE deleted_at IS NULL ORDER BY id`)
@@ -58,6 +58,10 @@ func (s *Store) CreateModelNode(ctx context.Context, input domain.ModelNodeInput
 		input.PollInterval.Milliseconds(), input.RequestTimeout.Milliseconds(), boolInt(input.Enabled), values.upstreamModel, values.maxConcurrency, boolInt(values.replaceResultURL), now, now); err != nil {
 		return domain.ModelNode{}, err
 	}
+	input.ProtocolVersion, input.ServiceURL = values.protocolVersion, values.serviceURL
+	if err := s.writeNodeCatalog(ctx, conn, input, now); err != nil {
+		return domain.ModelNode{}, err
+	}
 	return scanModelNode(conn.QueryRowContext(ctx, modelNodeSelect+` WHERE id=? AND deleted_at IS NULL`, input.ID))
 }
 
@@ -77,11 +81,26 @@ func (s *Store) UpdateModelNode(ctx context.Context, id string, expectedVersion 
 	if current.Version != expectedVersion {
 		return domain.ModelNode{}, domain.ErrNodeVersionConflict
 	}
+	if current.ProtocolVersion == domain.ProtocolTK2SD && (current.ProtocolVersion != input.ProtocolVersion || current.ServiceURL != input.ServiceURL) {
+		dependent, err := retainedRemoteResults(ctx, conn, id, s.nowUnix())
+		if err != nil {
+			return domain.ModelNode{}, err
+		}
+		if dependent > 0 {
+			return domain.ModelNode{}, domain.ErrNodeHasActiveTask
+		}
+	}
 	active, err := activeTaskCount(ctx, conn, id)
 	if err != nil {
 		return domain.ModelNode{}, err
 	}
 	allowedWhileActive := current.Enabled && !input.Enabled && sameNodeConnection(current.ModelNodeInput, input)
+	if active > 0 && sameNodeConnection(current.ModelNodeInput, input) && current.Enabled == input.Enabled && current.LegacyModelCompat == input.LegacyModelCompat {
+		allowedWhileActive = true
+	}
+	if active > 0 && current.ProtocolVersion == domain.ProtocolTK2SD && input.ProtocolVersion == current.ProtocolVersion && input.ServiceURL == current.ServiceURL && input.LegacyModelCompat == current.LegacyModelCompat && input.APIKeyFingerprint != current.APIKeyFingerprint {
+		allowedWhileActive = true
+	}
 	if active > 0 && current.Enabled && input.Enabled && current.UsesOfficialV2() && input.UsesOfficialV2() && sameOfficialConnectionExceptCapacity(current.ModelNodeInput, input) && input.MaxConcurrency > current.MaxConcurrency {
 		allowedWhileActive = true
 	}
@@ -98,6 +117,20 @@ func (s *Store) UpdateModelNode(ctx context.Context, id string, expectedVersion 
 		if errors.Is(err, domain.ErrStateConflict) {
 			return domain.ModelNode{}, domain.ErrNodeVersionConflict
 		}
+		return domain.ModelNode{}, err
+	}
+	if current.LegacyModelCompat && !input.LegacyModelCompat && active > 0 {
+		return domain.ModelNode{}, domain.ErrNodeHasActiveTask
+	}
+	if !current.LegacyModelCompat && input.LegacyModelCompat {
+		return domain.ModelNode{}, domain.ErrStateConflict
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE model_service_nodes SET legacy_model_compat=? WHERE id=?`, boolInt(input.LegacyModelCompat), id); err != nil {
+		return domain.ModelNode{}, err
+	}
+	input.ID = id
+	input.ProtocolVersion, input.ServiceURL = values.protocolVersion, values.serviceURL
+	if err := s.writeNodeCatalog(ctx, conn, input, now); err != nil {
 		return domain.ModelNode{}, err
 	}
 	return scanModelNode(conn.QueryRowContext(ctx, modelNodeSelect+` WHERE id=? AND deleted_at IS NULL`, id))
@@ -129,13 +162,21 @@ func (s *Store) DeleteModelNode(ctx context.Context, id string, expectedVersion 
 	if active > 0 {
 		return domain.ErrNodeHasActiveTask
 	}
+	dependent, err := retainedRemoteResults(ctx, conn, id, s.nowUnix())
+	if err != nil {
+		return err
+	}
+	if dependent > 0 {
+		return domain.ErrNodeHasActiveTask
+	}
 	now := s.nowUnix()
 	result, err := conn.ExecContext(ctx, `UPDATE model_service_nodes SET deleted_at=?,updated_at=?,version=version+1 WHERE id=? AND version=? AND deleted_at IS NULL`, now, now, id, expectedVersion)
 	if err := oneRow(result, err); errors.Is(err, domain.ErrStateConflict) {
 		return domain.ErrNodeVersionConflict
-	} else {
+	} else if err != nil {
 		return err
 	}
+	return bumpRouting(ctx, conn, now)
 }
 
 func (s *Store) LegacyNodeImportPending(ctx context.Context) (bool, error) {
@@ -176,6 +217,10 @@ func (s *Store) ImportLegacyNodes(ctx context.Context, inputs []domain.ModelNode
 				input.PollInterval.Milliseconds(), input.RequestTimeout.Milliseconds(), boolInt(input.Enabled), values.upstreamModel, values.maxConcurrency, boolInt(values.replaceResultURL), now, now); err != nil {
 				return 0, false, err
 			}
+			input.ProtocolVersion, input.ServiceURL = values.protocolVersion, values.serviceURL
+			if err := s.writeNodeCatalog(ctx, conn, input, now); err != nil {
+				return 0, false, err
+			}
 		}
 		importedCount = len(sorted)
 	}
@@ -194,7 +239,7 @@ func activeTaskCount(ctx context.Context, query rowQuerier, nodeID string) (int,
 }
 
 func sameNodeConnection(left, right domain.ModelNodeInput) bool {
-	if !left.UsesNodeAPI() && !right.UsesNodeAPI() {
+	if !left.UsesNodeAPI() && !right.UsesNodeAPI() && !left.UsesOfficialV2() && !right.UsesOfficialV2() && left.ProtocolVersion != domain.ProtocolTK2SD && right.ProtocolVersion != domain.ProtocolTK2SD {
 		return left.BaseURL == right.BaseURL && left.JobsBaseURL == right.JobsBaseURL && left.PublicBaseURL == right.PublicBaseURL &&
 			left.HealthPath == right.HealthPath && left.SubmitAPIName == right.SubmitAPIName && left.CheckAPIName == right.CheckAPIName &&
 			left.PollInterval == right.PollInterval && left.RequestTimeout == right.RequestTimeout
@@ -203,7 +248,7 @@ func sameNodeConnection(left, right domain.ModelNodeInput) bool {
 		left.APIKeyFingerprint != right.APIKeyFingerprint || left.PollInterval != right.PollInterval || left.RequestTimeout != right.RequestTimeout {
 		return false
 	}
-	if left.UsesOfficialV2() || right.UsesOfficialV2() {
+	if left.UsesOfficialV2() || right.UsesOfficialV2() || left.ProtocolVersion == domain.ProtocolTK2SD || right.ProtocolVersion == domain.ProtocolTK2SD {
 		return left.UpstreamModel == right.UpstreamModel && left.MaxConcurrency == right.MaxConcurrency && left.ReplaceResultURL == right.ReplaceResultURL
 	}
 	return true
@@ -215,13 +260,19 @@ func sameOfficialConnectionExceptCapacity(left, right domain.ModelNodeInput) boo
 		left.UpstreamModel == right.UpstreamModel && left.ReplaceResultURL == right.ReplaceResultURL
 }
 
+func retainedRemoteResults(ctx context.Context, q rowQuerier, nodeID string, now int64) (int, error) {
+	var count int
+	err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM video_tasks WHERE upstream_id=? AND protocol_version='tk2sd-v1' AND deleted_at IS NULL AND expires_at>? AND status='succeeded' AND (delivery_required=0 OR COALESCE(result_public_url,'')='')`, nodeID, now).Scan(&count)
+	return count, err
+}
+
 func scanModelNode(scanner rowScanner) (domain.ModelNode, error) {
 	var node domain.ModelNode
 	var compatibilityAPIKeyID string
-	var pollMS, timeoutMS, enabled, replaceResultURL, created, updated int64
+	var pollMS, timeoutMS, enabled, replaceResultURL, created, updated, legacyCompat int64
 	err := scanner.Scan(&node.ID, &node.ServiceURL, &node.ProtocolVersion, &node.APIKeyCiphertext, &node.APIKeyNonce, &node.APIKeyFingerprint, &compatibilityAPIKeyID,
 		&node.BaseURL, &node.JobsBaseURL, &node.PublicBaseURL, &node.HealthPath, &node.SubmitAPIName, &node.CheckAPIName,
-		&pollMS, &timeoutMS, &enabled, &node.UpstreamModel, &node.MaxConcurrency, &replaceResultURL, &node.Version, &created, &updated)
+		&pollMS, &timeoutMS, &enabled, &node.UpstreamModel, &node.MaxConcurrency, &replaceResultURL, &node.Version, &created, &updated, &legacyCompat)
 	if err != nil {
 		return domain.ModelNode{}, err
 	}
@@ -229,6 +280,7 @@ func scanModelNode(scanner rowScanner) (domain.ModelNode, error) {
 	node.RequestTimeout = durationMilliseconds(timeoutMS)
 	node.Enabled = enabled == 1
 	node.ReplaceResultURL = replaceResultURL == 1
+	node.LegacyModelCompat = legacyCompat == 1
 	node.CreatedAt = unix(created)
 	node.UpdatedAt = unix(updated)
 	return node, nil
@@ -245,7 +297,7 @@ type persistedNodeValues struct {
 }
 
 func nodePersistenceValues(input domain.ModelNodeInput) persistedNodeValues {
-	if input.UsesNodeAPI() || input.UsesOfficialV2() {
+	if input.UsesNodeAPI() || input.UsesOfficialV2() || input.ProtocolVersion == domain.ProtocolTK2SD {
 		maxConcurrency := input.MaxConcurrency
 		if input.UsesNodeAPI() || maxConcurrency == 0 {
 			maxConcurrency = 1

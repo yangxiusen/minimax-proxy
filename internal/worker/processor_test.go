@@ -800,6 +800,30 @@ func workerStore(t *testing.T) *sqlite.Store {
 	return store
 }
 
+type foreignRecoveryStore struct {
+	Store
+	task domain.Task
+}
+
+func (s foreignRecoveryStore) ActiveForUpstream(context.Context, string) (domain.Task, error) {
+	return s.task, nil
+}
+func (s foreignRecoveryStore) MarkFailed(context.Context, string, string, string, string) error {
+	return nil
+}
+
+func TestLegacyProcessorRejectsForeignRecoveryBeforeIO(t *testing.T) {
+	s := workerStore(t)
+	client := &scriptedClient{}
+	p := workerProcessor(foreignRecoveryStore{Store: s, task: domain.Task{TaskID: "foreign", UpstreamID: "gpu-1", ProtocolVersion: domain.ProtocolOfficial, RouteState: "ready", Status: domain.StatusRunning}}, client, monitor.NewCache(nil))
+	if err := p.ProcessOne(context.Background()); !errors.Is(err, domain.ErrStateConflict) {
+		t.Fatalf("process=%v", err)
+	}
+	if client.calls != 0 {
+		t.Fatalf("upstream calls=%d", client.calls)
+	}
+}
+
 func workerProfiles() map[string]config.GenerationProfile {
 	dimensions := map[string]config.Dimension{"16:9": {Width: 1920, Height: 1080}}
 	return map[string]config.GenerationProfile{"2K": {ModelMode: "custom", Steps: 20, Dimensions: dimensions}}

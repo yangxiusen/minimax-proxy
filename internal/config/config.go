@@ -591,6 +591,9 @@ func validate(cfg Config) error {
 		}
 		ids[key.ID], keys[key.Key] = struct{}{}, struct{}{}
 	}
+	if len(cfg.GenerationProfiles) == 0 {
+		return nil
+	}
 	for _, resolution := range requiredResolutions {
 		profile, ok := cfg.GenerationProfiles[resolution]
 		if !ok {

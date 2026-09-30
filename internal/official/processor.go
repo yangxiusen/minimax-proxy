@@ -50,6 +50,12 @@ func (p *Processor) ProcessOne(ctx context.Context) error {
 }
 
 func (p *Processor) ProcessTask(ctx context.Context, task domain.Task) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if task.ProtocolVersion != domain.ProtocolOfficial || task.RouteState != "ready" || task.UpstreamID != p.NodeID {
+		return domain.ErrStateConflict
+	}
 	upstreamTaskID := task.UpstreamJobID
 	if upstreamTaskID == "" {
 		baseline := make(map[string]struct{})

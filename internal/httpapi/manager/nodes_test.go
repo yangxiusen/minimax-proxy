@@ -11,6 +11,7 @@ import (
 
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
+	monitorcache "minimax-h3-tc/internal/monitor"
 )
 
 type nodeStoreStub struct {
@@ -39,6 +40,43 @@ func (s *nodeStoreStub) ActiveOfficialCount(_ context.Context, nodeID string) (i
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.activeTasks[nodeID], nil
+}
+
+func TestTK2SDNodeCapacityAndActiveTasksVisibleInManager(t *testing.T) {
+	nodes := &nodeStoreStub{
+		items: []domain.ModelNode{{ModelNodeInput: domain.ModelNodeInput{
+			ID: "tk-1", ProtocolVersion: domain.ProtocolTK2SD, MaxConcurrency: 4, Enabled: true,
+		}}},
+		activeTasks: map[string]int{"tk-1": 2},
+	}
+	cache := monitorcache.NewCache([]monitorcache.NodeSnapshot{{
+		ID: "tk-1", Health: monitorcache.HealthHealthy, Runtime: monitorcache.RuntimeRunning,
+	}})
+	h := testHandler(Dependencies{
+		Admin: config.AdminConfig{Username: "admin", Password: "secret", SessionTTL: time.Hour},
+		Nodes: nodes, Cache: cache,
+	})
+	cookie := login(t, h, "admin", "secret", "192.0.2.11:1")
+	for _, endpoint := range []string{"/manager/api/snapshot", "/manager/api/nodes"} {
+		t.Run(endpoint, func(t *testing.T) {
+			response := serve(h, http.MethodGet, endpoint, "", "", cookie, "192.0.2.11:1", false)
+			type capacity struct {
+				ID              string `json:"id"`
+				ProtocolVersion string `json:"protocol_version"`
+				MaxConcurrency  int    `json:"max_concurrency"`
+				ActiveTasks     int    `json:"active_tasks"`
+			}
+			var body struct {
+				Items     []capacity `json:"items"`
+				Upstreams []capacity `json:"upstreams"`
+			}
+			decodeResponse(t, response, &body)
+			items := append(body.Items, body.Upstreams...)
+			if response.Code != http.StatusOK || len(items) != 1 || items[0].ID != "tk-1" || items[0].ProtocolVersion != domain.ProtocolTK2SD || items[0].MaxConcurrency != 4 || items[0].ActiveTasks != 2 {
+				t.Fatalf("capacity response: status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
 }
 
 func (s *nodeStoreStub) GetModelNode(_ context.Context, id string) (domain.ModelNode, error) {
@@ -294,18 +332,28 @@ func TestOfficialV2NodeAcceptsProtocolSpecificFieldsAndKey(t *testing.T) {
 		Admin: config.AdminConfig{Username: "admin", Password: "secret", SessionTTL: time.Hour}, Nodes: store, NodeSecrets: testNodeSecrets{},
 	})
 	cookie := login(t, h, "admin", "secret", "192.0.2.9:1")
-	body := `{"id":"official-1","service_url":"https://api.example.com","protocol_version":"minimax-v2","api_key":"sk-official-key-with-symbols._-","upstream_model":"MiniMax-H3-Custom","max_concurrency":3,"replace_result_url":false,"poll_interval":"3s","request_timeout":"30s","enabled":true}`
+	body := `{"id":"official-1","service_url":"https://api.example.com","protocol_version":"minimax-v2","api_key":"sk-official-key-with-symbols._-","enabled_models":["MiniMax-H3-Custom"],"max_concurrency":3,"replace_result_url":false,"poll_interval":"3s","request_timeout":"30s","enabled":true}`
 	response := serve(h, http.MethodPost, "/manager/api/nodes", body, "application/json", cookie, "192.0.2.9:1", false)
 	if response.Code != http.StatusCreated {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
-	if store.created.ProtocolVersion != "minimax-v2" || store.created.UpstreamModel != "MiniMax-H3-Custom" || store.created.MaxConcurrency != 3 || store.created.ReplaceResultURL {
+	if store.created.ProtocolVersion != "minimax-v2" || store.created.UpstreamModel != "" || store.created.MaxConcurrency != 3 || store.created.ReplaceResultURL || store.created.LegacyModelCompat {
 		t.Fatalf("created=%+v", store.created)
+	}
+	catalog := store.created.ModelCatalog
+	if catalog == nil || catalog.Source != "manual" || len(catalog.Items) != 1 || catalog.Items[0].ModelID != "MiniMax-H3-Custom" || !catalog.Items[0].Enabled || !catalog.Items[0].Present || catalog.Items[0].Verified {
+		t.Fatalf("catalog=%+v", catalog)
 	}
 	var dto nodeDTO
 	decodeResponse(t, response, &dto)
-	if dto.UpstreamModel != "MiniMax-H3-Custom" || dto.MaxConcurrency != 3 || dto.ReplaceResultURL {
+	if dto.UpstreamModel != "" || dto.MaxConcurrency != 3 || dto.ReplaceResultURL || dto.ModelCatalog == nil || dto.ModelCatalog.Source != "manual" || dto.LegacyModelCompat {
 		t.Fatalf("dto=%+v", dto)
+	}
+	aliasBody := strings.TrimSuffix(body, "}") + `,"upstream_model":"MiniMax-H3-Custom"}`
+	rejected := serve(h, http.MethodPost, "/manager/api/nodes", aliasBody, "application/json", cookie, "192.0.2.9:1", false)
+	assertManagerError(t, rejected, http.StatusBadRequest, "bad_request_error")
+	if store.createCalls != 1 {
+		t.Fatal("rejected alias reached node store")
 	}
 }
 
@@ -315,7 +363,7 @@ func TestOfficialV2NodeRejectsEmptyOrControlKey(t *testing.T) {
 	for _, key := range []string{"", "bad\nkey"} {
 		value := map[string]any{
 			"id": "official-1", "service_url": "https://api.example.com", "protocol_version": "minimax-v2", "api_key": key,
-			"upstream_model": "MiniMax-H3", "max_concurrency": 3, "replace_result_url": false,
+			"enabled_models": []string{"MiniMax-H3"}, "max_concurrency": 3, "replace_result_url": false,
 			"poll_interval": "3s", "request_timeout": "30s", "enabled": true,
 		}
 		data, _ := json.Marshal(value)

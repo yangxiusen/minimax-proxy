@@ -106,7 +106,12 @@ func (client *Client) Submit(ctx context.Context, requestJSON []byte) (string, e
 	if len(input.Content) == 0 || input.Resolution == "" || input.Duration == 0 {
 		return "", errors.New("V2 任务快照缺少必填字段")
 	}
-	input.Model = client.model
+	if client.model != "" {
+		input.Model = client.model
+	}
+	if strings.TrimSpace(input.Model) == "" {
+		return "", errors.New("V2 任务快照缺少 model")
+	}
 	body, err := json.Marshal(input)
 	if err != nil {
 		return "", err

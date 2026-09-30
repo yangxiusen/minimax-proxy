@@ -5,7 +5,7 @@ import (
 	"net/http"
 )
 
-//go:embed web/login.html web/manager.html web/styles.css web/login.js web/manager.js
+//go:embed web/login.html web/manager.html web/styles.css web/login.js web/manager.js web/model-routing.js
 var webAssets embed.FS
 
 func (h *handler) registerWebRoutes(mux *http.ServeMux) {
@@ -39,7 +39,7 @@ func (h *handler) asset(w http.ResponseWriter, r *http.Request) {
 	switch name {
 	case "styles.css":
 		contentType = "text/css; charset=utf-8"
-	case "login.js", "manager.js":
+	case "login.js", "manager.js", "model-routing.js":
 		contentType = "text/javascript; charset=utf-8"
 	default:
 		http.NotFound(w, r)

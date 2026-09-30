@@ -24,6 +24,8 @@ type ModelNodeInput struct {
 	UpstreamModel     string
 	MaxConcurrency    int
 	ReplaceResultURL  bool
+	LegacyModelCompat bool
+	ModelCatalog      *ModelCatalog
 
 	// Legacy 字段只用于读取和运行升级前的 gradio-v1 节点。
 	ID             string

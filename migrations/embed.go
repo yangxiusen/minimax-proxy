@@ -106,3 +106,8 @@ var OSSInputObjectMetadata string
 //
 //go:embed 022_reusable_input_object_refs.sql
 var ReusableInputObjectRefs string
+
+// MultiModelProtocolRouting 保存多模型目录、冻结路由及远程任务提交证据。
+//
+//go:embed 023_multi_model_protocol_routing.sql
+var MultiModelProtocolRouting string

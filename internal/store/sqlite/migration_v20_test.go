@@ -20,7 +20,7 @@ func TestUpstreamFeedbackMigration(t *testing.T) {
 	if err := store.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 22 {
+	if version != latestSchemaVersion {
 		t.Fatalf("user_version=%d want=22", version)
 	}
 	var columnCount int

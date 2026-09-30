@@ -3,16 +3,18 @@ package sqlite
 import (
 	"context"
 	"testing"
+	"time"
+
+	"minimax-h3-tc/internal/domain"
 )
 
 func insertNodeAPINode(t *testing.T, store *Store, id string) {
 	t.Helper()
-	_, err := store.db.ExecContext(context.Background(), `INSERT INTO model_service_nodes(
-		id,service_url,protocol_version,api_key_ciphertext,api_key_nonce,api_key_fingerprint,api_key_id,
-		capabilities_json,health_path,poll_interval_ms,request_timeout_ms,enabled,version,created_at,updated_at,
-		base_url,jobs_base_url,public_base_url
-	) VALUES(?,?, 'h3-node-v1',X'01',X'02','fingerprint','key-id','{}','/internal/v1/health',3000,30000,1,1,1,1,?,?,?)`,
-		id, "https://"+id+".example", "https://"+id+".example", "https://"+id+".example", "https://"+id+".example")
+	_, err := store.CreateModelNode(context.Background(), domain.ModelNodeInput{
+		ID: id, ServiceURL: "https://" + id + ".example", ProtocolVersion: domain.ProtocolH3,
+		APIKeyCiphertext: []byte{1}, APIKeyNonce: []byte{2}, APIKeyFingerprint: "fingerprint",
+		PollInterval: 3 * time.Second, RequestTimeout: 30 * time.Second, Enabled: true,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -31,10 +31,15 @@ type VideoDownloader interface {
 	Download(context.Context, string, string) (int64, error)
 }
 
+type TaskVideoDownloader interface {
+	DownloadTask(context.Context, string, string) (int64, error)
+}
+
 type Worker struct {
 	Store              Store
 	Secrets            SecretOpener
 	Downloader         VideoDownloader
+	TaskDownloader     TaskVideoDownloader
 	ObjectStoreFactory ObjectStoreFactory
 	LeaseDuration      time.Duration
 	Interval           time.Duration
@@ -111,7 +116,12 @@ func (w Worker) ProcessOne(ctx context.Context) error {
 	filePath := file.Name()
 	_ = file.Close()
 	defer os.Remove(filePath)
-	bytesDownloaded, err := w.Downloader.Download(operationCtx, sourceURL, filePath)
+	var bytesDownloaded int64
+	if w.TaskDownloader != nil {
+		bytesDownloaded, err = w.TaskDownloader.DownloadTask(operationCtx, job.TaskID, filePath)
+	} else {
+		bytesDownloaded, err = w.Downloader.Download(operationCtx, sourceURL, filePath)
+	}
 	if err != nil {
 		return w.fail(ctx, job, lease, "result_download_failed", "官方结果视频下载失败", retryableDownload(err), err)
 	}

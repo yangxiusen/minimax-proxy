@@ -69,6 +69,9 @@ func (p *Processor) ProcessOne(ctx context.Context) error {
 	}
 	active, err := p.Store.ActiveForUpstream(ctx, p.Upstream.ID)
 	if err == nil {
+		if active.ProtocolVersion != domain.ProtocolLegacy || active.RouteState != "ready" || active.UpstreamID != p.Upstream.ID {
+			return domain.ErrStateConflict
+		}
 		p.markCurrent(active)
 		return p.resume(ctx, active)
 	}
@@ -83,6 +86,9 @@ func (p *Processor) ProcessOne(ctx context.Context) error {
 	}
 	if err != nil {
 		return err
+	}
+	if task.ProtocolVersion != domain.ProtocolLegacy || task.RouteState != "ready" || task.UpstreamID != p.Upstream.ID {
+		return domain.ErrStateConflict
 	}
 	p.markCurrent(task)
 	p.Logger.InfoContext(ctx, "上游任务已领取", "task_id", task.TaskID, "api_key_id", task.APIKeyID, "upstream_id", p.Upstream.ID, "stage", "claim")
