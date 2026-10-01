@@ -18,7 +18,7 @@ import (
 )
 
 type Store interface {
-	ClaimNextRemote(context.Context, string, int64, int) (domain.Task, error)
+	ClaimNextRemote(context.Context, string, int64, int, ...domain.TK2SDAdmission) (domain.Task, error)
 	ListActiveRemoteTasks(context.Context, string) ([]domain.Task, error)
 	GetRemoteRun(context.Context, string) (domain.RemoteRun, error)
 	AcquireRemoteLease(context.Context, string, string, string, time.Duration) (domain.RemoteRun, error)
@@ -47,13 +47,22 @@ type Processor struct {
 	NodeVersion                 int64
 	NodeURL                     *url.URL
 	Capacity                    int
+	Admission                   func() (domain.TK2SDAdmission, bool)
 	LeaseDuration, PollInterval time.Duration
 	Now                         func() time.Time
 	Logger                      *slog.Logger
 }
 
 func (p *Processor) ProcessOne(ctx context.Context) error {
-	task, err := p.Store.ClaimNextRemote(ctx, p.NodeID, p.NodeVersion, p.Capacity)
+	var admission []domain.TK2SDAdmission
+	if p.Admission != nil {
+		current, ok := p.Admission()
+		if !ok {
+			return domain.ErrUpstreamBusy
+		}
+		admission = append(admission, current)
+	}
+	task, err := p.Store.ClaimNextRemote(ctx, p.NodeID, p.NodeVersion, p.Capacity, admission...)
 	if err != nil {
 		return err
 	}

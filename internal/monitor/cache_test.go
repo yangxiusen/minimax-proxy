@@ -77,6 +77,25 @@ func TestCacheReadsAndWritesUseIndependentCopies(t *testing.T) {
 	}
 }
 
+func TestTK2SDDashboardCacheIsDeepCopied(t *testing.T) {
+	credits := 80
+	input := &TK2SDDashboard{Accounts: []TK2SDAccount{{Label: "1-1", Credits: &credits}}, Login: TK2SDLogin{Status: "valid"}, LeasedTaskIDs: []string{"private-task"}}
+	cache := NewCache([]NodeSnapshot{{ID: "tk-node", TK2SDDashboard: input}})
+	credits = 10
+	input.Accounts[0].Label = "changed"
+	input.LeasedTaskIDs[0] = "changed"
+	first, _ := cache.Get("tk-node")
+	first.TK2SDDashboard.Accounts[0].Label = "other"
+	*first.TK2SDDashboard.Accounts[0].Credits = 0
+	first.TK2SDDashboard.LeasedTaskIDs[0] = "other"
+	listed := cache.List()
+	listed[0].TK2SDDashboard.Login.Status = "expired"
+	got, _ := cache.Get("tk-node")
+	if got.TK2SDDashboard.Accounts[0].Label != "1-1" || *got.TK2SDDashboard.Accounts[0].Credits != 80 || got.TK2SDDashboard.Login.Status != "valid" || got.TK2SDDashboard.LeasedTaskIDs[0] != "private-task" {
+		t.Fatalf("dashboard mutated through external copy: %+v", got.TK2SDDashboard)
+	}
+}
+
 func TestNewCacheSanitizesLastError(t *testing.T) {
 	tests := []struct {
 		code    string

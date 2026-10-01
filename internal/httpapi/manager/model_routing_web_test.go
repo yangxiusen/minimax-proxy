@@ -24,3 +24,39 @@ func TestModelRoutingAssetIsServed(t *testing.T) {
 		}
 	}
 }
+
+func TestManagerTaskTableShowsModelAndSearchesIt(t *testing.T) {
+	page, err := webAssets.ReadFile("web/manager.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := webAssets.ReadFile("web/manager.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(page), "<span>模型</span>") || !strings.Contains(string(page), "任务 ID / 客户 / 模型") {
+		t.Fatal("manager task table does not expose model or model search")
+	}
+	if !strings.Contains(string(js), "item.model ||") {
+		t.Fatal("task row does not display model")
+	}
+}
+
+func TestManagerTK2SDDashboardHasSeparateQueueAndAccountView(t *testing.T) {
+	js, err := webAssets.ReadFile("web/manager.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	styles, err := webAssets.ReadFile("web/styles.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"tk2sd_dashboard", "tk2sd_proxy_queued", "renderTK2SDDashboard", "Proxy 待派发", "上游排队", "待核实", "失败", "取消", "账号占用", "账号状态", "登录状态"} {
+		if !strings.Contains(string(js), value) {
+			t.Errorf("dashboard UI missing %q", value)
+		}
+	}
+	if !strings.Contains(string(styles), ".tk-dashboard") {
+		t.Fatal("dashboard layout missing")
+	}
+}

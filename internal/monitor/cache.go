@@ -57,6 +57,7 @@ type NodeSnapshot struct {
 	CurrentTask        *CurrentTaskSnapshot  `json:"current_task"`
 	LatestFinishedTask *FinishedTaskSnapshot `json:"latest_finished_task"`
 	LastError          *ErrorSnapshot        `json:"last_error"`
+	TK2SDDashboard     *TK2SDDashboard       `json:"-"`
 	Disabled           bool                  `json:"-"`
 	Applying           bool                  `json:"-"`
 	SchedulingBlocked  bool                  `json:"-"`
@@ -182,6 +183,18 @@ func cloneNode(node NodeSnapshot) NodeSnapshot {
 	if node.LastError != nil {
 		value := *node.LastError
 		node.LastError = &value
+	}
+	if node.TK2SDDashboard != nil {
+		value := *node.TK2SDDashboard
+		value.Accounts = append([]TK2SDAccount(nil), value.Accounts...)
+		value.LeasedTaskIDs = append([]string(nil), value.LeasedTaskIDs...)
+		for i := range value.Accounts {
+			if value.Accounts[i].Credits != nil {
+				credits := *value.Accounts[i].Credits
+				value.Accounts[i].Credits = &credits
+			}
+		}
+		node.TK2SDDashboard = &value
 	}
 	return node
 }

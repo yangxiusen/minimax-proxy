@@ -23,12 +23,12 @@
         <div class="filters">
           <label><span>状态</span><select id="status-filter"><option value="">全部</option><option value="queued">排队</option><option value="running">运行中</option><option value="succeeded">成功</option><option value="failed">失败</option><option value="cancelled">已取消</option></select></label>
           <label><span>实例</span><select id="upstream-filter"><option value="">全部</option></select></label>
-          <label class="search-control"><span>搜索</span><input id="search-filter" type="search" placeholder="任务 ID / 客户" autocomplete="off"></label>
+          <label class="search-control"><span>搜索</span><input id="search-filter" type="search" placeholder="任务 ID / 客户 / 模型" autocomplete="off"></label>
         </div>
       </div>
       <div class="table-scroll">
         <div class="task-table" role="table" aria-label="全部任务">
-          <div class="task-row task-head" role="row"><span>任务 ID</span><span>客户</span><span>状态</span><span>实例</span><span>方式</span><span>规格</span><span>耗时</span><span>创建时间</span><span>操作</span></div>
+          <div class="task-row task-head" role="row"><span>任务 ID</span><span>模型</span><span>客户</span><span>状态</span><span>实例</span><span>方式</span><span>规格</span><span>耗时</span><span>创建时间</span><span>操作</span></div>
           <div id="task-rows" class="task-rows"><p class="table-state">正在加载任务...</p></div>
         </div>
       </div>
@@ -103,7 +103,7 @@
           </div>
           <div id="official-node-fields" class="official-node-fields" hidden>
             <label><span>官方模型</span><input name="upstream_model" maxlength="128" value="MiniMax-H3" autocomplete="off"></label>
-            <label><span>并发数</span><input name="max_concurrency" type="number" min="1" max="100" value="1" inputmode="numeric"></label>
+            <label><span>并发任务数</span><input name="max_concurrency" type="number" min="1" max="100" value="1" inputmode="numeric"></label>
             <label class="toggle-control"><input name="replace_result_url" type="checkbox"><span>使用 UCloud 替换生成地址</span></label>
           </div>
           <label><span>API Key</span><input name="api_key" type="password" minlength="32" maxlength="32" pattern="[A-Za-z0-9]{32}" autocomplete="new-password" placeholder="编辑时留空表示沿用已保存 Key" required></label>

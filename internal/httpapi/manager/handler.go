@@ -463,6 +463,7 @@ func (h *handler) setSessionCookie(w http.ResponseWriter, value string, expires 
 type snapshotResponse struct {
 	UpdatedAt        int64           `json:"updated_at"`
 	StaleAfterSecond int64           `json:"stale_after_seconds"`
+	TK2SDProxyQueued *int            `json:"tk2sd_proxy_queued,omitempty"`
 	Summary          snapshotSummary `json:"summary"`
 	Upstreams        []upstreamDTO   `json:"upstreams"`
 }
@@ -475,26 +476,27 @@ type snapshotSummary struct {
 }
 
 type upstreamDTO struct {
-	ID                 string                     `json:"id"`
-	Address            string                     `json:"address"`
-	ProtocolVersion    string                     `json:"protocol_version"`
-	ActiveTasks        int                        `json:"active_tasks"`
-	MaxConcurrency     int                        `json:"max_concurrency"`
-	Enabled            bool                       `json:"enabled"`
-	Applying           bool                       `json:"applying"`
-	Health             monitorcache.HealthStatus  `json:"health"`
-	Runtime            monitorcache.RuntimeStatus `json:"runtime"`
-	PrivateQueue       *int                       `json:"private_queue"`
-	CPUPercent         *float64                   `json:"cpu_percent"`
-	MemoryPercent      *float64                   `json:"memory_percent"`
-	GPUPercent         *float64                   `json:"gpu_percent"`
-	VRAMPercent        *float64                   `json:"vram_percent"`
-	CheckedAt          int64                      `json:"checked_at"`
-	LastHealthyAt      int64                      `json:"last_healthy_at"`
-	UpdatedAt          int64                      `json:"updated_at"`
-	CurrentTask        *currentTaskDTO            `json:"current_task"`
-	LatestFinishedTask *finishedTaskDTO           `json:"latest_finished_task"`
-	LastError          *errorDTO                  `json:"last_error"`
+	ID                 string                       `json:"id"`
+	Address            string                       `json:"address"`
+	ProtocolVersion    string                       `json:"protocol_version"`
+	ActiveTasks        int                          `json:"active_tasks"`
+	MaxConcurrency     int                          `json:"max_concurrency"`
+	Enabled            bool                         `json:"enabled"`
+	Applying           bool                         `json:"applying"`
+	Health             monitorcache.HealthStatus    `json:"health"`
+	Runtime            monitorcache.RuntimeStatus   `json:"runtime"`
+	PrivateQueue       *int                         `json:"private_queue"`
+	CPUPercent         *float64                     `json:"cpu_percent"`
+	MemoryPercent      *float64                     `json:"memory_percent"`
+	GPUPercent         *float64                     `json:"gpu_percent"`
+	VRAMPercent        *float64                     `json:"vram_percent"`
+	CheckedAt          int64                        `json:"checked_at"`
+	LastHealthyAt      int64                        `json:"last_healthy_at"`
+	UpdatedAt          int64                        `json:"updated_at"`
+	CurrentTask        *currentTaskDTO              `json:"current_task"`
+	LatestFinishedTask *finishedTaskDTO             `json:"latest_finished_task"`
+	LastError          *errorDTO                    `json:"last_error"`
+	TK2SDDashboard     *monitorcache.TK2SDDashboard `json:"tk2sd_dashboard,omitempty"`
 }
 
 type currentTaskDTO struct {
@@ -518,6 +520,7 @@ type errorDTO struct {
 
 func (h *handler) snapshot(w http.ResponseWriter, r *http.Request) {
 	nodes := h.cache.List()
+	response := snapshotResponse{Upstreams: make([]upstreamDTO, 0, len(nodes))}
 	configuredNodes := make(map[string]domain.ModelNode)
 	if h.nodes != nil {
 		items, err := h.nodes.ListModelNodes(r.Context())
@@ -528,9 +531,19 @@ func (h *handler) snapshot(w http.ResponseWriter, r *http.Request) {
 		for _, node := range items {
 			configuredNodes[node.ID] = node
 		}
+		if queue, ok := h.nodes.(interface {
+			QueuedRemoteCount(context.Context) (int, error)
+		}); ok {
+			count, err := queue.QueuedRemoteCount(r.Context())
+			if err != nil {
+				h.internalError(w, r, err)
+				return
+			}
+			response.TK2SDProxyQueued = &count
+		}
 	}
 	staleAfter := int64((3*h.monitorInterval + time.Second - 1) / time.Second)
-	response := snapshotResponse{StaleAfterSecond: staleAfter, Upstreams: make([]upstreamDTO, 0, len(nodes))}
+	response.StaleAfterSecond = staleAfter
 	for _, node := range nodes {
 		item := upstreamDTO{
 			ID: node.ID, Address: node.Address, Enabled: !node.Disabled, Applying: node.Applying, Health: node.Health, Runtime: node.Runtime,
@@ -541,6 +554,9 @@ func (h *handler) snapshot(w http.ResponseWriter, r *http.Request) {
 		}
 		if configured, ok := configuredNodes[node.ID]; ok {
 			item.ProtocolVersion = configured.ProtocolVersion
+			if configured.ProtocolVersion == domain.ProtocolTK2SD {
+				item.TK2SDDashboard = node.TK2SDDashboard
+			}
 			if configured.UsesOfficialV2() || configured.ProtocolVersion == domain.ProtocolTK2SD {
 				if configured.MaxConcurrency > 0 {
 					item.MaxConcurrency = configured.MaxConcurrency

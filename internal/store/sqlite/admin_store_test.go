@@ -51,6 +51,32 @@ func TestListAdminTasksFiltersAcrossOwners(t *testing.T) {
 	}
 }
 
+func TestListAdminTasksSearchesModelSubstringsWithoutChangingIDPrefixSearch(t *testing.T) {
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 20, GlobalLimit: 100})
+	ctx := context.Background()
+	seedance := task("remote-task", "customer-a")
+	seedance.Model = "doubao-seedance-2-0-mini-260615"
+	for _, input := range []domain.NewTask{seedance, task("h3-task", "customer-b")} {
+		if _, err := store.Create(ctx, input, "", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		search string
+		want   string
+	}{
+		{"seedance-2-0", "remote-task"},
+		{"remote", "remote-task"},
+		{"customer-b", "h3-task"},
+		{"-2-0-", "remote-task"},
+	} {
+		items, total, err := store.ListAdminTasks(ctx, domain.AdminTaskFilter{Search: tc.search, PageNum: 1, PageSize: 10})
+		if err != nil || total != 1 || len(items) != 1 || items[0].TaskID != tc.want || items[0].Model == "" {
+			t.Fatalf("search %q: items=%+v total=%d err=%v", tc.search, items, total, err)
+		}
+	}
+}
+
 func TestListAdminTasksIncludesArtifactForPlaybackSigning(t *testing.T) {
 	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 20, GlobalLimit: 100})
 	ctx := context.Background()

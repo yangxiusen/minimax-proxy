@@ -29,6 +29,13 @@ type RemoteRun struct {
 	CreatedAt, UpdatedAt                        int64
 }
 
+// TK2SDAdmission is a recent account snapshot used only to bound new claims.
+type TK2SDAdmission struct {
+	Capacity, Occupied, Cooling, Queued int
+	CanDispatch                         bool
+	LeasedTaskIDs                       []string
+}
+
 type NodeAsset struct {
 	TaskID, NodeID                           string
 	ContentIndex                             int

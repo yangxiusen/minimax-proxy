@@ -20,6 +20,11 @@ type tkRuntimeStore interface {
 }
 type remoteDispatcher struct{ processor *remote.Processor }
 
+type tk2sdMonitorClient interface {
+	Health(context.Context) error
+	Dashboard(context.Context) (tk2sd.Dashboard, error)
+}
+
 func (d remoteDispatcher) ProcessOne(ctx context.Context) error {
 	err := d.processor.ProcessOne(ctx)
 	if errors.Is(err, domain.ErrRemotePending) {
@@ -42,6 +47,21 @@ func (f NodeRuntimeFactory) startTK2SD(parent context.Context, node domain.Model
 	}
 	client := tk2sd.NewClient(upstream.ServiceURL, key, &http.Client{Timeout: upstream.RequestTimeout}, 1<<20).WithLogger(f.Logger)
 	processor := &remote.Processor{Store: store, Client: client, Inputs: &remote.InputMaterializer{Store: store, Root: f.InputSpoolRoot, Timeout: upstream.RequestTimeout}, NodeID: node.ID, NodeVersion: node.Version, NodeURL: upstream.ServiceURL, Capacity: input.MaxConcurrency, PollInterval: input.PollInterval, Now: f.Now, Logger: f.Logger}
+	maxAge := upstream.RequestTimeout + monitorInterval(f.MonitorInterval)
+	processor.Admission = func() (domain.TK2SDAdmission, bool) {
+		snapshot, ok := f.Cache.Get(node.ID)
+		if !ok || snapshot.TK2SDDashboard == nil || snapshot.CheckedAt.IsZero() || snapshot.CheckedAt.Before(runtimeNow(f.Now).Add(-maxAge)) {
+			return domain.TK2SDAdmission{}, false
+		}
+		dashboard := snapshot.TK2SDDashboard
+		cooling := 0
+		for _, account := range dashboard.Accounts {
+			if account.Status == "cooldown" {
+				cooling++
+			}
+		}
+		return domain.TK2SDAdmission{Capacity: dashboard.Capacity, Occupied: dashboard.Occupied, Cooling: cooling, Queued: dashboard.Counts.Queued, CanDispatch: dashboard.Login.CanDispatch, LeasedTaskIDs: dashboard.LeasedTaskIDs}, true
+	}
 	ctx, cancel := context.WithCancel(parent)
 	wake := make(chan struct{}, 1)
 	done := make(chan struct{})
@@ -82,23 +102,8 @@ func (f NodeRuntimeFactory) startTK2SD(parent context.Context, node domain.Model
 		defer ticker.Stop()
 		for {
 			probeCtx, stop := context.WithTimeout(ctx, upstream.RequestTimeout)
-			err := client.Health(probeCtx)
+			f.probeTK2SD(probeCtx, node.ID, input.Enabled, client)
 			stop()
-			now := runtimeNow(f.Now)
-			f.Cache.Update(node.ID, func(s *monitor.NodeSnapshot) {
-				s.Applying = false
-				s.Disabled = !input.Enabled
-				s.CheckedAt = now
-				s.UpdatedAt = now
-				if err != nil {
-					s.Health = monitor.HealthUnhealthy
-					s.LastError = &monitor.ErrorSnapshot{Code: "tk2sd_api_unhealthy"}
-				} else {
-					s.Health = monitor.HealthHealthy
-					s.LastHealthyAt = now
-					s.LastError = nil
-				}
-			})
 			select {
 			case <-ctx.Done():
 				return
@@ -114,4 +119,39 @@ func (f NodeRuntimeFactory) startTK2SD(parent context.Context, node domain.Model
 		default:
 		}
 	}}, nil
+}
+
+func (f NodeRuntimeFactory) probeTK2SD(ctx context.Context, nodeID string, enabled bool, client tk2sdMonitorClient) {
+	healthErr := client.Health(ctx)
+	var dashboard tk2sd.Dashboard
+	var dashboardErr error
+	if healthErr == nil {
+		dashboard, dashboardErr = client.Dashboard(ctx)
+	}
+	now := runtimeNow(f.Now)
+	f.Cache.Update(nodeID, func(s *monitor.NodeSnapshot) {
+		s.Applying = false
+		s.Disabled = !enabled
+		s.CheckedAt = now
+		s.UpdatedAt = now
+		s.TK2SDDashboard = nil
+		if healthErr != nil {
+			s.Health = monitor.HealthUnhealthy
+			s.LastError = &monitor.ErrorSnapshot{Code: "tk2sd_api_unhealthy"}
+			return
+		}
+		s.Health = monitor.HealthHealthy
+		s.LastHealthyAt = now
+		s.LastError = nil
+		if dashboardErr == nil {
+			accounts := make([]monitor.TK2SDAccount, len(dashboard.Accounts))
+			for i, account := range dashboard.Accounts {
+				accounts[i] = monitor.TK2SDAccount{Label: account.Label, Status: account.Status, Credits: account.Credits}
+			}
+			s.TK2SDDashboard = &monitor.TK2SDDashboard{
+				Counts: monitor.TK2SDCounts(dashboard.Counts), Occupied: dashboard.Occupied, Capacity: dashboard.Capacity,
+				Accounts: accounts, Login: monitor.TK2SDLogin(dashboard.Login), LeasedTaskIDs: dashboard.LeasedTaskIDs,
+			}
+		}
+	})
 }

@@ -368,8 +368,8 @@ func (s *Store) ListAdminTasks(ctx context.Context, filter domain.AdminTaskFilte
 		args = append(args, filter.UpstreamID)
 	}
 	if filter.Search != "" {
-		conditions = append(conditions, "(instr(task_id, ?)=1 OR instr(api_key_id, ?)=1)")
-		args = append(args, filter.Search, filter.Search)
+		conditions = append(conditions, "(instr(task_id, ?)=1 OR instr(api_key_id, ?)=1 OR instr(model, ?)>0)")
+		args = append(args, filter.Search, filter.Search, filter.Search)
 	}
 	where := strings.Join(conditions, " AND ")
 	var total int

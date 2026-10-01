@@ -101,7 +101,7 @@ func (s *Store) UpdateModelNode(ctx context.Context, id string, expectedVersion 
 	if active > 0 && current.ProtocolVersion == domain.ProtocolTK2SD && input.ProtocolVersion == current.ProtocolVersion && input.ServiceURL == current.ServiceURL && input.LegacyModelCompat == current.LegacyModelCompat && input.APIKeyFingerprint != current.APIKeyFingerprint {
 		allowedWhileActive = true
 	}
-	if active > 0 && current.Enabled && input.Enabled && current.UsesOfficialV2() && input.UsesOfficialV2() && sameOfficialConnectionExceptCapacity(current.ModelNodeInput, input) && input.MaxConcurrency > current.MaxConcurrency {
+	if active > 0 && current.Enabled && input.Enabled && (current.UsesOfficialV2() || current.ProtocolVersion == domain.ProtocolTK2SD) && input.ProtocolVersion == current.ProtocolVersion && sameDirectConnectionExceptCapacity(current.ModelNodeInput, input) && input.MaxConcurrency > current.MaxConcurrency {
 		allowedWhileActive = true
 	}
 	if active > 0 && !allowedWhileActive {
@@ -254,7 +254,7 @@ func sameNodeConnection(left, right domain.ModelNodeInput) bool {
 	return true
 }
 
-func sameOfficialConnectionExceptCapacity(left, right domain.ModelNodeInput) bool {
+func sameDirectConnectionExceptCapacity(left, right domain.ModelNodeInput) bool {
 	return left.ServiceURL == right.ServiceURL && left.ProtocolVersion == right.ProtocolVersion &&
 		left.APIKeyFingerprint == right.APIKeyFingerprint && left.PollInterval == right.PollInterval && left.RequestTimeout == right.RequestTimeout &&
 		left.UpstreamModel == right.UpstreamModel && left.ReplaceResultURL == right.ReplaceResultURL

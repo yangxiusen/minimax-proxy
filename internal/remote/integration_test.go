@@ -43,6 +43,7 @@ type integrationJob struct {
 
 type integrationUpstream struct {
 	model                                                           string
+	nodeID                                                          string
 	actualDuration                                                  float64
 	t                                                               *testing.T
 	mu                                                              sync.Mutex
@@ -64,7 +65,7 @@ func newIntegrationUpstream(t *testing.T, modelID ...string) *integrationUpstrea
 	if len(modelID) > 0 {
 		model = modelID[0]
 	}
-	u := &integrationUpstream{t: t, model: model, actualDuration: 5.062, jobs: map[string]*integrationJob{}, assets: map[string][]byte{}}
+	u := &integrationUpstream{t: t, model: model, nodeID: "tk-integration", actualDuration: 5.062, jobs: map[string]*integrationJob{}, assets: map[string][]byte{}}
 	u.server = httptest.NewServer(http.HandlerFunc(u.serveHTTP))
 	t.Cleanup(u.server.Close)
 	return u
@@ -216,7 +217,7 @@ func (u *integrationUpstream) submit(w http.ResponseWriter, r *http.Request) {
 	// 在 HTTP 边界验证已提交的持久证据；这里若仍持有 SQLite 写事务，测试会超时。
 	run, err := u.store.GetRemoteRun(r.Context(), parts[2])
 	digest := sha256.Sum256(body)
-	if err != nil || run.Phase != domain.RemoteSubmitIntent || run.NodeID != "tk-integration" || run.SubmissionKey != key || run.RequestBodyJSON != string(body) || run.RequestBodyHash != hex.EncodeToString(digest[:]) || run.SubmitAttempts < 1 {
+	if err != nil || run.Phase != domain.RemoteSubmitIntent || run.NodeID != u.nodeID || run.SubmissionKey != key || run.RequestBodyJSON != string(body) || run.RequestBodyHash != hex.EncodeToString(digest[:]) || run.SubmitAttempts < 1 {
 		u.t.Error("HTTP create preceded durable intent", err, run.Phase)
 		w.WriteHeader(500)
 		return

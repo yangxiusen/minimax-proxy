@@ -207,7 +207,7 @@ function nodeCapacityText(node) {
   return `${active} / ${maximum}`;
 }
 
-function renderNodes(upstreams) {
+function renderNodes(upstreams, proxyQueued) {
   if (!upstreams.length) {
     state.selectedNodeID = "";
     elements.nodeList.replaceChildren(makeElement("p", "inline-state", "暂无私有实例"));
@@ -221,16 +221,16 @@ function renderNodes(upstreams) {
     button.append(
       makeElement("span", "node-name", node.id || "未命名实例"),
       makeElement("span", `node-state summary-${node.health || "unknown"}`, `● ${nodeStatusText(node)}`),
-      makeElement("span", "node-meta", node.protocol_version === "tk2sd-v1" ? `tk2sd 节点 · ${nodeCapacityText(node)}` : node.protocol_version === "minimax-v2" ? `官方节点 · ${nodeCapacityText(node)}` : node.private_queue == null ? "私有队列未知" : `私有队列 ${node.private_queue}`)
+      makeElement("span", "node-meta", node.protocol_version === "tk2sd-v1" ? `tk2sd 节点 · ${nodeCapacityText(node)}${node.tk2sd_dashboard ? ` · 排队 ${node.tk2sd_dashboard.counts.queued}` : ""}` : node.protocol_version === "minimax-v2" ? `官方节点 · ${nodeCapacityText(node)}` : node.private_queue == null ? "私有队列未知" : `私有队列 ${node.private_queue}`)
     );
     button.addEventListener("click", () => {
       state.selectedNodeID = node.id;
-      renderNodes(upstreams);
+      renderNodes(upstreams, proxyQueued);
     });
     return button;
   });
   elements.nodeList.replaceChildren(...buttons);
-  renderNodeDetail(upstreams.find((item) => item.id === state.selectedNodeID));
+  renderNodeDetail(upstreams.find((item) => item.id === state.selectedNodeID), proxyQueued);
 }
 
 function metric(name, rawValue) {
@@ -305,7 +305,53 @@ function renderRecent(node) {
   return recent;
 }
 
-function renderNodeDetail(node) {
+function renderTK2SDDashboard(node, proxyQueued) {
+  const section = makeElement("section", "tk-dashboard");
+  section.append(makeElement("h4", "tk-dashboard-title", "tk2sd 队列与账号"));
+  const proxy = makeElement("div", "tk-proxy-queue");
+  proxy.append(makeElement("span", "muted", "Proxy 待派发（tk2sd 全局）"), makeElement("strong", "", proxyQueued == null ? "--" : String(proxyQueued)));
+  section.append(proxy);
+  const dashboard = node.tk2sd_dashboard;
+  if (!dashboard) {
+    section.append(makeElement("p", "muted", "上游统计暂不可用"));
+    return section;
+  }
+  const loginLabels = { valid: "已登录", checking: "检查中", expired: "已失效", login_required: "需要登录", disabled: "未启用监测", unknown: "未知" };
+  const login = makeElement("div", "tk-login");
+  login.append(makeElement("span", "muted", "登录状态"), statusPill(dashboard.login.can_dispatch ? "healthy" : "queued", `${loginLabels[dashboard.login.status] || "未知"} · ${dashboard.login.can_dispatch ? "可派发" : "不可派发"}`));
+  section.append(login);
+  const counts = dashboard.counts || {};
+  const stats = makeElement("div", "tk-stats");
+  [
+    ["生成中", counts.running], ["上游排队", counts.queued], ["已完成", counts.succeeded],
+    ["待核实", counts.uncertain], ["失败", counts.failed], ["取消", counts.canceled],
+    ["账号占用", `${dashboard.occupied} / ${dashboard.capacity}`]
+  ].forEach(([label, value]) => {
+    const stat = makeElement("div", "tk-stat");
+    stat.append(makeElement("span", "box-label", label), makeElement("strong", "", String(value)));
+    stats.append(stat);
+  });
+  section.append(stats);
+  const accounts = makeElement("div", "tk-accounts");
+  accounts.append(makeElement("h4", "tk-accounts-title", "账号状态"));
+  const list = makeElement("div", "tk-account-list");
+  const accountLabels = { occupied: "占用", cooldown: "冷却中", idle: "空闲" };
+  (dashboard.accounts || []).forEach((account) => {
+    const row = makeElement("div", "tk-account-row");
+    row.append(
+      makeElement("span", "", account.label || "--"),
+      makeElement("span", "", accountLabels[account.status] || "未知"),
+      makeElement("span", "", account.credits == null ? "额度未查询" : `额度 ${account.credits}`)
+    );
+    list.append(row);
+  });
+  if (!list.childElementCount) list.append(makeElement("p", "muted", "暂无账号"));
+  accounts.append(list);
+  section.append(accounts);
+  return section;
+}
+
+function renderNodeDetail(node, proxyQueued) {
   if (!node) return;
   const head = makeElement("div", "detail-head");
   const identity = makeElement("div");
@@ -314,10 +360,16 @@ function renderNodeDetail(node) {
     makeElement("div", "detail-subtitle", `${node.address || "地址未知"} · 最后检查 ${localTime(node.checked_at)}`)
   );
   head.append(identity, statusPill(node.enabled === false ? "idle" : node.applying ? "queued" : node.health, nodeStatusText(node)));
-  if (node.protocol_version === "minimax-v2" || node.protocol_version === "tk2sd-v1") {
+  if (node.protocol_version === "minimax-v2") {
     const capacity = makeElement("div", "official-capacity");
     capacity.append(makeElement("span", "box-label", "运行任务"), makeElement("strong", "official-capacity-value", nodeCapacityText(node)));
     elements.nodeDetail.replaceChildren(head, capacity);
+    return;
+  }
+  if (node.protocol_version === "tk2sd-v1") {
+    const capacity = makeElement("div", "official-capacity");
+    capacity.append(makeElement("span", "box-label", "Proxy 运行任务"), makeElement("strong", "official-capacity-value", nodeCapacityText(node)));
+    elements.nodeDetail.replaceChildren(head, capacity, renderTK2SDDashboard(node, proxyQueued));
     return;
   }
   const metrics = makeElement("div", "metrics");
@@ -331,7 +383,7 @@ function renderSnapshot(snapshot) {
   const upstreams = Array.isArray(snapshot.upstreams) ? snapshot.upstreams : [];
   renderHealthSummary(snapshot.summary || {});
   updateUpstreamOptions(upstreams);
-  renderNodes(upstreams);
+  renderNodes(upstreams, snapshot.tk2sd_proxy_queued);
   setFreshness(snapshot, false);
 }
 
@@ -403,8 +455,11 @@ function renderTasks(response) {
       actions.append(retry);
     }
     if (!actions.childElementCount) actions.append(makeElement("span", "muted", "--"));
+    const model = makeElement("span", "task-model", item.model || "--");
+    model.title = item.model ? `${item.model}${item.protocol_version ? ` · ${item.protocol_version}` : ""}` : "未记录模型";
     row.append(
       makeElement("span", "", item.id || "--"),
+      model,
       makeElement("span", "", item.api_key_id || "--"),
       statusPill(item.status, phaseLabel || statusLabels[item.status]),
       makeElement("span", "", item.upstream_id || "--"),
@@ -603,6 +658,7 @@ function syncNodeProtocolFields() {
   elements.officialNodeFields.querySelectorAll("input").forEach((input) => { input.disabled = !official || state.nodeBusy; });
   formField("upstream_model").required = official;
   formField("max_concurrency").required = official;
+  formField("max_concurrency").title = formField("protocol_version").value === "tk2sd-v1" ? "tk2sd 按账号处理任务；请依据可用账号和额度设置并发数" : "同一节点同时执行的任务上限";
   const key = formField("api_key");
   key.minLength = official ? 1 : 32;
   key.maxLength = official ? 512 : 32;

@@ -138,6 +138,14 @@ func processorFixture(t *testing.T) (*Processor, *sqlite.Store, *sql.DB, domain.
 	return p, s, db, task, f
 }
 
+func TestProcessOneRequiresFreshAdmissionWhenConfigured(t *testing.T) {
+	p, _, _, _, _ := processorFixture(t)
+	p.Admission = func() (domain.TK2SDAdmission, bool) { return domain.TK2SDAdmission{}, false }
+	if err := p.ProcessOne(context.Background()); !errors.Is(err, domain.ErrUpstreamBusy) {
+		t.Fatalf("missing dashboard admitted task: %v", err)
+	}
+}
+
 func TestSubmitUnknownRecoveryUsesPersistedBodyAndNamespace(t *testing.T) {
 	p, s, db, task, f := processorFixture(t)
 	ctx := context.Background()

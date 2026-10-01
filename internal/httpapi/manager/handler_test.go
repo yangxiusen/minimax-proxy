@@ -1073,6 +1073,41 @@ func TestSnapshotIncludesOfficialNodeProtocolAndCapacity(t *testing.T) {
 	}
 }
 
+func TestSnapshotIncludesSanitizedTK2SDDashboardOnlyOnTKNode(t *testing.T) {
+	updated := time.Unix(2_000_000_100, 0)
+	cache := monitorcache.NewCache([]monitorcache.NodeSnapshot{
+		{ID: "tk-1", Health: monitorcache.HealthHealthy, UpdatedAt: updated, TK2SDDashboard: &monitorcache.TK2SDDashboard{
+			Counts: monitorcache.TK2SDCounts{Running: 2, Queued: 3, Failed: 1}, Occupied: 1, Capacity: 1,
+			Accounts: []monitorcache.TK2SDAccount{{Label: "1-1", Status: "occupied"}},
+			Login:    monitorcache.TK2SDLogin{Status: "valid", CanDispatch: true},
+		}},
+		{ID: "h3-1", Health: monitorcache.HealthHealthy, UpdatedAt: updated, TK2SDDashboard: &monitorcache.TK2SDDashboard{Capacity: 999}},
+	})
+	nodes := &nodeStoreStub{items: []domain.ModelNode{
+		{ModelNodeInput: domain.ModelNodeInput{ID: "tk-1", ProtocolVersion: domain.ProtocolTK2SD, MaxConcurrency: 2}},
+		{ModelNodeInput: domain.ModelNodeInput{ID: "h3-1", ProtocolVersion: domain.ProtocolH3, MaxConcurrency: 1}},
+	}, queuedRemote: 4}
+	h := testHandler(Dependencies{Admin: config.AdminConfig{Username: "a", Password: "b", SessionTTL: time.Hour}, Cache: cache, Nodes: nodes})
+	cookie := login(t, h, "a", "b", "198.51.100.3:1")
+	response := serve(h, http.MethodGet, "/manager/api/snapshot", "", "", cookie, "198.51.100.3:1", false)
+	var body struct {
+		ProxyQueued *int `json:"tk2sd_proxy_queued"`
+		Upstreams   []struct {
+			ID        string                       `json:"id"`
+			Dashboard *monitorcache.TK2SDDashboard `json:"tk2sd_dashboard"`
+		} `json:"upstreams"`
+	}
+	decodeResponse(t, response, &body)
+	if response.Code != http.StatusOK || body.ProxyQueued == nil || *body.ProxyQueued != 4 || len(body.Upstreams) != 2 || body.Upstreams[0].Dashboard != nil || body.Upstreams[1].Dashboard == nil || body.Upstreams[1].Dashboard.Counts.Queued != 3 {
+		t.Fatalf("snapshot status=%d body=%+v", response.Code, body)
+	}
+	for _, secret := range []string{"private-account", "private-task", "session_file_present", "browser_error"} {
+		if strings.Contains(response.Body.String(), secret) {
+			t.Fatalf("snapshot leaked %q", secret)
+		}
+	}
+}
+
 func TestTasksValidatesFiltersAndReturnsMinimalShape(t *testing.T) {
 	created := time.Unix(2_000_000_000, 0)
 	started := created.Add(10 * time.Minute)

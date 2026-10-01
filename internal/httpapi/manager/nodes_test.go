@@ -15,19 +15,20 @@ import (
 )
 
 type nodeStoreStub struct {
-	mu          sync.Mutex
-	items       []domain.ModelNode
-	created     domain.ModelNodeInput
-	updatedID   string
-	updatedVer  int64
-	updated     domain.ModelNodeInput
-	deletedID   string
-	deletedVer  int64
-	createErr   error
-	updateErr   error
-	deleteErr   error
-	createCalls int
-	activeTasks map[string]int
+	mu           sync.Mutex
+	items        []domain.ModelNode
+	created      domain.ModelNodeInput
+	updatedID    string
+	updatedVer   int64
+	updated      domain.ModelNodeInput
+	deletedID    string
+	deletedVer   int64
+	createErr    error
+	updateErr    error
+	deleteErr    error
+	createCalls  int
+	activeTasks  map[string]int
+	queuedRemote int
 }
 
 func (s *nodeStoreStub) ListModelNodes(context.Context) ([]domain.ModelNode, error) {
@@ -40,6 +41,10 @@ func (s *nodeStoreStub) ActiveOfficialCount(_ context.Context, nodeID string) (i
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.activeTasks[nodeID], nil
+}
+
+func (s *nodeStoreStub) QueuedRemoteCount(context.Context) (int, error) {
+	return s.queuedRemote, nil
 }
 
 func TestTK2SDNodeCapacityAndActiveTasksVisibleInManager(t *testing.T) {

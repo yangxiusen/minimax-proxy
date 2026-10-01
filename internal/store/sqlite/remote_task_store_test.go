@@ -135,6 +135,103 @@ func TestRemoteClaimScansBothQueueStatesAndWholeCapability(t *testing.T) {
 	}
 }
 
+func TestTK2SDCapacityCanIncreaseWithActiveTaskButCannotDecrease(t *testing.T) {
+	s, _ := remoteFixture(t)
+	ctx := context.Background()
+	node, err := s.GetModelNode(ctx, "remote-node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := node.ModelNodeInput
+	input.MaxConcurrency = 3
+	updated, err := s.UpdateModelNode(ctx, node.ID, node.Version, input)
+	if err != nil || updated.MaxConcurrency != 3 {
+		t.Fatalf("increase with active task: %+v %v", updated, err)
+	}
+	remoteQueued(t, s, "parallel-2", "seed-model", "queued_open", 5)
+	remoteQueued(t, s, "parallel-3", "seed-model", "queued_open", 5)
+	remoteQueued(t, s, "waiting", "seed-model", "queued_open", 5)
+	for _, want := range []string{"parallel-2", "parallel-3"} {
+		claimed, err := s.ClaimNextRemote(ctx, node.ID, updated.Version, updated.MaxConcurrency)
+		if err != nil || claimed.TaskID != want {
+			t.Fatalf("claim %q: %+v %v", want, claimed, err)
+		}
+	}
+	if _, err := s.ClaimNextRemote(ctx, node.ID, updated.Version, updated.MaxConcurrency); !errors.Is(err, domain.ErrUpstreamBusy) {
+		t.Fatalf("capacity exceeded: %v", err)
+	}
+	input.MaxConcurrency = 2
+	if _, err := s.UpdateModelNode(ctx, node.ID, updated.Version, input); !errors.Is(err, domain.ErrNodeHasActiveTask) {
+		t.Fatalf("decrease with active task: %v", err)
+	}
+	input.MaxConcurrency = 4
+	input.ServiceURL = "https://other-node.example"
+	if _, err := s.UpdateModelNode(ctx, node.ID, updated.Version, input); !errors.Is(err, domain.ErrNodeHasActiveTask) {
+		t.Fatalf("connection change with active task: %v", err)
+	}
+}
+
+func TestTK2SDAdmissionCountsExternalAccountsAndUnaccountedProxyReservations(t *testing.T) {
+	s, _ := remoteFixture(t)
+	ctx := context.Background()
+	v23Exec(t, s.db, `UPDATE model_service_nodes SET max_concurrency=5 WHERE id='remote-node'`)
+	remoteQueued(t, s, "next", "seed-model", "queued_open", 5)
+	remoteQueued(t, s, "later", "seed-model", "queued_open", 5)
+	full := domain.TK2SDAdmission{Capacity: 3, Occupied: 2, CanDispatch: true, LeasedTaskIDs: []string{"external-a", "external-b"}}
+	if _, err := s.ClaimNextRemote(ctx, "remote-node", 1, 5, full); !errors.Is(err, domain.ErrUpstreamBusy) {
+		t.Fatalf("external occupancy plus pending Proxy task should fill accounts: %v", err)
+	}
+	v23Exec(t, s.db, `UPDATE task_remote_runs SET upstream_task_id='owned' WHERE task_id='remote-task'`)
+	full.LeasedTaskIDs = []string{"external-a", "owned"}
+	got, err := s.ClaimNextRemote(ctx, "remote-node", 1, 5, full)
+	if err != nil || got.TaskID != "next" {
+		t.Fatalf("one free account should claim next: %+v %v", got, err)
+	}
+	if _, err := s.ClaimNextRemote(ctx, "remote-node", 1, 5, full); !errors.Is(err, domain.ErrUpstreamBusy) {
+		t.Fatalf("unaccounted new reservation overfilled node: %v", err)
+	}
+	full.Queued = 1
+	full.Occupied = 0
+	full.LeasedTaskIDs = nil
+	if _, err := s.ClaimNextRemote(ctx, "remote-node", 1, 5, full); !errors.Is(err, domain.ErrUpstreamBusy) {
+		t.Fatalf("upstream backlog should keep later task in Proxy: %v", err)
+	}
+	full.Queued = 0
+	full.CanDispatch = false
+	if _, err := s.ClaimNextRemote(ctx, "remote-node", 1, 5, full); !errors.Is(err, domain.ErrUpstreamBusy) {
+		t.Fatalf("invalid login should keep later task in Proxy: %v", err)
+	}
+}
+
+func TestTK2SDProxyQueueCountsOnlyUnassignedLiveTasks(t *testing.T) {
+	s, _ := remoteFixture(t)
+	ctx := context.Background()
+	remoteQueued(t, s, "waiting", "seed-model", "queued_open", 5)
+	remoteQueued(t, s, "expired", "seed-model", "queued_locked", 5)
+	remoteQueued(t, s, "deleted", "seed-model", "queued_open", 5)
+	v23Exec(t, s.db, `UPDATE video_tasks SET expires_at=1 WHERE task_id='expired'`)
+	v23Exec(t, s.db, `UPDATE video_tasks SET deleted_at=1 WHERE task_id='deleted'`)
+	count, err := s.QueuedRemoteCount(ctx)
+	if err != nil || count != 1 {
+		t.Fatalf("Proxy queue count=%d err=%v, want 1", count, err)
+	}
+}
+
+func TestTK2SDAdmissionExcludesCoolingAccounts(t *testing.T) {
+	s, _ := remoteFixture(t)
+	ctx := context.Background()
+	v23Exec(t, s.db, `UPDATE model_service_nodes SET max_concurrency=5 WHERE id='remote-node'`)
+	remoteQueued(t, s, "waiting", "seed-model", "queued_open", 5)
+	admission := domain.TK2SDAdmission{Capacity: 3, Occupied: 1, Cooling: 1, CanDispatch: true, LeasedTaskIDs: []string{"external-a"}}
+	if _, err := s.ClaimNextRemote(ctx, "remote-node", 1, 5, admission); !errors.Is(err, domain.ErrUpstreamBusy) {
+		t.Fatalf("cooling account is not dispatchable: %v", err)
+	}
+	admission.Cooling = 0
+	if got, err := s.ClaimNextRemote(ctx, "remote-node", 1, 5, admission); err != nil || got.TaskID != "waiting" {
+		t.Fatalf("available account should claim waiting task: %+v %v", got, err)
+	}
+}
+
 func TestRemoteClaimRejectsChangedConnectionButRecoveryDoesNot(t *testing.T) {
 	s, task := remoteFixture(t)
 	ctx := context.Background()

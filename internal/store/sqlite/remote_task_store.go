@@ -27,7 +27,7 @@ func (s *Store) GetRemoteRun(ctx context.Context, taskID string) (domain.RemoteR
 	return scanRemoteRun(s.db.QueryRowContext(ctx, remoteRunSelect+` WHERE task_id=?`, taskID))
 }
 
-func (s *Store) ClaimNextRemote(ctx context.Context, nodeID string, nodeVersion int64, capacity int) (task domain.Task, err error) {
+func (s *Store) ClaimNextRemote(ctx context.Context, nodeID string, nodeVersion int64, capacity int, admission ...domain.TK2SDAdmission) (task domain.Task, err error) {
 	if capacity < 1 {
 		return task, domain.ErrUpstreamBusy
 	}
@@ -49,6 +49,47 @@ func (s *Store) ClaimNextRemote(ctx context.Context, nodeID string, nodeVersion 
 	var active int
 	if err = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM video_tasks WHERE upstream_id=? AND upstream_slot_active=1`, nodeID).Scan(&active); err != nil {
 		return task, err
+	}
+	if len(admission) > 1 {
+		return task, domain.ErrStateConflict
+	}
+	if len(admission) == 1 {
+		status := admission[0]
+		if !status.CanDispatch || status.Queued > 0 || status.Capacity < 1 || status.Occupied < 0 || status.Cooling < 0 || status.Occupied+status.Cooling > status.Capacity {
+			return task, domain.ErrUpstreamBusy
+		}
+		leased := make(map[string]bool, len(status.LeasedTaskIDs))
+		for _, id := range status.LeasedTaskIDs {
+			if id != "" {
+				leased[id] = true
+			}
+		}
+		rows, err := conn.QueryContext(ctx, `SELECT COALESCE(r.upstream_task_id,'') FROM video_tasks t LEFT JOIN task_remote_runs r ON r.task_id=t.task_id WHERE t.upstream_id=? AND t.upstream_slot_active=1`, nodeID)
+		if err != nil {
+			return task, err
+		}
+		overlap := 0
+		for rows.Next() {
+			var id string
+			if err = rows.Scan(&id); err != nil {
+				break
+			}
+			if leased[id] {
+				overlap++
+			}
+		}
+		readErr := rows.Err()
+		rows.Close()
+		if err != nil {
+			return task, err
+		}
+		if readErr != nil {
+			return task, readErr
+		}
+		if overlap > status.Occupied {
+			return task, domain.ErrUpstreamBusy
+		}
+		capacity = min(capacity, status.Capacity-status.Occupied-status.Cooling+overlap)
 	}
 	if active >= capacity {
 		return task, domain.ErrUpstreamBusy
@@ -111,6 +152,12 @@ func (s *Store) ClaimNextRemote(ctx context.Context, nodeID string, nodeVersion 
 		return task, err
 	}
 	return getWith(ctx, conn, owner, taskID, now)
+}
+
+func (s *Store) QueuedRemoteCount(ctx context.Context) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM video_tasks WHERE protocol_version='tk2sd-v1' AND status IN ('queued_open','queued_locked') AND upstream_slot_active=0 AND deleted_at IS NULL AND expires_at>?`, s.nowUnix()).Scan(&count)
+	return count, err
 }
 
 func (s *Store) ListActiveRemoteTasks(ctx context.Context, nodeID string) ([]domain.Task, error) {
