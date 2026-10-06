@@ -172,6 +172,7 @@ func (a *ResultAccess) Download(ctx context.Context, task domain.Task, destinati
 	if maxBytes <= 0 || maxBytes > 2<<30 {
 		maxBytes = 2 << 30
 	}
+	ctx = logsafe.WithTask(ctx, task.TaskID, run.NodeID)
 	return client.Download(ctx, run.UpstreamTaskID, destination, maxBytes)
 }
 

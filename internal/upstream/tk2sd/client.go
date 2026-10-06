@@ -38,6 +38,7 @@ const (
 var (
 	ErrInvalidRequest  = errors.New("tk2sd: invalid request")
 	ErrInvalidResponse = errors.New("tk2sd: invalid response")
+	ErrIncompleteVideo = errors.New("tk2sd: incomplete video response")
 	ErrBodyTooLarge    = errors.New("tk2sd: body exceeds limit")
 	ErrUnsafeURL       = errors.New("tk2sd: unsafe media URL")
 	ErrUploadSource    = errors.New("tk2sd: upload source failed or empty")

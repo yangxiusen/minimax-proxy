@@ -11,6 +11,7 @@ import (
 	"minimax-h3-tc/internal/domain"
 	"minimax-h3-tc/internal/logsafe"
 	"minimax-h3-tc/internal/objectstore"
+	"minimax-h3-tc/internal/upstream/tk2sd"
 )
 
 type Store interface {
@@ -116,6 +117,8 @@ func (w Worker) ProcessOne(ctx context.Context) error {
 	filePath := file.Name()
 	_ = file.Close()
 	defer os.Remove(filePath)
+	w.logger().InfoContext(ctx, "开始下载结果视频", "stage", "result_delivery", "task_id", job.TaskID, "round", job.RoundNo, "attempt", job.AttemptNo, "max_attempts", job.MaxAttempts, "operation_timeout", config.RequestTimeout.String())
+	started := time.Now()
 	var bytesDownloaded int64
 	if w.TaskDownloader != nil {
 		bytesDownloaded, err = w.TaskDownloader.DownloadTask(operationCtx, job.TaskID, filePath)
@@ -123,8 +126,15 @@ func (w Worker) ProcessOne(ctx context.Context) error {
 		bytesDownloaded, err = w.Downloader.Download(operationCtx, sourceURL, filePath)
 	}
 	if err != nil {
+		var upstreamError *tk2sd.HTTPError
+		if errors.As(err, &upstreamError) {
+			w.logger().WarnContext(ctx, "结果视频下载失败", "stage", "result_delivery", "task_id", job.TaskID, "round", job.RoundNo, "attempt", job.AttemptNo, "http_status", upstreamError.StatusCode, "error_class", upstreamError.Class, "elapsed", time.Since(started).String(), "error_reason", logsafe.Error(err))
+		} else {
+			w.logger().WarnContext(ctx, "结果视频下载失败", "stage", "result_delivery", "task_id", job.TaskID, "round", job.RoundNo, "attempt", job.AttemptNo, "elapsed", time.Since(started).String(), "error_reason", logsafe.Error(err))
+		}
 		return w.fail(ctx, job, lease, "result_download_failed", "官方结果视频下载失败", retryableDownload(err), err)
 	}
+	w.logger().InfoContext(ctx, "结果视频下载完成，开始上传对象存储", "stage", "result_delivery", "task_id", job.TaskID, "round", job.RoundNo, "attempt", job.AttemptNo, "bytes_downloaded", bytesDownloaded, "download_elapsed", time.Since(started).String())
 	publicURL, err := store.UploadFile(operationCtx, filePath, job.ObjectKey, "video/mp4")
 	if err != nil {
 		return w.failObjectStore(ctx, job, lease, err)
@@ -153,11 +163,26 @@ func (w Worker) fail(ctx context.Context, job domain.ResultUploadJob, lease, cod
 	if err := w.Store.FailResultUploadAttempt(ctx, job.ID, lease, code, message, retryable, next); err != nil {
 		return errors.Join(cause, err)
 	}
-	w.logger().WarnContext(ctx, "结果上传尝试失败", "stage", "result_delivery", "task_id", job.TaskID, "attempt", job.AttemptNo, "error_code", code, "error_reason", logsafe.Error(cause))
+	automaticRetry := retryable && job.AttemptNo < job.MaxAttempts
+	var nextAttempt any
+	if automaticRetry {
+		nextAttempt = next
+	}
+	w.logger().WarnContext(ctx, "结果上传尝试失败", "stage", "result_delivery", "task_id", job.TaskID, "round", job.RoundNo, "attempt", job.AttemptNo, "max_attempts", job.MaxAttempts, "automatic_retry", automaticRetry, "next_attempt_at", nextAttempt, "error_code", code, "error_reason", logsafe.Error(cause))
 	return nil
 }
 
 func retryableDownload(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if errors.Is(err, tk2sd.ErrIncompleteVideo) {
+		return true
+	}
+	var upstreamError *tk2sd.HTTPError
+	if errors.As(err, &upstreamError) {
+		return upstreamError.Class == tk2sd.ErrorTemporary || upstreamError.Class == tk2sd.ErrorTransport || upstreamError.StatusCode == 409
+	}
 	var downloadError *DownloadError
 	if errors.As(err, &downloadError) {
 		return downloadError.Retryable

@@ -42,7 +42,7 @@ import (
 	"minimax-h3-tc/internal/upstream/tk2sd"
 )
 
-const defaultLogDir = "/var/log/minimax-proxy"
+const defaultLogDir = "/app/logs"
 
 func main() {
 	configPath := flag.String("config", configPathDefault(), "YAML 配置文件路径")

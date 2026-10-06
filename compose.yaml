@@ -17,4 +17,4 @@ services:
     volumes:
       - ./config.docker.yaml:/app/config.yaml:ro
       - ./data:/data
-      - ./logs:/var/log/minimax-proxy
+      - ./logs:/app/logs

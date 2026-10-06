@@ -10,14 +10,14 @@ RUN CGO_ENABLED=0 go test ./... && \
 FROM alpine:3.22
 RUN apk add --no-cache ca-certificates su-exec tzdata && \
     addgroup -S app && adduser -S -G app app && \
-    mkdir -p /data /var/log/minimax-proxy && chown app:app /data /var/log/minimax-proxy
+    mkdir -p /data /app/logs && chown app:app /data /app/logs
 WORKDIR /app
 COPY --from=builder /out/server /app/server
 COPY --from=builder /out/healthcheck /app/healthcheck
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
 EXPOSE 18080
-VOLUME ["/data", "/var/log/minimax-proxy"]
+VOLUME ["/data", "/app/logs"]
 HEALTHCHECK --interval=10s --timeout=3s --retries=3 CMD ["/app/healthcheck", "-address", "127.0.0.1:18080"]
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["/app/server", "-config", "/app/config.yaml"]

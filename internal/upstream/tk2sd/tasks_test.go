@@ -1,9 +1,12 @@
 package tk2sd
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/netip"
 	"os"
@@ -191,6 +194,46 @@ func TestDownloadFailurePreservesExistingDestination(t *testing.T) {
 	data, _ := os.ReadFile(dst)
 	if string(data) != "original" {
 		t.Fatal("existing destination lost")
+	}
+}
+
+func TestDownloadLogsFailureReasonWithoutCredentials(t *testing.T) {
+	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, "private response")
+	})
+	var output bytes.Buffer
+	c.logger = slog.New(slog.NewJSONHandler(&output, nil))
+	if _, err := c.Download(context.Background(), taskID, filepath.Join(t.TempDir(), "video.mp4"), 1024); err == nil {
+		t.Fatal("expected invalid media type")
+	}
+	log := output.String()
+	for _, value := range []string{"节点视频下载开始", "节点视频响应校验失败", `"reason":"invalid_content_type"`, `"status_code":200`} {
+		if !strings.Contains(log, value) {
+			t.Fatalf("missing %s: %s", value, log)
+		}
+	}
+	for _, secret := range []string{"test-secret", "private response"} {
+		if strings.Contains(log, secret) {
+			t.Fatalf("secret leaked: %s", log)
+		}
+	}
+}
+
+func TestDownloadTruncatedVideoIsRetryableWithoutSavingPartialFile(t *testing.T) {
+	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Content-Length", "10")
+		_, _ = io.WriteString(w, "short")
+	})
+	dir := t.TempDir()
+	_, err := c.Download(context.Background(), taskID, filepath.Join(dir, "video.mp4"), 1024)
+	if !errors.Is(err, ErrIncompleteVideo) {
+		t.Fatalf("truncated download = %v", err)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 0 {
+		t.Fatalf("partial video remains: %v", entries)
 	}
 }
 

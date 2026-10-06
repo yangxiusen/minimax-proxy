@@ -12,6 +12,7 @@ import (
 
 	"minimax-h3-tc/internal/domain"
 	"minimax-h3-tc/internal/objectstore"
+	"minimax-h3-tc/internal/upstream/tk2sd"
 )
 
 func TestWorkerCompletesUploadWithPublicURL(t *testing.T) {
@@ -63,6 +64,41 @@ func TestWorkerLogsDoNotExposeSourceURL(t *testing.T) {
 	output := logs.String()
 	if strings.Contains(output, "origin.example") || strings.Contains(output, "private-token") || !strings.Contains(output, "[redacted-url]") {
 		t.Fatalf("unsafe log output: %s", output)
+	}
+}
+
+func TestWorkerRetriesTemporaryNodeDownloadAndLogsStages(t *testing.T) {
+	var logs bytes.Buffer
+	store := &deliveryStoreFake{job: domain.ResultUploadJob{ID: "job-1", TaskID: "task-1", RoundNo: 1, AttemptNo: 1, MaxAttempts: 3}, config: domain.ObjectStorageConfig{RequestTimeout: time.Minute}}
+	worker := Worker{
+		Store: store, Secrets: secretFake{}, Downloader: downloadFake{err: &tk2sd.HTTPError{StatusCode: 503, Class: tk2sd.ErrorTemporary}},
+		ObjectStoreFactory: func(domain.ObjectStorageConfig, string, string) (objectstore.Store, error) { return uploadFake{}, nil },
+		Logger:             slog.New(slog.NewJSONHandler(&logs, nil)),
+		Now:                func() time.Time { return time.Date(2033, 5, 18, 0, 0, 0, 0, time.UTC) },
+	}
+	if err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !store.retryable || store.failedCode != "result_download_failed" || !store.next.Equal(worker.now().Add(time.Second)) {
+		t.Fatalf("retryable=%v code=%q next=%s", store.retryable, store.failedCode, store.next)
+	}
+	for _, text := range []string{"开始下载结果视频", "结果视频下载失败", `"http_status":503`, `"automatic_retry":true`, `"task_id":"task-1"`} {
+		if !strings.Contains(logs.String(), text) {
+			t.Fatalf("missing %s: %s", text, logs.String())
+		}
+	}
+}
+
+func TestWorkerDoesNotRetryPermanentNodeDownload(t *testing.T) {
+	for _, err := range []error{&tk2sd.HTTPError{StatusCode: 403, Class: tk2sd.ErrorAuthentication}, tk2sd.ErrInvalidResponse} {
+		if retryableDownload(err) {
+			t.Fatalf("permanent error marked retryable: %v", err)
+		}
+	}
+	for _, err := range []error{&tk2sd.HTTPError{StatusCode: 409, Class: tk2sd.ErrorConflict}, &tk2sd.HTTPError{Class: tk2sd.ErrorTransport}, tk2sd.ErrIncompleteVideo, context.DeadlineExceeded} {
+		if !retryableDownload(err) {
+			t.Fatalf("temporary error not retryable: %v", err)
+		}
 	}
 }
 

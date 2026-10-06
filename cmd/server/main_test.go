@@ -70,6 +70,17 @@ func TestNewServerLoggerWritesStdoutAndFile(t *testing.T) {
 	}
 }
 
+func TestServerLogDirDefaultsToAppMount(t *testing.T) {
+	t.Setenv("MINIMAX_LOG_DIR", "")
+	if got := serverLogDir(); got != "/app/logs" {
+		t.Fatalf("default log directory = %q", got)
+	}
+	t.Setenv("MINIMAX_LOG_DIR", "/custom/logs")
+	if got := serverLogDir(); got != "/custom/logs" {
+		t.Fatalf("override log directory = %q", got)
+	}
+}
+
 func TestNewServerLoggerRotatesFileByDay(t *testing.T) {
 	var stdout bytes.Buffer
 	logDir := t.TempDir()

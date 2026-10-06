@@ -123,4 +123,6 @@ docker compose --env-file .env.docker up -d
 
 The SQLite database lives in `data/`. Migrations are forward-only and run atomically on startup; take a database backup before changing binaries. Legacy `legacy-gradio-v1` nodes remain readable for old tasks, while new v0.0.1 profiles require compatible `h3-node-v1` nodes.
 
-Container JSON logs are written to stdout and daily files under `/var/log/minimax-proxy`, for example `/var/log/minimax-proxy/server-2026-09-05.log`. The default compose file mounts this path to `./logs`; set `MINIMAX_LOG_DIR` only when the in-container log directory must be changed.
+Container JSON logs are written to stdout and daily files under `/app/logs`, for example `/app/logs/server-2026-10-07.log`. The default compose file mounts `./logs` to `/app/logs`; mount that subdirectory rather than all of `/app` so the server binary and configuration remain available. `MINIMAX_LOG_DIR` overrides the in-container log directory.
+
+Result delivery logs include the task ID, round, attempt, node video HTTP status, safe failure category, byte counts and whether an automatic retry is scheduled. Temporary node errors (409/408/429/5xx, transport failure, timeout and incomplete video) use the existing maximum of three attempts per round. Authentication and invalid media responses still require investigation or a manual retry. Filter `stage=result_delivery` and `stage=tk2sd_video_download` in the daily log to follow a download; video URLs and tokens are not logged.
