@@ -237,7 +237,19 @@ func (c *Client) remoteError(status int, envelope map[string]json.RawMessage, ca
 var sensitiveText = regexp.MustCompile(`(?i)(https?://|asset://|\bbearer\b|\bsignature\b|\bapi[_-]?key\b|\btoken\b|\bcookie\b)`)
 
 func (c *Client) safeText(value string, limit int) string {
-	if (c.apiKey != "" && strings.Contains(value, c.apiKey)) || sensitiveText.MatchString(value) {
+	return sanitizeText(value, limit, c.apiKey)
+}
+
+func SafeFeedbackMessage(value string) string {
+	message := strings.TrimSpace(sanitizeText(value, 512, ""))
+	if message == "[redacted]" {
+		return ""
+	}
+	return message
+}
+
+func sanitizeText(value string, limit int, apiKey string) string {
+	if (apiKey != "" && strings.Contains(value, apiKey)) || sensitiveText.MatchString(value) {
 		return "[redacted]"
 	}
 	value = strings.Map(func(r rune) rune {

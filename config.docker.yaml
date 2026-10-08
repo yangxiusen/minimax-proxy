@@ -1,7 +1,7 @@
 server:
   address: ":18080"
-  read_timeout: 15s
-  write_timeout: 15s
+  read_timeout: 60s
+  write_timeout: 120s
 
 admin:
   username: admin

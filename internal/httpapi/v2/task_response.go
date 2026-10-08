@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/upstream/tk2sd"
 )
 
 type RemoteResultAccess interface {
@@ -23,7 +24,13 @@ func (h *handler) mapRemoteTask(ctx context.Context, task domain.Task) (TaskResp
 		response.Content = &TaskContent{URL: task.ResultPublicURL}
 	}
 	if task.Status == domain.StatusFailed {
-		response.Error = &TaskError{Code: task.ErrorCode, Message: task.ErrorMessage}
+		message := task.ErrorMessage
+		if task.UpstreamFeedback != nil {
+			if feedback := tk2sd.SafeFeedbackMessage(task.UpstreamFeedback.Message); feedback != "" {
+				message = feedback
+			}
+		}
+		response.Error = &TaskError{Code: task.ErrorCode, Message: message}
 	}
 	return response, nil
 }

@@ -21,6 +21,9 @@ func TestLoadExpandsEnvironmentAndAppliesDefaults(t *testing.T) {
 	if cfg.Server.Address != ":8080" {
 		t.Fatalf("Server.Address = %q", cfg.Server.Address)
 	}
+	if cfg.Server.ReadTimeout != 60*time.Second || cfg.Server.WriteTimeout != 120*time.Second {
+		t.Fatalf("Server timeouts = read %s, write %s", cfg.Server.ReadTimeout, cfg.Server.WriteTimeout)
+	}
 	if cfg.Queue.ProtectedSlots != 3 || cfg.Queue.PerKeyUnfinishedLimit != 10 {
 		t.Fatalf("Queue defaults = %+v", cfg.Queue)
 	}

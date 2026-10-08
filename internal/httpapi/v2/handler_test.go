@@ -490,6 +490,45 @@ func TestFailedTaskInfersMediaDownloadErrorFromHistoricalFeedback(t *testing.T) 
 	}
 }
 
+func TestRemoteFailureQueriesExposeSafeFeedbackMessage(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0)
+	tests := []struct {
+		name     string
+		feedback *domain.UpstreamFeedback
+		want     string
+	}{
+		{name: "audit rejection", feedback: &domain.UpstreamFeedback{Code: "10001303", Message: "video audit rejected (reason=video audit rejected)"}, want: "video audit rejected (reason=video audit rejected)"},
+		{name: "missing feedback", want: "远程视频生成失败"},
+		{name: "redacted feedback", feedback: &domain.UpstreamFeedback{Message: "[redacted]"}, want: "远程视频生成失败"},
+		{name: "historical unsafe feedback", feedback: &domain.UpstreamFeedback{Message: "download failed at https://private.example/video?token=secret"}, want: "远程视频生成失败"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			task := domain.Task{TaskID: "remote-failed", APIKeyID: "owner-a", Model: "seed-model", ProtocolVersion: domain.ProtocolTK2SD, Status: domain.StatusFailed,
+				ErrorCode: "tk2sd_generation_failed", ErrorMessage: "远程视频生成失败", UpstreamFeedback: tt.feedback, CreatedAt: now, UpdatedAt: now}
+			h := NewHandler(Dependencies{Store: &fixedTaskStore{task: task}, APIKeys: []config.APIKeyConfig{{ID: "owner-a", Key: "key-a", Enabled: true}}})
+			for _, endpoint := range []string{"/v2/query/video_generation/remote-failed", "/v2/query/video_generation"} {
+				response := request(t, h, http.MethodGet, endpoint, nil, "key-a")
+				if response.Code != http.StatusOK {
+					t.Fatalf("%s status=%d body=%s", endpoint, response.Code, response.Body.String())
+				}
+				var body struct {
+					Task  TaskResponse   `json:"task"`
+					Items []TaskResponse `json:"items"`
+				}
+				decode(t, response, &body)
+				got := body.Task
+				if len(body.Items) > 0 {
+					got = body.Items[0]
+				}
+				if got.Error == nil || got.Error.Code != "tk2sd_generation_failed" || got.Error.Message != tt.want {
+					t.Fatalf("%s error=%+v, want message %q", endpoint, got.Error, tt.want)
+				}
+			}
+		})
+	}
+}
+
 func TestSucceededArtifactURLIgnoresUntrustedForwardingHeaders(t *testing.T) {
 	store := &fixedTaskStore{task: domain.Task{
 		TaskID: "task-1", APIKeyID: "owner-a", Model: "MiniMax-H3", Status: domain.StatusSucceeded,

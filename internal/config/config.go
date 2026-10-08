@@ -345,7 +345,7 @@ func expandEnvironment(input string) (string, error) {
 
 func normalize(raw rawConfig) (Config, error) {
 	cfg := Config{
-		Server:             ServerConfig{Address: ":8080", ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second},
+		Server:             ServerConfig{Address: ":8080", ReadTimeout: 60 * time.Second, WriteTimeout: 120 * time.Second},
 		Admin:              AdminConfig{Username: "admin", Password: "123", SessionTTL: 12 * time.Hour, MonitorInterval: 5 * time.Second},
 		Database:           raw.Database,
 		Queue:              QueueConfig{ProtectedSlots: 3, PerKeyUnfinishedLimit: 10, GlobalUnfinishedLimit: 100},
