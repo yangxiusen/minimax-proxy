@@ -147,16 +147,28 @@ func (p *Processor) advance(ctx context.Context, task domain.Task, run domain.Re
 		return "", false, p.complete(ctx, run, domain.RemoteCompletion{Status: "cancelled"})
 	}
 	if run.Phase == domain.RemotePreparing {
-		body, err := p.Inputs.Prepare(ctx, task, run, p.Client)
-		if err != nil {
-			if errors.Is(err, ErrInvalidInput) || rejected(err) {
-				return "input_invalid", false, p.complete(ctx, run, domain.RemoteCompletion{Status: "failed", ErrorCode: "tk2sd_input_invalid", ErrorMessage: "远程任务素材校验失败"})
+		p.log("开始准备远程任务素材", task.TaskID, "stage", "prepare", "event", "input_prepare_started")
+		inputs := p.Inputs
+		if inputs != nil {
+			copy := *inputs
+			if copy.Logger == nil {
+				copy.Logger = p.Logger
 			}
-			return "input_unavailable", false, domain.ErrRemotePending
+			inputs = &copy
+		}
+		body, err := inputs.Prepare(ctx, task, run, p.Client)
+		if err != nil {
+			detail := p.logInputFailure(ctx, err)
+			if errors.Is(err, ErrInvalidInput) || rejected(err) {
+				return detail.Code, false, p.complete(ctx, run, domain.RemoteCompletion{Status: "failed", ErrorCode: detail.Code, ErrorMessage: detail.Error()})
+			}
+			return detail.Code, false, domain.ErrRemotePending
 		}
 		if err = p.Store.PrepareRemoteRequest(ctx, run, string(body)); err != nil {
+			p.logInputFailure(ctx, inputFailure("tk2sd_input_persistence_failed", "proxy_store", "request_save", "save_failed", "素材请求保存失败", err))
 			return "prepare_conflict", false, err
 		}
+		p.log("远程任务素材准备完成", task.TaskID, "stage", "prepare", "event", "input_prepared", "request_bytes", len(body))
 		run, err = p.reloadRun(ctx, run)
 		if err != nil {
 			return "store_unavailable", false, err
@@ -316,9 +328,10 @@ func (p *Processor) now() time.Time {
 	}
 	return time.Now().UTC()
 }
-func (p *Processor) log(message, taskID string) {
+func (p *Processor) log(message, taskID string, attrs ...any) {
 	if p.Logger != nil {
-		p.Logger.Info(message, "task_id", taskID, "node_id", p.NodeID, "protocol", domain.ProtocolTK2SD)
+		fields := []any{"task_id", taskID, "node_id", p.NodeID, "protocol", domain.ProtocolTK2SD}
+		p.Logger.Info(message, append(fields, attrs...)...)
 	}
 }
 func rejected(err error) bool {

@@ -25,3 +25,12 @@ func TestTKResponseNeverUsesRequestedMetadata(t *testing.T) {
 		t.Fatalf("actual duration: %+v", got)
 	}
 }
+
+func TestTKResponsePreservesSpecificInputFailure(t *testing.T) {
+	h := &handler{}
+	task := domain.Task{TaskID: "t", Model: "m", ProtocolVersion: domain.ProtocolTK2SD, Status: domain.StatusFailed, ErrorCode: "tk2sd_input_source_http_error", ErrorMessage: "对象存储：素材下载失败（HTTP 403）；content[1] image_url"}
+	got, err := h.mapTask(context.Background(), task)
+	if err != nil || got.Error == nil || got.Error.Code != task.ErrorCode || got.Error.Message != task.ErrorMessage {
+		t.Fatalf("specific input failure lost: %+v, %v", got.Error, err)
+	}
+}

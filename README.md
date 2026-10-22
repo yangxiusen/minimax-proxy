@@ -90,8 +90,15 @@ JSON logs expose the following diagnostic events:
 | `stage=tk2sd_api`, `event=request` | Parameters actually sent, including `duration`; correlate by `task_id` and `node_id`. |
 | `stage=tk2sd_api`, `event=response` | Upstream HTTP status and sanitized response structure for upload, create, query, metadata and cancel. |
 | `stage=tk2sd_api`, `event=task_id_mapping` | The associated `task_id` and `upstream_task_id`. |
+| `event=input_failed` | Input failure source, stage, reason, content index/type/role, `http_status`, `error_code`, `cause_class` and `retryable`; correlate by `task_id` and `node_id`. |
+| `event=source_open_started` / `source_opened` | Input source access and media format detection. |
+| `event=asset_upload_started` / `asset_uploaded` / `asset_reused` | Upstream asset upload, integrity validation and reuse without another upload. |
 
 If generation keeps using 5 seconds, compare the received and forwarded values first. `duration_source=default` means the JSON arriving at the Proxy omitted `duration`; inspect the caller or New API forwarding configuration. Logs preserve IDs, model parameters, numeric metadata and error codes. Prompts, raw Base64, credentials, signed URLs and unknown response strings (including error messages that can echo inputs) are redacted; multipart bodies are omitted. Logging does not change the HTTP bodies sent or returned. See the log directory information below.
+
+Input preparation failures now use specific `task.error.code/message` values. For example, `tk2sd_input_source_http_error` with `对象存储：素材下载失败（HTTP 403）；content[1] image_url` means the Proxy failed to download a persisted object-storage input before submitting generation. `content_index` is the zero-based index in the original `content` array. Filter `event=input_failed` and the task ID: `source=object_storage` identifies a persisted `ObjectURL`, `media_url` an external URL, `local_spool` a local input file, `data_uri` inline media, `proxy_store` the input/asset records, and `upstream` the tk2sd asset service. An arbitrary external URL is not assumed to belong to object storage.
+
+Other input codes distinguish `tk2sd_input_request_invalid`, `tk2sd_input_source_invalid`, `tk2sd_input_local_file_invalid`, `tk2sd_input_media_invalid`, `tk2sd_input_integrity_mismatch` and `tk2sd_asset_upload_rejected`. Temporary source reads, uploads, malformed upstream asset responses and persistence failures are logged as `tk2sd_input_source_read_failed`, `tk2sd_asset_upload_unavailable`, `tk2sd_asset_response_invalid` or `tk2sd_input_persistence_failed` while the task keeps its existing pending/retry behavior; `retryable` records that decision, not a new retry policy. Source non-200 responses and upstream upload 400/413/422 responses keep their previous terminal behavior. Raw storage responses, URLs, file paths, prompts and binary data are not included in these diagnostics.
 
 The manager task list shows the exact requested model and supports model-substring search alongside task/customer ID prefix search. It lists only unexpired, undeleted tasks created through this Proxy; tasks submitted directly to tk2sd remain in tk2sd's own database.
 
