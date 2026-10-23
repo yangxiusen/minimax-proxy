@@ -102,3 +102,77 @@ func objectStorageConfig() domain.ObjectStorageConfig {
 		RequestTimeout: 30 * time.Second,
 	}
 }
+
+func TestExpiredFinalResultUploadCannotBlockQueue(t *testing.T) {
+	for _, follower := range []bool{false, true} {
+		t.Run(map[bool]string{false: "empty_after_recovery", true: "next_job_claimed"}[follower], func(t *testing.T) {
+			now := time.Unix(2_000_000_000, 0).UTC()
+			store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 100, Now: func() time.Time { return now }})
+			ctx := context.Background()
+			createDeliveryFixture(t, store, "expired-final", "upload-expired")
+			_, err := store.db.Exec(`UPDATE result_upload_jobs SET status='uploading',attempt_no=3,lease_token='old',lease_expires_at=?,last_error_code='ucloud_upload_failed',last_error_message='UCloud 上传失败' WHERE id='upload-expired'`, now.Add(-time.Second).UnixMilli())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if follower {
+				now = now.Add(time.Millisecond)
+				createDeliveryFixture(t, store, "next-delivery", "upload-next")
+			}
+			claimed, err := store.ClaimResultUploadJob(ctx, "new-worker", time.Minute)
+			if follower {
+				if err != nil || claimed.ID != "upload-next" || claimed.AttemptNo != 1 {
+					t.Fatalf("queue blocked: %+v %v", claimed, err)
+				}
+			} else if !errors.Is(err, domain.ErrQueueEmpty) {
+				t.Fatalf("expected empty queue after recovery: %v", err)
+			}
+			expired, err := store.GetResultUploadJob(ctx, "expired-final")
+			if err != nil || expired.Status != domain.UploadFailed || expired.AttemptNo != 3 || expired.LeaseToken != "" {
+				t.Fatalf("exhausted job not finalized: %+v %v", expired, err)
+			}
+			main, err := store.Get(ctx, "owner", "expired-final")
+			if err != nil || main.Status != domain.StatusFailed || main.ErrorCode != "result_upload_failed" {
+				t.Fatalf("main task not failed: %+v %v", main, err)
+			}
+			if err := store.RetryResultUpload(ctx, "expired-final"); err != nil {
+				t.Fatal("manual retry blocked", err)
+			}
+			retried, err := store.GetResultUploadJob(ctx, "expired-final")
+			if err != nil || retried.Status != domain.UploadPending || retried.RoundNo != 2 || retried.AttemptNo != 0 {
+				t.Fatalf("manual retry: %+v %v", retried, err)
+			}
+		})
+	}
+}
+
+func TestResultUploadRecoveryPreservesLiveFinalLease(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0).UTC()
+	store := newStore(t, Options{ProtectedSlots: 0, PerKeyLimit: 10, GlobalLimit: 100, Now: func() time.Time { return now }})
+	createDeliveryFixture(t, store, "live-final", "upload-live")
+	if _, err := store.db.Exec(`UPDATE result_upload_jobs SET status='uploading',attempt_no=3,lease_token='live',lease_expires_at=? WHERE id='upload-live'`, now.Add(time.Minute).UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimResultUploadJob(t.Context(), "other", time.Minute); !errors.Is(err, domain.ErrQueueEmpty) {
+		t.Fatal(err)
+	}
+	job, err := store.GetResultUploadJob(t.Context(), "live-final")
+	if err != nil || job.Status != domain.UploadUploading || job.LeaseToken != "live" || job.AttemptNo != 3 {
+		t.Fatalf("live attempt interrupted: %+v %v", job, err)
+	}
+	if err := store.CompleteResultUpload(t.Context(), job.ID, "live", "https://cdn.example/video", 5); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func createDeliveryFixture(t *testing.T, store *Store, taskID, jobID string) {
+	t.Helper()
+	if _, err := store.Create(t.Context(), task(taskID, "owner"), "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE video_tasks SET status='reconciling',result_internal_url='https://origin.example/video',delivery_required=1 WHERE task_id=?`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateResultUploadJob(t.Context(), domain.ResultUploadJob{ID: jobID, TaskID: taskID, ObjectKey: taskID + ".mp4"}); err != nil {
+		t.Fatal(err)
+	}
+}

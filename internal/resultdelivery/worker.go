@@ -84,6 +84,8 @@ func (w Worker) ProcessOne(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	ctx = logsafe.WithTask(ctx, job.TaskID, "")
+	w.logger().InfoContext(ctx, "领取结果上传作业", "stage", "result_delivery", "task_id", job.TaskID, "job_id", job.ID, "round", job.RoundNo, "attempt", job.AttemptNo, "max_attempts", job.MaxAttempts)
 	sourceURL, err := w.Store.GetResultUploadSource(ctx, job.TaskID)
 	if err != nil {
 		return w.fail(ctx, job, lease, "result_source_missing", "原始结果地址不可用", false, err)
@@ -161,6 +163,7 @@ func (w Worker) fail(ctx context.Context, job domain.ResultUploadJob, lease, cod
 	backoff := []time.Duration{time.Second, 5 * time.Second, 20 * time.Second}
 	next := w.now().Add(backoff[min(job.AttemptNo-1, len(backoff)-1)])
 	if err := w.Store.FailResultUploadAttempt(ctx, job.ID, lease, code, message, retryable, next); err != nil {
+		w.logger().ErrorContext(ctx, "保存结果上传失败状态失败", "stage", "result_delivery", "task_id", job.TaskID, "job_id", job.ID, "round", job.RoundNo, "attempt", job.AttemptNo, "error_code", "result_upload_state_save_failed", "error_reason", logsafe.Error(err))
 		return errors.Join(cause, err)
 	}
 	automaticRetry := retryable && job.AttemptNo < job.MaxAttempts
@@ -168,7 +171,14 @@ func (w Worker) fail(ctx context.Context, job domain.ResultUploadJob, lease, cod
 	if automaticRetry {
 		nextAttempt = next
 	}
-	w.logger().WarnContext(ctx, "结果上传尝试失败", "stage", "result_delivery", "task_id", job.TaskID, "round", job.RoundNo, "attempt", job.AttemptNo, "max_attempts", job.MaxAttempts, "automatic_retry", automaticRetry, "next_attempt_at", nextAttempt, "error_code", code, "error_reason", logsafe.Error(cause))
+	reason := logsafe.Error(cause)
+	attrs := []any{"stage", "result_delivery", "task_id", job.TaskID, "job_id", job.ID, "round", job.RoundNo, "attempt", job.AttemptNo, "max_attempts", job.MaxAttempts, "automatic_retry", automaticRetry, "next_attempt_at", nextAttempt, "error_code", code}
+	var storageError *objectstore.Error
+	if errors.As(cause, &storageError) {
+		reason = storageError.Message
+		attrs = append(attrs, "storage_operation", storageError.Operation, "http_status", storageError.HTTPStatus, "failure_reason", storageError.Reason, "storage_request_id", storageError.RequestID)
+	}
+	w.logger().WarnContext(ctx, "结果上传尝试失败", append(attrs, "error_reason", reason)...)
 	return nil
 }
 

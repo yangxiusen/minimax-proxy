@@ -414,7 +414,9 @@ function renderTasks(response) {
     const row = makeElement("div", "task-row");
     row.setAttribute("role", "row");
     let phaseLabel = phaseLabels[item.phase];
-    if (item.result_delivery_status === "pending" || item.result_delivery_status === "uploading") phaseLabel = "上传结果";
+    if (item.result_delivery_status === "pending") phaseLabel = "等待上传";
+    if (item.result_delivery_status === "uploading") phaseLabel = "上传结果";
+    if (item.result_delivery_status === "retry_wait") phaseLabel = "等待上传重试";
     if (item.result_delivery_status === "failed") phaseLabel = "上传失败";
     const actions = makeElement("span", "task-actions");
     const view = makeElement("button", "task-action", "查看");
@@ -888,7 +890,7 @@ function renderTaskDetail(detail) {
     detailRow("上传轮次", detail.result_upload_round || 0),
     detailRow("尝试次数", detail.result_upload_attempts || 0)
   );
-  if (detail.result_upload_error) deliverySection.append(detailRow("失败原因", `${detail.result_upload_error.code}：${detail.result_upload_error.summary || "上传失败"}`));
+  if (detail.result_upload_error) deliverySection.append(detailRow(detail.result_delivery_status === "failed" ? "失败原因" : "上次尝试失败", `${detail.result_upload_error.code}：${detail.result_upload_error.summary || "上传失败"}`));
   elements.taskDetailBody.replaceChildren(summary, feedbackSection, textSection, mediaSection, deliverySection, configSection);
   window.modelRouting?.renderTaskRouting(detail, elements.taskDetailBody);
 }

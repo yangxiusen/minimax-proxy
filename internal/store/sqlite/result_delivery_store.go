@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 	"time"
 
 	"minimax-h3-tc/internal/domain"
@@ -115,13 +116,16 @@ func (s *Store) GetResultUploadSource(ctx context.Context, taskID string) (strin
 }
 
 func (s *Store) ClaimResultUploadJob(ctx context.Context, leaseToken string, leaseDuration time.Duration) (result domain.ResultUploadJob, err error) {
+	if err := s.recoverExhaustedResultUploads(ctx); err != nil {
+		return result, err
+	}
 	conn, finish, err := s.immediate(ctx)
 	if err != nil {
 		return result, err
 	}
 	defer completeTransaction(finish, &err)
 	now := s.nowMillis()
-	job, err := scanResultUploadJob(conn.QueryRowContext(ctx, uploadJobSelect+` WHERE (status='pending' OR (status='retry_wait' AND COALESCE(next_attempt_at,0)<=?) OR (status='uploading' AND COALESCE(lease_expires_at,0)<=?)) ORDER BY created_at,id LIMIT 1`, now, now))
+	job, err := scanResultUploadJob(conn.QueryRowContext(ctx, uploadJobSelect+` WHERE attempt_no<max_attempts AND (status='pending' OR (status='retry_wait' AND COALESCE(next_attempt_at,0)<=?) OR (status='uploading' AND COALESCE(lease_expires_at,0)<=?)) ORDER BY created_at,id LIMIT 1`, now, now))
 	if errors.Is(err, sql.ErrNoRows) {
 		return result, domain.ErrQueueEmpty
 	}
@@ -133,6 +137,65 @@ func (s *Store) ClaimResultUploadJob(ctx context.Context, leaseToken string, lea
 		return result, err
 	}
 	return scanResultUploadJob(conn.QueryRowContext(ctx, uploadJobSelect+` WHERE id=?`, job.ID))
+}
+
+// 单独提交恢复事务，避免没有后续可领任务时 ErrQueueEmpty 回滚已完成的恢复。
+func (s *Store) recoverExhaustedResultUploads(ctx context.Context) (err error) {
+	conn, finish, err := s.immediate(ctx)
+	if err != nil {
+		return err
+	}
+	var jobs []domain.ResultUploadJob
+	defer func() {
+		completeTransaction(finish, &err)
+		if err == nil {
+			for _, job := range jobs {
+				slog.WarnContext(ctx, "已结束尝试次数耗尽的过期结果上传作业", "stage", "result_delivery", "event", "upload_lease_exhausted", "task_id", job.TaskID, "job_id", job.ID, "round", job.RoundNo, "attempt", job.AttemptNo, "max_attempts", job.MaxAttempts, "error_code", "result_upload_attempts_exhausted")
+			}
+		}
+	}()
+	now := s.nowMillis()
+	rows, err := conn.QueryContext(ctx, uploadJobSelect+` WHERE attempt_no>=max_attempts AND (status IN ('pending','retry_wait') OR (status='uploading' AND COALESCE(lease_expires_at,0)<=?)) ORDER BY created_at,id LIMIT 100`, now)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		job, scanErr := scanResultUploadJob(rows)
+		if scanErr != nil {
+			rows.Close()
+			return scanErr
+		}
+		jobs = append(jobs, job)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	for _, job := range jobs {
+		message := "结果上传已达到本轮尝试上限且执行租约已过期，请检查对象存储后重新上传"
+		if _, err = conn.ExecContext(ctx, `UPDATE result_upload_jobs SET status='failed',lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,last_error_code='result_upload_attempts_exhausted',last_error_message=?,finished_at=?,updated_at=?,version=version+1 WHERE id=?`, message, now, now, job.ID); err != nil {
+			return err
+		}
+		if err = failDeliveredTask(ctx, conn, job.TaskID, message, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func failDeliveredTask(ctx context.Context, conn *sql.Conn, taskID, message string, now int64) error {
+	updated, err := conn.ExecContext(ctx, `UPDATE video_tasks SET status='failed',error_code='result_upload_failed',error_message=?,finished_at=?,updated_at=?,version=version+1 WHERE task_id=? AND status='reconciling'`, message, now/1000, now/1000, taskID)
+	if err != nil {
+		return err
+	}
+	count, err := updated.RowsAffected()
+	if err != nil || count == 0 {
+		return err
+	}
+	return createCallbackDeliveryWithConn(ctx, conn, taskID, "failed", now)
 }
 
 func (s *Store) FailResultUploadAttempt(ctx context.Context, jobID, leaseToken, code, message string, retryable bool, nextAttempt time.Time) (err error) {
@@ -159,10 +222,7 @@ func (s *Store) FailResultUploadAttempt(ctx context.Context, jobID, leaseToken, 
 		return err
 	}
 	if status == domain.UploadFailed {
-		if _, err = conn.ExecContext(ctx, `UPDATE video_tasks SET status='failed',error_code='result_upload_failed',error_message=?,finished_at=?,updated_at=?,version=version+1 WHERE task_id=? AND status='reconciling'`, message, now/1000, now/1000, job.TaskID); err != nil {
-			return err
-		}
-		return createCallbackDeliveryWithConn(ctx, conn, job.TaskID, "failed", now)
+		return failDeliveredTask(ctx, conn, job.TaskID, message, now)
 	}
 	return err
 }

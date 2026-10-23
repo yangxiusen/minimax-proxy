@@ -19,6 +19,11 @@ func Error(err error) string {
 	if err == nil {
 		return "未知错误"
 	}
+	// 安全外层允许保留错误链用于判断重试，但日志不能绕过它输出 SDK 原因。
+	var safe interface{ SafeLogMessage() string }
+	if errors.As(err, &safe) {
+		err = errors.New(safe.SafeLogMessage())
+	}
 	var urlErr *url.Error
 	if errors.As(err, &urlErr) {
 		err = urlErr.Err

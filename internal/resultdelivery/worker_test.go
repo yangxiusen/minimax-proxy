@@ -3,14 +3,17 @@ package resultdelivery
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"errors"
 	"log/slog"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/logsafe"
 	"minimax-h3-tc/internal/objectstore"
 	"minimax-h3-tc/internal/upstream/tk2sd"
 )
@@ -102,6 +105,43 @@ func TestWorkerDoesNotRetryPermanentNodeDownload(t *testing.T) {
 	}
 }
 
+func TestWorkerLogsStorageOperationAndStatusWithoutCauseSecrets(t *testing.T) {
+	var logs bytes.Buffer
+	store := &deliveryStoreFake{job: domain.ResultUploadJob{ID: "job-1", TaskID: "task-1", RoundNo: 1, AttemptNo: 2, MaxAttempts: 3}, config: domain.ObjectStorageConfig{RequestTimeout: time.Minute}}
+	worker := Worker{Store: store, Secrets: secretFake{}, Downloader: downloadFake{}, Logger: slog.New(slog.NewJSONHandler(&logs, nil)), ObjectStoreFactory: func(domain.ObjectStorageConfig, string, string) (objectstore.Store, error) {
+		return uploadFake{err: &objectstore.Error{Code: "ucloud_upload_failed", Message: "UCloud 上传分片失败（HTTP 503）", Retryable: true, Operation: "multipart_part", HTTPStatus: 503, Reason: "http_status", RequestID: "request-1", Cause: errors.New("private-secret https://private.example/secret")}}, nil
+	}}
+	if err := worker.ProcessOne(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"storage_operation":"multipart_part"`, `"http_status":503`, `"storage_request_id":"request-1"`, `"job_id":"job-1"`, `"automatic_retry":true`} {
+		if !strings.Contains(logs.String(), field) {
+			t.Error("missing storage diagnostic", field, logs.String())
+		}
+	}
+	if strings.Contains(logs.String(), "private-secret") || strings.Contains(logs.String(), "private.example") {
+		t.Fatal("raw SDK cause leaked", logs.String())
+	}
+}
+
+func TestWorkerPersistenceFailureCannotExposeSDKCause(t *testing.T) {
+	var logs bytes.Buffer
+	persistErr := errors.New("database is locked")
+	store := &deliveryStoreFake{job: domain.ResultUploadJob{ID: "job-1", TaskID: "task-1", AttemptNo: 1, MaxAttempts: 3}, config: domain.ObjectStorageConfig{RequestTimeout: time.Minute}, persistErr: persistErr}
+	sdkErr := &url.Error{Op: "PUT", URL: "https://private-storage.internal/video", Err: x509.HostnameError{Host: "private-storage.internal", Certificate: &x509.Certificate{DNSNames: []string{"different-private.internal"}}}}
+	worker := Worker{Store: store, Secrets: secretFake{}, Downloader: downloadFake{}, Logger: slog.New(slog.NewJSONHandler(&logs, nil)), ObjectStoreFactory: func(domain.ObjectStorageConfig, string, string) (objectstore.Store, error) {
+		return uploadFake{err: &objectstore.Error{Code: "ucloud_upload_failed", Message: "UCloud 上传分片失败", Retryable: true, Cause: sdkErr}}, nil
+	}}
+	err := worker.ProcessOne(t.Context())
+	if !errors.Is(err, persistErr) {
+		t.Fatal("persistence cause lost", err)
+	}
+	output := logsafe.Error(err)
+	if strings.Contains(output, "private-storage.internal") || strings.Contains(output, "different-private.internal") || !strings.Contains(output, "UCloud 上传分片失败") {
+		t.Fatalf("combined worker error bypassed safe message: %s", output)
+	}
+}
+
 type deliveryStoreFake struct {
 	job                      domain.ResultUploadJob
 	config                   domain.ObjectStorageConfig
@@ -109,6 +149,7 @@ type deliveryStoreFake struct {
 	completedBytes           int64
 	retryable                bool
 	next                     time.Time
+	persistErr               error
 }
 
 func (s *deliveryStoreFake) ClaimResultUploadJob(context.Context, string, time.Duration) (domain.ResultUploadJob, error) {
@@ -122,7 +163,7 @@ func (s *deliveryStoreFake) GetObjectStorageConfig(context.Context) (domain.Obje
 }
 func (s *deliveryStoreFake) FailResultUploadAttempt(_ context.Context, _, _, code, _ string, retryable bool, next time.Time) error {
 	s.failedCode, s.retryable, s.next = code, retryable, next
-	return nil
+	return s.persistErr
 }
 func (s *deliveryStoreFake) CompleteResultUpload(_ context.Context, _, _, publicURL string, bytes int64) error {
 	s.completedURL, s.completedBytes = publicURL, bytes

@@ -1,6 +1,7 @@
 package ucloud
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -123,4 +124,89 @@ func asObjectStoreError(err error, target **objectstore.Error) bool {
 		*target = value
 	}
 	return ok
+}
+
+func TestUploadPartFailureKeepsOriginalStatusAfterAbort(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.RawQuery == "uploads":
+			_, _ = w.Write([]byte(`{"BlkSize":4194304,"UploadId":"upload-1"}`))
+		case r.Method == http.MethodPut:
+			w.Header().Set("X-Request-Id", "storage-request-1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+	path := t.TempDir() + "/input.mp4"
+	if err := os.WriteFile(path, []byte("video"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := New(Config{BucketName: "bucket", FileHost: server.URL, PublicBaseURL: server.URL + "/public", PublicKey: "private-public-key", PrivateKey: "private-secret-key", Client: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.UploadFile(t.Context(), path, "video.mp4", "video/mp4")
+	var failure *objectstore.Error
+	if !errors.As(err, &failure) || !failure.Retryable || !strings.Contains(failure.Message, "HTTP 503") || !strings.Contains(failure.Message, "上传分片") {
+		t.Fatalf("part failure overwritten by cleanup: %+v", err)
+	}
+	if failure.Operation != "multipart_part" || failure.HTTPStatus != 503 || failure.RequestID != "storage-request-1" || failure.Reason != "http_status" {
+		t.Fatalf("missing structured failure: %+v", failure)
+	}
+	for _, secret := range []string{server.URL, path, "private-secret-key", "private-public-key"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatal("sensitive storage error", err)
+		}
+	}
+}
+
+func TestObjectVerificationFailureHasStageAndStatus(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	store, err := New(Config{BucketName: "bucket", FileHost: server.URL, PublicBaseURL: server.URL + "/public", PublicKey: "public", PrivateKey: "private", Client: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.Upload(t.Context(), []byte("image"), "image.png", "image/png")
+	if err == nil || !strings.Contains(err.Error(), "对象校验") || !strings.Contains(err.Error(), "HTTP 503") {
+		t.Fatalf("verification diagnostic missing: %v", err)
+	}
+}
+
+func TestUploadRedirectKeepsFinalFailureStatus(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/video.mp4" {
+			http.Redirect(w, r, "/final?uploads", http.StatusTemporaryRedirect)
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	path := t.TempDir() + "/video.mp4"
+	if err := os.WriteFile(path, []byte("video"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := New(Config{BucketName: "bucket", FileHost: server.URL, PublicBaseURL: server.URL, PublicKey: "public", PrivateKey: "private", Client: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.UploadFile(t.Context(), path, "video.mp4", "video/mp4")
+	var failure *objectstore.Error
+	if !errors.As(err, &failure) || failure.HTTPStatus != 503 || !failure.Retryable {
+		t.Fatalf("redirect hid final temporary failure: %+v", err)
+	}
 }
