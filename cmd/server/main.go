@@ -68,16 +68,16 @@ func newServerLoggerWithClock(stdout io.Writer, logDir string, now func() time.T
 		stdout = io.Discard
 	}
 	if err := os.MkdirAll(logDir, 0o750); err != nil {
-		logger := slog.New(slog.NewJSONHandler(stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		logger := slog.New(newReadableLogHandler(stdout))
 		return logger, func() error { return nil }, err
 	}
 	fileWriter := &dailyLogWriter{dir: logDir, now: now}
 	if err := fileWriter.rotateLocked(); err != nil {
-		logger := slog.New(slog.NewJSONHandler(stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		logger := slog.New(newReadableLogHandler(stdout))
 		return logger, func() error { return nil }, err
 	}
 	writer := io.MultiWriter(stdout, fileWriter)
-	logger := slog.New(slog.NewJSONHandler(writer, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := slog.New(newReadableLogHandler(writer))
 	return logger, fileWriter.Close, nil
 }
 

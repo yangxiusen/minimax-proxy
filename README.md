@@ -80,7 +80,14 @@ Replace the example image URL with a publicly reachable image. `duration` must b
 
 Successful creation and idempotent replay return `{"task_id":"<proxy-task-id>"}`. This ID is assigned when the Proxy queues the task, before the asynchronous upstream submission. Use it for Proxy queries. The later tk2sd `{"id":"<upstream-task-id>"}` response is stored against that task; it does not replace the public ID. An empty local task ID cannot produce a successful create response. An upstream response without a valid `id` remains subject to the existing uncertain-submission recovery policy.
 
-JSON logs expose the following diagnostic events:
+Readable text logs expose the following diagnostic events:
+
+```text
+2026-10-23 10:19:09.362 +0800 WARN  远程任务素材准备失败 | task_id=task-1 source=object_storage http_status=403 retryable=false
+2026-10-23 10:19:11.272 +0800 INFO  tk2sd 返回结果 | task_id=task-2 operation=query response.status=running
+```
+
+The timestamp includes milliseconds and the runtime's timezone offset; levels are aligned, followed by the message and `key=value` fields. Nested sanitized summaries use dotted names and array indexes, such as `response.status` and `request.content[0].type`. Messages and field values escape line breaks so each record stays on one line. Existing INFO filtering and diagnostic events remain in place.
 
 | Filter | What to check |
 | --- | --- |
@@ -130,6 +137,6 @@ docker compose --env-file .env.docker up -d
 
 The SQLite database lives in `data/`. Migrations are forward-only and run atomically on startup; take a database backup before changing binaries. Legacy `legacy-gradio-v1` nodes remain readable for old tasks, while new v0.0.1 profiles require compatible `h3-node-v1` nodes.
 
-Container JSON logs are written to stdout and daily files under `/app/logs`, for example `/app/logs/server-2026-10-07.log`. The default compose file mounts `./logs` to `/app/logs`; mount that subdirectory rather than all of `/app` so the server binary and configuration remain available. `MINIMAX_LOG_DIR` overrides the in-container log directory.
+Container text logs are written to stdout and daily files under `/app/logs`, for example `/app/logs/server-2026-10-23.log`. If the directory or file cannot be opened, stdout keeps the same readable format. The default compose file mounts `./logs` to `/app/logs`; mount that subdirectory rather than all of `/app` so the server binary and configuration remain available. `MINIMAX_LOG_DIR` overrides the in-container log directory. Rebuild and restart the server to apply the new format; historical records are not rewritten, so an existing daily file may contain both earlier JSON records and newer text records. Log collectors must read text instead of decoding every line as JSON.
 
 Result delivery logs include the task ID, round, attempt, node video HTTP status, safe failure category, byte counts and whether an automatic retry is scheduled. Temporary node errors (409/408/429/5xx, transport failure, timeout and incomplete video) use the existing maximum of three attempts per round. Authentication and invalid media responses still require investigation or a manual retry. Filter `stage=result_delivery` and `stage=tk2sd_video_download` in the daily log to follow a download; video URLs and tokens are not logged.

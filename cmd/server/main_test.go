@@ -58,15 +58,15 @@ func TestNewServerLoggerWritesStdoutAndFile(t *testing.T) {
 	defer closeLog()
 
 	logger.Error("测试异常", "stage", "test", "error_code", "test_error", "error_reason", "boom")
-	if !strings.Contains(stdout.String(), `"error_reason":"boom"`) {
-		t.Fatalf("stdout log missing error_reason: %s", stdout.String())
+	if !strings.Contains(stdout.String(), "ERROR 测试异常 | stage=test error_code=test_error error_reason=boom") || strings.HasPrefix(stdout.String(), "{") {
+		t.Fatalf("stdout log is not readable text: %s", stdout.String())
 	}
 	data, err := os.ReadFile(filepath.Join(logDir, "server-2026-09-05.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(data, []byte(`"error_reason":"boom"`)) {
-		t.Fatalf("file log missing error_reason: %s", string(data))
+	if !bytes.Equal(data, stdout.Bytes()) {
+		t.Fatalf("file log differs from stdout: %s", string(data))
 	}
 }
 
@@ -126,9 +126,26 @@ func TestNewServerLoggerFallsBackToStdoutWhenFilePathIsInvalid(t *testing.T) {
 	}
 	defer closeLog()
 
-	logger.Error("娴嬭瘯寮傚父", "stage", "test", "error_code", "test_error", "error_reason", "boom")
-	if !strings.Contains(stdout.String(), `"error_reason":"boom"`) {
+	logger.Error("测试异常", "stage", "test", "error_code", "test_error", "error_reason", "boom")
+	if !strings.Contains(stdout.String(), "ERROR 测试异常 | stage=test error_code=test_error error_reason=boom") || strings.HasPrefix(stdout.String(), "{") {
 		t.Fatalf("stdout fallback missing error_reason: %s", stdout.String())
+	}
+}
+
+func TestNewServerLoggerFallsBackToTextWhenDailyFileCannotOpen(t *testing.T) {
+	var stdout bytes.Buffer
+	logDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(logDir, "server-2026-10-23.log"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	logger, closeLog, err := newServerLoggerWithClock(&stdout, logDir, func() time.Time { return time.Date(2026, 10, 23, 0, 0, 0, 0, time.UTC) })
+	if err == nil {
+		t.Fatal("daily file unexpectedly writable")
+	}
+	defer closeLog()
+	logger.Warn("文件日志不可用", "stage", "lifecycle")
+	if !strings.Contains(stdout.String(), "WARN  文件日志不可用 | stage=lifecycle") || strings.HasPrefix(stdout.String(), "{") {
+		t.Fatal("fallback is not readable text", stdout.String())
 	}
 }
 
