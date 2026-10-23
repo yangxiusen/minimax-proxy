@@ -5,11 +5,54 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"minimax-h3-tc/internal/domain"
 )
+
+func TestTK2SDSlotAdmissionReservesOnlyRemainingCapacity(t *testing.T) {
+	s, _ := remoteFixture(t)
+	ctx := context.Background()
+	v23Exec(t, s.db, `UPDATE model_service_nodes SET max_concurrency=10 WHERE id='remote-node'`)
+	v23Exec(t, s.db, `UPDATE task_remote_runs SET upstream_task_id='owned' WHERE task_id='remote-task'`)
+	for i := 0; i < 5; i++ {
+		remoteQueued(t, s, "waiting-"+string(rune('a'+i)), "seed-model", "queued_open", 5)
+	}
+	admission := domain.TK2SDAdmission{Capacity: 3, Occupied: 2, CanDispatch: true, LeasedTaskIDs: []string{"owned", "external"}}
+	var group sync.WaitGroup
+	results := make(chan error, 5)
+	for i := 0; i < 5; i++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			_, err := s.ClaimNextRemote(ctx, "remote-node", 1, 10, admission)
+			results <- err
+		}()
+	}
+	group.Wait()
+	close(results)
+	claimed := 0
+	for err := range results {
+		if err == nil {
+			claimed++
+		} else if !errors.Is(err, domain.ErrUpstreamBusy) {
+			t.Fatal(err)
+		}
+	}
+	if claimed != 1 {
+		t.Fatalf("claims=%d, want one remaining slot", claimed)
+	}
+	// 下调容量后不领取，但原有任务仍然可取得执行租约继续对账。
+	admission.Capacity = 1
+	if _, err := s.ClaimNextRemote(ctx, "remote-node", 1, 10, admission); !errors.Is(err, domain.ErrUpstreamBusy) {
+		t.Fatalf("lowered capacity: %v", err)
+	}
+	if _, err := s.AcquireRemoteLease(ctx, "remote-task", "remote-node", "continue-poll", time.Minute); err != nil {
+		t.Fatal("lowering blocked reconciliation", err)
+	}
+}
 
 func remoteFixture(t *testing.T) (*Store, domain.Task) {
 	t.Helper()

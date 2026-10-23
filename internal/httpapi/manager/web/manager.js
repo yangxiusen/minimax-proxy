@@ -316,7 +316,7 @@ function renderTK2SDDashboard(node, proxyQueued) {
     section.append(makeElement("p", "muted", "上游统计暂不可用"));
     return section;
   }
-  const loginLabels = { valid: "已登录", checking: "检查中", expired: "已失效", login_required: "需要登录", disabled: "未启用监测", unknown: "未知" };
+  const loginLabels = { valid: "已登录", checking: "检查中", expired: "已失效", login_required: "需要登录", unavailable: "暂不可用", disabled: "未启用监测", unknown: "未知" };
   const login = makeElement("div", "tk-login");
   login.append(makeElement("span", "muted", "登录状态"), statusPill(dashboard.login.can_dispatch ? "healthy" : "queued", `${loginLabels[dashboard.login.status] || "未知"} · ${dashboard.login.can_dispatch ? "可派发" : "不可派发"}`));
   section.append(login);
@@ -325,7 +325,9 @@ function renderTK2SDDashboard(node, proxyQueued) {
   [
     ["生成中", counts.running], ["上游排队", counts.queued], ["已完成", counts.succeeded],
     ["待核实", counts.uncertain], ["失败", counts.failed], ["取消", counts.canceled],
-    ["账号占用", `${dashboard.occupied} / ${dashboard.capacity}`]
+    ["账号占用", `${dashboard.occupied} / ${dashboard.capacity}`],
+    ["并发占用", `${dashboard.slot_occupied ?? dashboard.occupied} / ${dashboard.slot_capacity ?? dashboard.capacity}`],
+    ["每线路并发", dashboard.concurrency_per_line ?? 1]
   ].forEach(([label, value]) => {
     const stat = makeElement("div", "tk-stat");
     stat.append(makeElement("span", "box-label", label), makeElement("strong", "", String(value)));
@@ -335,12 +337,16 @@ function renderTK2SDDashboard(node, proxyQueued) {
   const accounts = makeElement("div", "tk-accounts");
   accounts.append(makeElement("h4", "tk-accounts-title", "账号状态"));
   const list = makeElement("div", "tk-account-list");
-  const accountLabels = { occupied: "占用", cooldown: "冷却中", idle: "空闲" };
+  const accountLabels = { occupied: "生成中", full: "已满", cooldown: "冷却中", idle: "空闲" };
   (dashboard.accounts || []).forEach((account) => {
     const row = makeElement("div", "tk-account-row");
+    const limit = account.concurrency_limit ?? 1;
+    const active = account.active_count ?? (account.status === "occupied" ? 1 : 0);
+    const available = account.available_slots ?? Math.max(0, limit - active);
     row.append(
       makeElement("span", "", account.label || "--"),
       makeElement("span", "", accountLabels[account.status] || "未知"),
+      makeElement("span", "", `${active} / ${limit} · 剩余 ${available}`),
       makeElement("span", "", account.credits == null ? "额度未查询" : `额度 ${account.credits}`)
     );
     list.append(row);
@@ -660,7 +666,7 @@ function syncNodeProtocolFields() {
   elements.officialNodeFields.querySelectorAll("input").forEach((input) => { input.disabled = !official || state.nodeBusy; });
   formField("upstream_model").required = official;
   formField("max_concurrency").required = official;
-  formField("max_concurrency").title = formField("protocol_version").value === "tk2sd-v1" ? "tk2sd 按账号处理任务；请依据可用账号和额度设置并发数" : "同一节点同时执行的任务上限";
+  formField("max_concurrency").title = formField("protocol_version").value === "tk2sd-v1" ? "此 Proxy 在该节点的并发上限，实际派发同时受上游线路剩余名额、登录状态和额度约束；每线路并发在 tk2sd 设置" : "同一节点同时执行的任务上限";
   const key = formField("api_key");
   key.minLength = official ? 1 : 32;
   key.maxLength = official ? 512 : 32;

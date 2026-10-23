@@ -1078,7 +1078,8 @@ func TestSnapshotIncludesSanitizedTK2SDDashboardOnlyOnTKNode(t *testing.T) {
 	cache := monitorcache.NewCache([]monitorcache.NodeSnapshot{
 		{ID: "tk-1", Health: monitorcache.HealthHealthy, UpdatedAt: updated, TK2SDDashboard: &monitorcache.TK2SDDashboard{
 			Counts: monitorcache.TK2SDCounts{Running: 2, Queued: 3, Failed: 1}, Occupied: 1, Capacity: 1,
-			Accounts: []monitorcache.TK2SDAccount{{Label: "1-1", Status: "occupied"}},
+			SlotCapacity: 3, SlotOccupied: 2, ConcurrencyPerLine: 3, LeasedTaskIDs: []string{"private-task"},
+			Accounts: []monitorcache.TK2SDAccount{{Label: "1-1", Status: "occupied", ActiveCount: 2, ConcurrencyLimit: 3, AvailableSlots: 1}},
 			Login:    monitorcache.TK2SDLogin{Status: "valid", CanDispatch: true},
 		}},
 		{ID: "h3-1", Health: monitorcache.HealthHealthy, UpdatedAt: updated, TK2SDDashboard: &monitorcache.TK2SDDashboard{Capacity: 999}},
@@ -1100,6 +1101,10 @@ func TestSnapshotIncludesSanitizedTK2SDDashboardOnlyOnTKNode(t *testing.T) {
 	decodeResponse(t, response, &body)
 	if response.Code != http.StatusOK || body.ProxyQueued == nil || *body.ProxyQueued != 4 || len(body.Upstreams) != 2 || body.Upstreams[0].Dashboard != nil || body.Upstreams[1].Dashboard == nil || body.Upstreams[1].Dashboard.Counts.Queued != 3 {
 		t.Fatalf("snapshot status=%d body=%+v", response.Code, body)
+	}
+	dashboard := body.Upstreams[1].Dashboard
+	if dashboard.SlotCapacity != 3 || dashboard.SlotOccupied != 2 || dashboard.ConcurrencyPerLine != 3 || dashboard.Accounts[0].ActiveCount != 2 || dashboard.Accounts[0].AvailableSlots != 1 {
+		t.Fatalf("slot metrics missing: %+v", dashboard)
 	}
 	for _, secret := range []string{"private-account", "private-task", "session_file_present", "browser_error"} {
 		if strings.Contains(response.Body.String(), secret) {

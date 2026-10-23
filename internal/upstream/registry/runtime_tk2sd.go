@@ -3,8 +3,10 @@ package registry
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"minimax-h3-tc/internal/config"
 	"minimax-h3-tc/internal/domain"
+	"minimax-h3-tc/internal/logsafe"
 	"minimax-h3-tc/internal/monitor"
 	"minimax-h3-tc/internal/remote"
 	"minimax-h3-tc/internal/scheduler"
@@ -50,17 +52,10 @@ func (f NodeRuntimeFactory) startTK2SD(parent context.Context, node domain.Model
 	maxAge := upstream.RequestTimeout + monitorInterval(f.MonitorInterval)
 	processor.Admission = func() (domain.TK2SDAdmission, bool) {
 		snapshot, ok := f.Cache.Get(node.ID)
-		if !ok || snapshot.TK2SDDashboard == nil || snapshot.CheckedAt.IsZero() || snapshot.CheckedAt.Before(runtimeNow(f.Now).Add(-maxAge)) {
+		if !ok {
 			return domain.TK2SDAdmission{}, false
 		}
-		dashboard := snapshot.TK2SDDashboard
-		cooling := 0
-		for _, account := range dashboard.Accounts {
-			if account.Status == "cooldown" {
-				cooling++
-			}
-		}
-		return domain.TK2SDAdmission{Capacity: dashboard.Capacity, Occupied: dashboard.Occupied, Cooling: cooling, Queued: dashboard.Counts.Queued, CanDispatch: dashboard.Login.CanDispatch, LeasedTaskIDs: dashboard.LeasedTaskIDs}, true
+		return tk2sdAdmission(snapshot, runtimeNow(f.Now), maxAge)
 	}
 	ctx, cancel := context.WithCancel(parent)
 	wake := make(chan struct{}, 1)
@@ -122,6 +117,7 @@ func (f NodeRuntimeFactory) startTK2SD(parent context.Context, node domain.Model
 }
 
 func (f NodeRuntimeFactory) probeTK2SD(ctx context.Context, nodeID string, enabled bool, client tk2sdMonitorClient) {
+	previous, _ := f.Cache.Get(nodeID)
 	healthErr := client.Health(ctx)
 	var dashboard tk2sd.Dashboard
 	var dashboardErr error
@@ -146,12 +142,49 @@ func (f NodeRuntimeFactory) probeTK2SD(ctx context.Context, nodeID string, enabl
 		if dashboardErr == nil {
 			accounts := make([]monitor.TK2SDAccount, len(dashboard.Accounts))
 			for i, account := range dashboard.Accounts {
-				accounts[i] = monitor.TK2SDAccount{Label: account.Label, Status: account.Status, Credits: account.Credits}
+				accounts[i] = monitor.TK2SDAccount{Label: account.Label, Status: account.Status, Credits: account.Credits, ActiveCount: account.ActiveCount, ConcurrencyLimit: account.ConcurrencyLimit, AvailableSlots: account.AvailableSlots, Cooldown: account.Cooldown}
 			}
 			s.TK2SDDashboard = &monitor.TK2SDDashboard{
 				Counts: monitor.TK2SDCounts(dashboard.Counts), Occupied: dashboard.Occupied, Capacity: dashboard.Capacity,
 				Accounts: accounts, Login: monitor.TK2SDLogin(dashboard.Login), LeasedTaskIDs: dashboard.LeasedTaskIDs,
+				SlotCapacity: dashboard.SlotCapacity, SlotOccupied: dashboard.SlotOccupied, ConcurrencyPerLine: dashboard.ConcurrencyPerLine, CoolingSlots: dashboard.CoolingSlots,
 			}
 		}
 	})
+	logger := f.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if healthErr == nil && dashboardErr != nil && (previous.TK2SDDashboard != nil || previous.CheckedAt.IsZero() || previous.Health != monitor.HealthHealthy) {
+		logger.WarnContext(ctx, "tk2sd容量快照获取失败，暂停该节点新派发并继续已有任务对账", "stage", "tk2sd_capacity", "node_id", nodeID, "error_code", "tk2sd_capacity_unavailable", "error_reason", logsafe.Error(dashboardErr))
+	}
+	old := previous.TK2SDDashboard
+	if healthErr == nil && dashboardErr == nil && (old == nil || old.SlotCapacity != dashboard.SlotCapacity || old.SlotOccupied != dashboard.SlotOccupied || old.CoolingSlots != dashboard.CoolingSlots || old.Counts.Queued != dashboard.Counts.Queued || old.Login.CanDispatch != dashboard.Login.CanDispatch || old.ConcurrencyPerLine != dashboard.ConcurrencyPerLine) {
+		reason := "ready"
+		if !dashboard.Login.CanDispatch {
+			reason = "upstream_dispatch_paused"
+		} else if dashboard.Counts.Queued > 0 {
+			reason = "upstream_queue_pending"
+		} else if dashboard.SlotOccupied >= dashboard.SlotCapacity || dashboard.CoolingSlots >= dashboard.SlotCapacity-dashboard.SlotOccupied {
+			reason = "no_available_slots"
+		}
+		logger.InfoContext(ctx, "tk2sd容量快照已更新", "stage", "tk2sd_capacity", "node_id", nodeID, "slot_capacity", dashboard.SlotCapacity, "slot_occupied", dashboard.SlotOccupied, "concurrency_per_line", dashboard.ConcurrencyPerLine, "cooling_slots", dashboard.CoolingSlots, "upstream_queued", dashboard.Counts.Queued, "can_dispatch", dashboard.Login.CanDispatch, "dispatch_reason", reason)
+	}
+}
+
+func tk2sdAdmission(snapshot monitor.NodeSnapshot, now time.Time, maxAge time.Duration) (domain.TK2SDAdmission, bool) {
+	dashboard := snapshot.TK2SDDashboard
+	if dashboard == nil || snapshot.CheckedAt.IsZero() || snapshot.CheckedAt.Before(now.Add(-maxAge)) {
+		return domain.TK2SDAdmission{}, false
+	}
+	capacity, occupied, cooling := dashboard.SlotCapacity, max(dashboard.SlotOccupied, len(dashboard.LeasedTaskIDs)), dashboard.CoolingSlots
+	if dashboard.ConcurrencyPerLine == 0 {
+		capacity, occupied = dashboard.Capacity, dashboard.Occupied
+		for _, account := range dashboard.Accounts {
+			if account.Status == "cooldown" {
+				cooling++
+			}
+		}
+	}
+	return domain.TK2SDAdmission{Capacity: capacity, Occupied: occupied, Cooling: cooling, Queued: dashboard.Counts.Queued, CanDispatch: dashboard.Login.CanDispatch, LeasedTaskIDs: dashboard.LeasedTaskIDs}, true
 }

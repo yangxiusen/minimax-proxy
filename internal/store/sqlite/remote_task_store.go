@@ -55,7 +55,8 @@ func (s *Store) ClaimNextRemote(ctx context.Context, nodeID string, nodeVersion 
 	}
 	if len(admission) == 1 {
 		status := admission[0]
-		if !status.CanDispatch || status.Queued > 0 || status.Capacity < 1 || status.Occupied < 0 || status.Cooling < 0 || status.Occupied+status.Cooling > status.Capacity {
+		// 下调上限后的超额占用只暂停新领取，不能影响已有任务对账。
+		if !status.CanDispatch || status.Queued > 0 || status.Capacity < 1 || status.Occupied < 0 || status.Cooling < 0 || status.Occupied > status.Capacity || status.Cooling > status.Capacity-status.Occupied {
 			return task, domain.ErrUpstreamBusy
 		}
 		leased := make(map[string]bool, len(status.LeasedTaskIDs))

@@ -10,9 +10,13 @@ type TK2SDCounts struct {
 }
 
 type TK2SDAccount struct {
-	Label   string `json:"label"`
-	Status  string `json:"status"`
-	Credits *int   `json:"credits"`
+	Label            string `json:"label"`
+	Status           string `json:"status"`
+	Credits          *int   `json:"credits"`
+	ActiveCount      int    `json:"active_count"`
+	ConcurrencyLimit int    `json:"concurrency_limit"`
+	AvailableSlots   int    `json:"available_slots"`
+	Cooldown         bool   `json:"cooldown"`
 }
 
 type TK2SDLogin struct {
@@ -21,10 +25,14 @@ type TK2SDLogin struct {
 }
 
 type TK2SDDashboard struct {
-	Counts        TK2SDCounts    `json:"counts"`
-	Occupied      int            `json:"occupied"`
-	Capacity      int            `json:"capacity"`
-	Accounts      []TK2SDAccount `json:"accounts"`
-	Login         TK2SDLogin     `json:"login"`
-	LeasedTaskIDs []string       `json:"-"`
+	Counts             TK2SDCounts    `json:"counts"`
+	Occupied           int            `json:"occupied"`
+	Capacity           int            `json:"capacity"`
+	Accounts           []TK2SDAccount `json:"accounts"`
+	Login              TK2SDLogin     `json:"login"`
+	LeasedTaskIDs      []string       `json:"-"`
+	SlotCapacity       int            `json:"slot_capacity"`
+	SlotOccupied       int            `json:"slot_occupied"`
+	ConcurrencyPerLine int            `json:"concurrency_per_line"`
+	CoolingSlots       int            `json:"-"`
 }

@@ -29,7 +29,7 @@ type RemoteRun struct {
 	CreatedAt, UpdatedAt                        int64
 }
 
-// TK2SDAdmission is a recent account snapshot used only to bound new claims.
+// TK2SDAdmission 仅用于约束新领取，容量、占用和冷却均按名额计算。
 type TK2SDAdmission struct {
 	Capacity, Occupied, Cooling, Queued int
 	CanDispatch                         bool

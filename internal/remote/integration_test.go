@@ -55,6 +55,11 @@ type integrationUpstream struct {
 	modelCalls, uploadCalls, queryCalls, metadataCalls, cancelCalls int
 	loseSubmitResponse                                              bool
 	metadataUnavailable                                             bool
+	slotLimit                                                       int
+	dashboardUnavailable                                            bool
+	dashboardBlock                                                  <-chan struct{}
+	dashboardStarted                                                chan<- struct{}
+	submitObserved                                                  chan<- struct{}
 	blockCancel                                                     <-chan struct{}
 	cancelStarted                                                   chan<- struct{}
 }
@@ -78,7 +83,43 @@ func (u *integrationUpstream) serveHTTP(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if r.URL.Path == "/v1/dashboard" && u.dashboardBlock != nil {
+		select {
+		case u.dashboardStarted <- struct{}{}:
+		default:
+		}
+		select {
+		case <-u.dashboardBlock:
+		case <-r.Context().Done():
+			return
+		}
+	}
 	switch {
+	case r.Method == http.MethodGet && (r.URL.Path == "/v1/dashboard" || r.URL.Path == "/api/v3/contents/generations/tasks"):
+		u.mu.Lock()
+		defer u.mu.Unlock()
+		if u.dashboardUnavailable {
+			w.WriteHeader(503)
+			_, _ = io.WriteString(w, `{}`)
+			return
+		}
+		active := []map[string]string{}
+		for _, job := range u.jobs {
+			if job.Status == "queued" || job.Status == "running" {
+				active = append(active, map[string]string{"id": job.ID, "status": "running"})
+			}
+		}
+		if r.URL.Path == "/v1/dashboard" {
+			var lease any
+			occupied := 0
+			if len(active) > 0 {
+				lease = active[0]["id"]
+				occupied = 1
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"capacity": 1, "occupied": occupied, "slot_capacity": u.slotLimit, "slot_occupied": len(active), "concurrency_per_line": u.slotLimit, "counts": map[string]int{"running": len(active), "queued": 0, "succeeded": 0, "failed": 0, "uncertain": 0, "canceled": 0}, "login": map[string]any{"status": "valid", "can_dispatch": true}, "accounts": []map[string]any{{"lease": lease, "not_before": 0, "credits": 100, "active_count": len(active), "concurrency_limit": u.slotLimit, "available_slots": max(u.slotLimit-len(active), 0)}}})
+		} else {
+			_ = json.NewEncoder(w).Encode(map[string]any{"total": len(active), "items": active})
+		}
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
 		u.mu.Lock()
 		u.modelCalls++
@@ -266,6 +307,12 @@ func (u *integrationUpstream) submit(w http.ResponseWriter, r *http.Request) {
 	if job == nil {
 		job = &integrationJob{ID: fmt.Sprintf("%032x", len(u.jobs)+1), Body: string(body), Status: "queued"}
 		u.jobs[key] = job
+		if u.submitObserved != nil {
+			select {
+			case u.submitObserved <- struct{}{}:
+			default:
+			}
+		}
 	}
 	if u.loseSubmitResponse {
 		u.loseSubmitResponse = false
