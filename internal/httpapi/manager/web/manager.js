@@ -327,7 +327,7 @@ function renderTK2SDDashboard(node, proxyQueued) {
     ["待核实", counts.uncertain], ["失败", counts.failed], ["取消", counts.canceled],
     ["账号占用", `${dashboard.occupied} / ${dashboard.capacity}`],
     ["并发占用", `${dashboard.slot_occupied ?? dashboard.occupied} / ${dashboard.slot_capacity ?? dashboard.capacity}`],
-    ["每线路并发", dashboard.concurrency_per_line ?? 1]
+    ["默认线路并发", dashboard.concurrency_per_line ?? 1]
   ].forEach(([label, value]) => {
     const stat = makeElement("div", "tk-stat");
     stat.append(makeElement("span", "box-label", label), makeElement("strong", "", String(value)));

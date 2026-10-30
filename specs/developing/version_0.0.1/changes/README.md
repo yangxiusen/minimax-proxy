@@ -30,6 +30,7 @@
 | 010-input-spool-admin-maintenance | 输入临时文件、任务详情查看与自动迁移 | 架构优化/管理后台增强/数据库迁移 | Pending | 待人工填写 | CHANGE_SPEC.md、TECH_SOLUTION.md、DATABASE_DELTA.md、API_DELTA.md、PROTOTYPE_DELTA.md、task.md、TEST_ACCEPTANCE.md | `specs/developing/version_0.0.1/changes/010-input-spool-admin-maintenance/` | 新任务 Base64 不入库，Manager 可查看请求详情，后台删除终态任务改为物理删除，v15 自动迁移待 `/s-develop` 实施 |
 | 011-oss-input-log-hardening | OSS 输入重复提交与异常日志落盘 | 缺陷修复/可观测性 | In Progress | 待人工填写 | CHANGE_SPEC.md、task.md、TEST_ACCEPTANCE.md | `specs/developing/version_0.0.1/changes/011-oss-input-log-hardening/` | 相同输入复用既有 OSS 对象，v22 允许多任务引用同一输入路径，补充异常原因日志与容器日志目录；本地 Go 1.26 toolchain 下载待恢复后复测 |
 | 012-tk2sd-public-failure-feedback | tk2sd 失败任务公开反馈 | 缺陷修复/API 响应 | In Progress | 待人工填写 | CHANGE_SPEC.md、API_DELTA.md、task.md、TEST_ACCEPTANCE.md | `specs/developing/version_0.0.1/changes/012-tk2sd-public-failure-feedback/` | 对外查询优先使用已脱敏反馈消息，缺失时保留通用文案；真实上游及 NewAPI 展示待人工联调 |
+| 013-tk2sd-independent-capacity | tk2sd 独立线路并发兼容 | 缺陷修复/上游兼容 | In Progress | 待人工填写 | CHANGE_SPEC.md、task.md、TEST_ACCEPTANCE.md | `specs/developing/version_0.0.1/changes/013-tk2sd-independent-capacity/` | 按各线路实际上限合计校验容量；部署及现场恢复待人工确认 |
 
 ## 维护规则
 

@@ -91,14 +91,14 @@ func (c *Client) Dashboard(ctx context.Context) (Dashboard, error) {
 	}
 	slots := raw.SlotCapacity != nil || raw.SlotOccupied != nil || raw.ConcurrencyPerLine != nil
 	if slots {
-		if raw.SlotCapacity == nil || raw.SlotOccupied == nil || raw.ConcurrencyPerLine == nil || *raw.ConcurrencyPerLine < 1 || *raw.ConcurrencyPerLine > 20 || *raw.SlotCapacity < 0 || *raw.SlotOccupied < 0 || *raw.SlotCapacity / *raw.ConcurrencyPerLine != *raw.Capacity || *raw.SlotCapacity%*raw.ConcurrencyPerLine != 0 {
+		if raw.SlotCapacity == nil || raw.SlotOccupied == nil || raw.ConcurrencyPerLine == nil || *raw.ConcurrencyPerLine < 1 || *raw.ConcurrencyPerLine > 20 || *raw.SlotCapacity < 0 || *raw.SlotOccupied < 0 {
 			return Dashboard{}, ErrInvalidResponse
 		}
 		// 降低并发后，现有占用可以暂时超过新容量，不得丢弃有效快照。
 		result.SlotCapacity, result.SlotOccupied, result.ConcurrencyPerLine = *raw.SlotCapacity, *raw.SlotOccupied, *raw.ConcurrencyPerLine
 	}
 	now := float64(time.Now().Unix())
-	totalActive, occupiedLines := 0, 0
+	totalActive, occupiedLines, totalCapacity := 0, 0, 0
 	for i, account := range *raw.Accounts {
 		if account.NotBefore == nil || account.Credits != nil && *account.Credits < 0 {
 			return Dashboard{}, ErrInvalidResponse
@@ -114,7 +114,7 @@ func (c *Client) Dashboard(ctx context.Context) (Dashboard, error) {
 			}
 		}
 		if slots {
-			if account.ActiveCount == nil || account.ConcurrencyLimit == nil || account.AvailableSlots == nil || *account.ActiveCount < 0 || *account.ConcurrencyLimit != result.ConcurrencyPerLine || *account.ActiveCount > result.SlotOccupied-totalActive || *account.AvailableSlots != max(*account.ConcurrencyLimit-*account.ActiveCount, 0) {
+			if account.ActiveCount == nil || account.ConcurrencyLimit == nil || account.AvailableSlots == nil || *account.ActiveCount < 0 || *account.ConcurrencyLimit < 1 || *account.ConcurrencyLimit > 20 || *account.ActiveCount > result.SlotOccupied-totalActive || *account.AvailableSlots != max(*account.ConcurrencyLimit-*account.ActiveCount, 0) {
 				return Dashboard{}, ErrInvalidResponse
 			}
 			active, limit = *account.ActiveCount, *account.ConcurrencyLimit
@@ -122,6 +122,8 @@ func (c *Client) Dashboard(ctx context.Context) (Dashboard, error) {
 			return Dashboard{}, ErrInvalidResponse
 		}
 		totalActive += active
+		// 新版各账号可独立设置上限，顶层并发值仅作为新增默认值。
+		totalCapacity += limit
 		status := "idle"
 		if active > 0 {
 			status = "occupied"
@@ -141,7 +143,7 @@ func (c *Client) Dashboard(ctx context.Context) (Dashboard, error) {
 		}
 		result.Accounts = append(result.Accounts, DashboardAccount{Label: fmt.Sprintf("1-%d", i+1), Status: status, Credits: account.Credits, ActiveCount: active, ConcurrencyLimit: limit, AvailableSlots: available, Cooldown: cooldown})
 	}
-	if occupiedLines != result.Occupied || totalActive != result.SlotOccupied {
+	if occupiedLines != result.Occupied || totalActive != result.SlotOccupied || totalCapacity != result.SlotCapacity {
 		return Dashboard{}, ErrInvalidResponse
 	}
 	// 满载、已排队或禁止派发时无需读取任务列表；下一次有空余时重新取完整证据。
